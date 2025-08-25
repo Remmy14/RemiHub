@@ -13,7 +13,7 @@ from starlette.staticfiles import StaticFiles
 # Local Imports
 from backend.services import race_service
 from backend.database.database import get_db_conn, put_db_conn
-from backend.routers import race, pool, plex, fieldwatch
+from backend.routers import race, pool, plex, fieldwatch, auto_logins
 from backend.tasks import swimming_pool_monitor, plex_dl_monitor, notification_worker, field_status_watcher, jury_watch
 
 TEST_MODE = False
@@ -51,6 +51,7 @@ routers = [
     pool.router,
     plex.router,
     fieldwatch.router,
+    auto_logins.router,
 ]
 
 for router in routers:
