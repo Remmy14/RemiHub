@@ -1,15 +1,23 @@
 import psycopg2
 from psycopg2 import pool
+import sys
+
+# Local Imports
+sys.path.append('M:/Q_Drive/Projects/RemiHub/')
+from backend.config import load_config
+
+# Initialize our config
+config = load_config('config/config.ini')['Database']
 
 # Create a connection pool (adjust minconn and maxconn as needed)
 db_pool = psycopg2.pool.SimpleConnectionPool(
     minconn=1,
     maxconn=5,
-    user='postgres',
-    password='REMOVED',
-    host='192.168.1.106',
-    port='5432',
-    database='automation_app'
+    user=config['user'],
+    password=config['password'],
+    host=config['host'],
+    port=config['port'],
+    database=config['database'],
 )
 
 def get_db_conn():
