@@ -1,5 +1,6 @@
 # Python Imports
 from datetime import datetime
+import os
 from pathlib import Path
 import uuid
 
@@ -10,10 +11,10 @@ from pydantic import BaseModel
 from backend.database.database import get_db_conn, put_db_conn
 
 
-CRAWLJOB_DIR = Path("C:/Users/alexr/Documents/Temp/JDownloaderWatch")
+CRAWLJOB_DIR = Path(os.getenv("REMHUB_CRAWLJOB_DIR", "/srv/remihub/Temp/JDownloaderWatch/"))
 CATEGORY_PATHS = {
-    "Movies": "C:\\Users\\alexr\\Documents\\Temp\\Movies",
-    "TV": "C:\\Users\\alexr\\Documents\\Temp\\TV"
+    "Movies": os.getenv("REMHUB_MOVIES_DIR", "/srv/remihub/Temp/Movies"),
+    "TV": os.getenv("REMHUB_TV_DIR", "/srv/remihub/Temp/TV"),
 }
 
 class DownloadRequest(BaseModel):
@@ -76,5 +77,11 @@ def get_recent_download_requests():
 
 
 if __name__ == '__main__':
-    print(get_recent_download_requests())
+    temp = DownloadRequest(
+        url="mega.nz/thisisatestfile",
+        category="Movies",
+        name="Some Test",
+    )
+
+    create_crawljob_file(temp)
 

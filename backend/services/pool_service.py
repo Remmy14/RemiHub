@@ -5,6 +5,7 @@ from datetime import datetime
 
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
+from backend.database import pool_watch_meta
 
 
 def get_latest_pool_temp():
@@ -53,3 +54,15 @@ def get_pool_temps_in_range(start_time: datetime, end_time: datetime) -> list[di
             ]
     finally:
         put_db_conn(conn)
+
+def get_pool_mode() -> dict:
+    # if you want updatedAt too, call set/get that returns dict
+    summer_mode = pool_watch_meta.get_summer_mode()
+    return {
+        'summerMode': summer_mode
+    }
+
+
+def set_pool_mode(summer_mode: bool) -> dict:
+    return pool_watch_meta.set_summer_mode(summer_mode)
+

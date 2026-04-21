@@ -5,15 +5,11 @@ from logging.handlers import RotatingFileHandler
 import time
 
 # 3rd Party Imports
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import sync_playwright
 
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
+from backend.database import pool_watch_meta
 from backend import config
 
 # ----------------------
@@ -56,53 +52,46 @@ def save_data_to_database(pool_data):
 # ----------------------
 def fetch_raymote_temperatures(_config):
     url = _config['url']
+    email = _config['email']
+    password = _config['password']
 
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    service = Service("M:/Q_Drive/Projects/drivers/chromedriver.exe")
-    driver = webdriver.Chrome(service=service, options=options)
+    with sync_playwright() as p:
+        browser = p.chromium.launch() #headless=True)
+        context = browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = context.new_page()
 
-    try:
-        logger.info('Loading Raymote page...')
-        driver.get(url)
-        wait = WebDriverWait(driver, 60)
+        page.goto(url, wait_until='domcontentloaded')
 
-        logger.info('Attempting login...')
-        email_input = wait.until(EC.presence_of_element_located((By.ID, 'email')))
-        password_input = driver.find_element(By.ID, 'password')
-        login_button = driver.find_element(By.XPATH, '//button[span[text()="Log In"]]')
+        # Login
+        page.wait_for_selector('#email', timeout=60_000)
+        page.fill('#email', email)
+        page.fill('#password', password)
 
-        email_input.send_keys(_config['email'])
-        password_input.send_keys(_config['password'])
-        login_button.click()
+        # Your Selenium used a specific button xpath. In Playwright, prefer a role/text locator:
+        page.get_by_role('button', name='Log In').click()
 
-        logger.info('Waiting for dashboard...')
-        inlet_elem = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//div[@id="WEB_LABEL2"]//span[contains(@class, "widgets--widget-web-label--value")]')
-        ))
-        outlet_elem = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//div[@id="WEB_LABEL4"]//span[contains(@class, "widgets--widget-web-label--value")]')
-        ))
-        outdoor_elem = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//div[@id="WEB_LABEL1"]//span[contains(@class, "widgets--widget-web-label--value")]')
-        ))
-        set_elem = wait.until(EC.presence_of_element_located(
-            (By.XPATH, '//div[@id="WEB_LABEL35"]//span[contains(@class, "widgets--widget-web-label--value")]')
-        ))
+        # Wait for dashboard widgets
+        inlet_sel = '#WEB_LABEL2 span.widgets--widget-web-label--value'
+        outlet_sel = '#WEB_LABEL4 span.widgets--widget-web-label--value'
+        outdoor_sel = '#WEB_LABEL1 span.widgets--widget-web-label--value'
+        set_sel = '#WEB_LABEL35 span.widgets--widget-web-label--value'
 
-        inlet_temp = float(inlet_elem.text)
-        outlet_temp = float(outlet_elem.text)
-        outdoor_temp = float(outdoor_elem.text)
-        set_temp = set_elem.text
+        page.wait_for_selector(inlet_sel, timeout=60_000)
 
-        if set_temp.isnumeric():
-            set_temp = float(set_temp)
-        else:
-            set_temp = None
+        inlet_text = page.locator(inlet_sel).inner_text().strip()
+        outlet_text = page.locator(outlet_sel).inner_text().strip()
+        outdoor_text = page.locator(outdoor_sel).inner_text().strip()
+        set_text = page.locator(set_sel).inner_text().strip()
 
-        logger.info('Temperatures fetched successfully.')
+        inlet_temp = float(inlet_text)
+        outlet_temp = float(outlet_text)
+        outdoor_temp = float(outdoor_text)
+
+        set_temp = float(set_text) if set_text.replace('.', '', 1).isdigit() else None
+
+        context.close()
+        browser.close()
+
         return {
             'inlet': inlet_temp,
             'outlet': outlet_temp,
@@ -110,11 +99,6 @@ def fetch_raymote_temperatures(_config):
             'set': set_temp,
         }
 
-    except Exception as e:
-        logger.exception(f"Error fetching Raymote temperatures: {e}")
-        raise
-    finally:
-        driver.quit()
 
 # ----------------------
 # Main Loop
@@ -127,6 +111,12 @@ def run_pool_monitor(_config=None):
 
     logger.info("Pool monitor started.")
     while True:
+        summer_mode = pool_watch_meta.get_summer_mode()
+        if not summer_mode:
+            logger.info('Pool monitor is disabled (winter mode). Skipping scrape.')
+            time.sleep(60)
+            continue
+
         now = datetime.now()
         if now.minute in [0, 15, 30, 45] and now.minute != last_run_minute:
             print('Beginning to scrape pool temps')
@@ -148,4 +138,5 @@ if __name__ == '__main__':
     # run_pool_monitor(_config['Pool Monitor'])
 
     temps = fetch_raymote_temperatures(_config['Pool Monitor'])
-    save_data_to_database(temps)
+    # save_data_to_database(temps)
+    print(temps)

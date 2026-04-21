@@ -31,7 +31,7 @@ class AutoLoginService:
         t0 = time.time()
         logs: List[str] = []
         net = network.strip().lower()
-        code = code.strip()
+        code = code.strip().upper()
         print(f'Got code: {code}')
 
         try:
@@ -51,7 +51,7 @@ class AutoLoginService:
 
     def _new_driver(self) -> webdriver.Chrome:
         opts = Options()
-        # opts.add_argument('--headless=new')
+        opts.add_argument('--headless=new')
         opts.add_argument('--no-sandbox')
         opts.add_argument('--disable-gpu')
         opts.add_argument('--disable-dev-shm-usage')
@@ -211,5 +211,6 @@ def _select_tv_provider(d, wait, provider_name: str, logs: list[str]) -> None:
 
 if __name__ == '__main__':
     auto_login_service = AutoLoginService()
-    auto_login_service.authenticate(network='fanduel', code='6URWW9M')
+    code = input("Enter code to login: ")
+    auto_login_service.authenticate(network='fanduel', code=code)
 

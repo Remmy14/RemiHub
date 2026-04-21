@@ -58,54 +58,149 @@ def send_fcm_notification(title: str, body: str, fcm_token: str):
     response = httpx.post(url, headers=headers, json=payload)
     return response
 
+def get_unsent_notifications(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            '''
+            SELECT id, title, body
+            FROM notifications
+            WHERE sent = FALSE
+            ORDER BY created_at ASC
+            LIMIT 10;
+            '''
+        )
+        return cur.fetchall()
+
+def get_active_device_tokens(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            '''
+            SELECT id, device_id, fcm_token, device_name, platform
+            FROM device_push_tokens
+            WHERE is_active = TRUE
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC;
+            '''
+        )
+        return cur.fetchall()
+
+
+
+def mark_notification_sent(conn, notif_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            '''
+            UPDATE notifications
+            SET sent = TRUE, sent_at = CURRENT_TIMESTAMP
+            WHERE id = %s;
+            ''',
+            (notif_id,),
+        )
+
+
+def deactivate_device_token(conn, token_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            '''
+            UPDATE device_push_tokens
+            SET is_active = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s;
+            ''',
+            (token_id,),
+        )
+
+
+def is_unregistered_token_response(resp) -> bool:
+    if resp.status_code in (404, 410):
+        return True
+
+    try:
+        payload = resp.json()
+    except Exception:
+        return False
+
+    error = payload.get('error', {})
+    status = error.get('status', '')
+    message = error.get('message', '')
+
+    if status == 'NOT_FOUND':
+        return True
+
+    message_upper = message.upper()
+    if 'UNREGISTERED' in message_upper:
+        return True
+
+    return False
+
+
+def process_notification(conn, notif_id: int, title: str, body: str):
+    device_rows = get_active_device_tokens(conn)
+
+    if not device_rows:
+        print(f'No active device tokens found for notification {notif_id}')
+        return
+
+    success_count = 0
+
+    for token_row in device_rows:
+        token_id, device_id, fcm_token, device_name, platform = token_row
+
+        try:
+            resp = send_fcm_notification(title, body, fcm_token)
+        except Exception as e:
+            print(
+                f'Error sending notification to device_id={device_id} '
+                f'({device_name}, {platform}): {e}'
+            )
+            continue
+
+        if resp.status_code == 200:
+            success_count += 1
+            print(
+                f'Notification sent to device_id={device_id} '
+                f'({device_name}, {platform})'
+            )
+            continue
+
+        print(
+            f'Failed to send notification to device_id={device_id} '
+            f'({device_name}, {platform}): {resp.status_code} - {resp.text}'
+        )
+
+        if is_unregistered_token_response(resp):
+            deactivate_device_token(conn, token_id)
+            print(
+                f'Deactivated stale token for device_id={device_id} '
+                f'({device_name}, {platform})'
+            )
+
+    if success_count > 0:
+        mark_notification_sent(conn, notif_id)
+        print(f'Notification marked sent: {title}')
+    else:
+        print(f'Notification not marked sent because all sends failed: {title}')
+
 
 def run_notification_worker():
-    print("Notification worker started")
-
-    # TODO: Replace with real token logic
-    _config = config.load_config('config/config.ini')
-    fcm_token = _config['Notifications']['fcm_token']
+    print('Notification worker started')
 
     while True:
         conn = get_db_conn()
         try:
-            with conn.cursor() as cur:
+            rows = get_unsent_notifications(conn)
 
-                # Pull all new notification requests from the database
-                cur.execute("""
-                    SELECT id, title, body FROM notifications
-                    WHERE sent = FALSE
-                    ORDER BY created_at ASC
-                    LIMIT 10;
-                """)
-                rows = cur.fetchall()
-
-                # Parse through all new notifications (realistically only 1 at a time)
-                for row in rows:
-                    notif_id, title, body = row
-
-                    # Send the notification request
-                    resp = send_fcm_notification(title, body, fcm_token)
-
-                    # Handle notification status and update the database
-                    if resp.status_code == 200:
-                        cur.execute("""
-                            UPDATE notifications
-                            SET sent = TRUE, sent_at = CURRENT_TIMESTAMP
-                            WHERE id = %s;
-                        """, (notif_id,))
-                        print(f"Notification sent: {title}")
-                    else:
-                        print(f"Failed to send notification: {resp.status_code} - {resp.text}")
+            for row in rows:
+                notif_id, title, body = row
+                process_notification(conn, notif_id, title, body)
 
             conn.commit()
         except Exception as e:
-            print(f"⚠️ Notification worker error: {e}")
+            conn.rollback()
+            print(f'⚠️ Notification worker error: {e}')
         finally:
             put_db_conn(conn)
 
         time.sleep(10)
-
 
 if __name__ == '__main__':
     run_notification_worker()

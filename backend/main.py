@@ -1,6 +1,7 @@
 # Python Imports
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 import sys
 import threading
 
@@ -13,13 +14,15 @@ from starlette.staticfiles import StaticFiles
 # Local Imports
 from backend.services import race_service
 from backend.database.database import get_db_conn, put_db_conn
-from backend.routers import race, pool, plex, fieldwatch, auto_logins
+from backend.routers import race, pool, plex, fieldwatch, auto_logins, notifications
 from backend.tasks import swimming_pool_monitor, plex_dl_monitor, notification_worker, field_status_watcher, jury_watch
 
 TEST_MODE = False
 
 # Add the main directory to the path for some reason
-sys.path.append('M:/Q_Drive/Projects/RemiHub/')
+BASE_DIR = Path(__file__).resolve().parent.parent  # /opt/remihub
+STATIC_DIR = BASE_DIR / 'backend' / 'static'
+RACE_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
 
 # Define the lifespan of the app
 @asynccontextmanager
@@ -52,6 +55,7 @@ routers = [
     plex.router,
     fieldwatch.router,
     auto_logins.router,
+    notifications.router,
 ]
 
 for router in routers:
@@ -67,11 +71,10 @@ app.add_middleware(
 )
 
 # Mount our images directory
-app.mount('/static', StaticFiles(directory='M:/Q_Drive/Projects/RemiHub/backend/static/'), name='static')
+app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
 
 # Serve React build at /race
-race_path = "M:/Q_Drive/Projects/RemiHub/frontend-web/dist/"
-app.mount("/race", StaticFiles(directory=race_path, html=True), name="race")
+app.mount('/race', StaticFiles(directory=str(RACE_DIST_DIR), html=True), name='race')
 
 def db_dependency():
     conn = get_db_conn()

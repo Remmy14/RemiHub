@@ -24,3 +24,16 @@ def get_temps_in_range(
 ):
     data = pool_service.get_pool_temps_in_range(start, end)
     return {"success": True, "data": data}
+
+@router.get('/getMode')
+def get_pool_mode():
+    data = pool_service.get_pool_mode()
+    return {'success': True, 'data': data}
+
+
+@router.post('/setMode')
+def set_pool_mode(
+    summerMode: bool = Query(..., description='true = enabled/summer, false = disabled/winter')
+):
+    data = pool_service.set_pool_mode(summerMode)
+    return {'success': True, 'data': data}

@@ -3,6 +3,7 @@ from datetime import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 from random import randint
 import re
 import shutil
@@ -16,7 +17,6 @@ from plexapi.server import PlexServer
 sys.path.append('M:/Q_Drive/Projects/RemiHub/')
 from backend.config import load_config
 
-
 # ----------------------
 # Configure Logging
 # ----------------------
@@ -28,33 +28,37 @@ formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)
 
+# Configure paths
+BASE_DIR = Path(__file__).resolve().parent.parent.parent  # /opt/remihub
 
-def print(message):
-    # Override the built in Print so that I don't have to change everything
-    now = datetime.now()
-    __builtins__.print(f'{now} - {message}')
 
-def get_new_downloads(library):
+def get_new_downloads(src, dest, library):
     # Check for a "maintenance" flag
-    if os.path.exists(f'C:/Users/alexr/Documents/Temp/maintenance.flg'):
+    if os.path.exists(BASE_DIR / 'maintenance.flg'):
         return False
-    files = os.listdir(library)
-    ignores = ['encrypted']
+
+    # Build paths
+    # download_dir = f"{src}/{library}/"
+    download_dir = src
+
+    # Get our files
+    files = os.listdir(download_dir)
+    ignores = ['part', 'encrypted', 'rar', 'zip']
 
     # Keep track of new files
     new_files = False
 
     for file in files:
-        enc_file = f'{library}/{file}.encrypted'
-        if any(file.endswith(s) for s in ['part', 'encrypted', 'rar', 'zip']):
+        enc_file = f'{download_dir}/{file}.encrypted'
+        if any(file.endswith(s) for s in ignores):
             continue
         elif os.path.exists(enc_file):
             # The file is still being decrypted
             continue
-        elif os.path.isdir(os.path.join(library, file)):
+        elif os.path.isdir(os.path.join(download_dir, file)):
             # We are in a folder, process that folder first
-            sub_dir = f'{library}/{file}/'
-            get_new_downloads(sub_dir)
+            sub_dir = f'{download_dir}/{file}/'
+            new_files = get_new_downloads(src=sub_dir, dest=dest, library=library)
             # Next, check if it's empty and delete it
             lingerers = os.listdir(sub_dir)
             if len(lingerers) == 0:
@@ -68,18 +72,17 @@ def get_new_downloads(library):
             continue
 
         # We have a new download that needs processed
-        src_path = os.path.join(f'{library}/{file}')
-        cur_library = library.split('/')[5]
-
+        logger.info(f"Migrating {library}: {file}")
+        src_path = os.path.join(f'{download_dir}/{file}')
         try:
-            if cur_library == 'TV':
-                process_tv(src_path)
+            if library == 'TV':
+                process_tv(item_path=src_path, dest=dest)
                 new_files = True
-            elif cur_library == 'Movies':
-                process_movie(src_path)
+            elif library == 'Movies':
+                process_movie(item_path=src_path, dest=dest)
                 new_files = True
             else:
-                logger.error(f'Illegal library: {cur_library}')
+                logger.error(f'Illegal library: {library}')
         except Exception as e:
             logger.error(f'Error Processing Item: {e}')
             quarantine_item(src_path)
@@ -87,7 +90,7 @@ def get_new_downloads(library):
     # Return whether or not we had files to move
     return new_files
 
-def process_movie(item_path):
+def process_movie(item_path, dest):
     new_item = item_path.split('/')[-1].upper()
     try:
         year = re.search('\\d{4}', new_item).group()
@@ -101,9 +104,9 @@ def process_movie(item_path):
 
     name = new_item.split(year)[0].replace('.', ' ').strip()
     new_name = f'{name.title()} ({year}).{extension}'
-    move_file(item_path, new_name, 'Movies')
+    move_file(source=item_path, dest=dest, new_name=new_name, library='Movies')
 
-def process_tv(item_path):
+def process_tv(item_path, dest):
     # We need to get the series name
     # We will split on the season/episode number, hopefully it's in a standard format
     new_item = item_path.split('/')[-1].upper()
@@ -132,7 +135,7 @@ def process_tv(item_path):
         info = info.group()
         season = int(info.split('E')[0].split('S')[1])
         episode = int(info.split('E')[1])
-    series = new_item.split(info)[0].strip().title()
+    series = new_item.split(info)[0].replace('-', '').strip().title()
     extra = new_item.split(info)[1].replace('-', '').replace('(', '').replace(')', '')
 
     # Special cases on Names
@@ -154,7 +157,7 @@ def process_tv(item_path):
     try:
         res = re.search('\\d{3,4}P', extra).group()
     except Exception as e:
-        #print(f'E: {e}')
+        logger.info(f"Error getting year for Show: {item_path}\n{e}")
         res = None
 
     # Grab everything before the resolution
@@ -177,7 +180,15 @@ def process_tv(item_path):
         new_name = f'{series} ({year}) - S{season:02d}E{episode:02d}{ep_name}.{extension}'
     else:
         new_name = f'{series} - S{season:02d}E{episode:02d}{ep_name}.{extension}'
-    move_file(item_path, new_name,'TV', series=series, season=season)
+
+    move_file(
+        source=item_path,
+        dest=dest,
+        new_name=new_name,
+        library='TV',
+        series=series,
+        season=season
+    )
 
 def quarantine_item(item_path):
     '''
@@ -187,7 +198,7 @@ def quarantine_item(item_path):
     '''
     logger.info(f'Quarantining Item: {item_path}')
     try:
-        dest = 'C:/Users/alexr/Documents/Temp/Quarantined/'
+        dest = '/srv/remihub/Quarantined/'
 
         if not os.path.exists(dest):
             os.makedirs(dest)
@@ -196,43 +207,29 @@ def quarantine_item(item_path):
     except Exception as e:
         logger.error(f'Error on Quarantine Item: {e}')
 
-def move_file(source, new_name, library, series=None, season=None):
-    # If we are running a TV show, we need to check if the show exists on a drive somewhere
-    drives = ['G:/', ]
-
-    if library == 'TV' and series:
-        # We need to do a search for this series
-        dest = None
-        for drive in drives:
-            existing_dirs  = os.listdir(drive + 'TV/')
-            for dir in existing_dirs:
-                if series in dir:
-                    # Possible match
-                    # TODO: Enhance!
-                    dest  = f'{drive}{library}/{dir}/'
-                    break
-        if not dest:
-            # No pre-existing destination exists, we need to create one
-            dest = f'{drives[randint(0, len(drives) - 1)]}{library}/{new_name.split('-')[0].strip()}'
-            logger.info(f'Creating new directory: {dest}')
-
+def move_file(source, dest, new_name, library, series=None, season=None):
+    # If we are running a TV show, we need to check if the show/season dirs exist
+    if library == "TV":
+        # No pre-existing destination exists, we need to create one
+        dest = f'{dest}/{library}/{new_name.split('-')[0].strip()}'
         dest = os.path.join(dest, f'Season {season:02d}')
         if os.path.exists(dest):
             pass
         else:
             logger.info(f'No Season Dir Found for {dest}')
             os.makedirs(dest)
+
     # Process Movies:
     elif library == 'Movies':
-        dest = f'{drives[randint(0, len(drives) - 1)]}/Movies/'
+        dest = f'{dest}/Movies/'
 
     # Append our pre-calculated new name to the destination directory
     dest = f'{dest}/{new_name}'
     logger.info(f'Moving {source} ==> {dest}')
     try:
         shutil.move(source, dest)
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Error moving {new_name}:\n{e}")
 
 
 def main():
@@ -242,20 +239,23 @@ def main():
     config = load_config('config/config.ini')['Plex Monitor']
 
     download_dir = config['download_dir']
+    media_root = config['media_dir']
     libraries = ['TV', 'Movies', ]
 
     # Get an instance of our Plex server
     baseurl = config['baseurl']
     PlexToken = config['plextoken']
+    logger.info("Starting Plex Server Client")
     plex = PlexServer(baseurl, PlexToken)
 
     # Get an object of each library
     tv = plex.library.section('TV Shows')
     movies = plex.library.section('Movies')
 
-    while(True):
+    while True:
         for library in libraries:
-            new_files = get_new_downloads(download_dir + library)
+            src_dir = f"{download_dir}/{library}"
+            new_files = get_new_downloads(src=src_dir, dest=media_root, library=library)
 
             # If we had new files, we need to scan the library
             if new_files:
