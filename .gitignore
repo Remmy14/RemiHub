@@ -1,0 +1,13 @@
+*.log
+__pycache__/
+logs/
+send_test_notification.py
+.venv
+favicon_io/
+config/
+.idea/
+.git/
+backend/static/
+data/autographs/
+releases/
+test.py
