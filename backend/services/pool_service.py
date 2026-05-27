@@ -5,7 +5,7 @@ from datetime import datetime
 
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
-from backend.database import pool_watch_meta
+from backend.scripts import pool_watch_meta
 
 
 def get_latest_pool_temp():

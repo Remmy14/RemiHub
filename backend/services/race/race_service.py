@@ -3,12 +3,14 @@ import asyncio
 from datetime import datetime
 
 # Local Imports
-from backend import draft
-from backend import leaderboard
-from backend import pool
+from backend.services.race import draft
+from backend.services.race import leaderboard
+from backend.services.race import pool
+from backend.services.race import archive
 
 
 LEADERBOARD_UPDATE_DELAY = 15
+
 # Begin to update the leaderboard on a regular basis
 async def update_leaderboard_loop():
     while True:
@@ -43,6 +45,9 @@ def get_all_pools() -> list[dict]:
     """
     return pool.get_all_pools()
 
+def create_pool(name: str, participant_count: int) -> dict:
+    return pool.create_pool(name, participant_count)
+
 # Expose Draft functionalities
 def submit_pick(pool_id: int, car_number: str) -> dict:
     success = draft.make_pick(pool_id, car_number)
@@ -58,7 +63,7 @@ def get_draft_order_by_pool(pool_id):
     return draft.get_draft_order(pool_id)
 
 def start_draft(pool_id: int):
-    draft.start_draft(pool_id)
+    return draft.start_draft(pool_id)
 
 def get_current_draft_pick_by_pool(pool_id: int):
     return draft.get_current_draft_pick(pool_id)
@@ -69,8 +74,14 @@ def get_draft_status(pool_id: int):
 def get_starting_grid_status(pool_id: int):
     return draft.get_starting_grid_status(pool_id)
 
-def set_race_draft_status(status: str, pool_id: int):
+def set_race_draft_status(status: str, pool_id: int = 0):
     return draft.set_race_draft_status(status, pool_id)
+
+def reset_draft(pool_id: int, order: list[dict]) -> None:
+    draft.reset_draft(pool_id, order)
+
+def get_recent_picks(pool_id: int, limit: int = 5):
+    return draft.get_recent_picks(pool_id, limit)
 
 # Expose Race Leaderboard Functionalities
 def get_leaderboard(pool_id: int):
@@ -105,3 +116,19 @@ async def update_leaderboard_and_standings():
     for _pool in pools:
         leaderboard.save_pool_standings_to_db(_pool['id'])
 
+# Expose Archive Functionalities
+def archive_pool(
+    pool_id: int,
+    year: int,
+    race_name: str = "Indianapolis 500",
+    notes: str | None = None,
+) -> dict:
+    return archive.archive_pool(pool_id, year, race_name, notes)
+
+
+def get_archives() -> list[dict]:
+    return archive.get_archives()
+
+
+def get_archive_entries(archive_id: int) -> dict:
+    return archive.get_archive_entries(archive_id)

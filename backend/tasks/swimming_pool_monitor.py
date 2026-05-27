@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
-from backend.database import pool_watch_meta
+from backend.scripts import pool_watch_meta
 from backend import config
 
 # ----------------------

@@ -69,7 +69,7 @@ const RaceScreen: React.FC = () => {
     if (!selectedPool) return;
 
     fetchLeaderboard(selectedPool.id);
-    const interval = setInterval(() => fetchLeaderboard(selectedPool.id), 30000);
+    const interval = setInterval(() => fetchLeaderboard(selectedPool.id), 3000);
     return () => clearInterval(interval);
   }, [selectedPool]);
 

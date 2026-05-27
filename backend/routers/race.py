@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Body, Query
 
 # Local Imports
-from backend.services import race_service
+from backend.services.race import race_service
 
 # Declare our Race module router
 router = APIRouter(prefix="/race", tags=["Race"])
@@ -20,6 +20,11 @@ def create_pool(request: dict = Body(...)):
     name = request.get("name")
     participant_count = request.get("participantCount", 10)
     return race_service.create_pool(name, participant_count)
+
+@router.get("/getPoolAssignments")
+def get_pool_assignments(pool_id: int = Query(...)):
+    return race_service.load_pool(pool_id)
+
 # --------------------------------
 
 # Draft Endpoints
@@ -54,6 +59,10 @@ def current_pick(pool_id: int, ):
         "participant": state["participant"]
     }
 
+@router.get("/getRecentPicks")
+def get_recent_picks(pool_id: int = Query(...), limit: int = Query(5)):
+    return race_service.get_recent_picks(pool_id, limit)
+
 @router.get("/getDraftStatus")
 def draft_status(pool_id: int):
     return race_service.get_draft_status(pool_id)
@@ -72,7 +81,7 @@ def get_grid_status(pool_id: int = Query(...)):
 # Start the race
 @router.post("/startRace")
 def start_race():
-    race_service.set_race_draft_status("RACE_ACTIVE")
+    race_service.set_race_draft_status(status="RACE_ACTIVE")
     return {"success": True, "message": "Race tracking is now active."}
 
 # Start the race
@@ -80,4 +89,19 @@ def start_race():
 def stop_race():
     race_service.set_race_draft_status("RACE_COMPLETED")
     return {"success": True, "message": "Race tracking is now completed."}
+# --------------------------------
+
+# Archive Endpoints
+# --------------------------------
+@router.get("/getArchives")
+def get_archives():
+    return {
+        "success": True,
+        "archives": race_service.get_archives(),
+    }
+
+
+@router.get("/getArchiveEntries")
+def get_archive_entries(archive_id: int = Query(...)):
+    return race_service.get_archive_entries(archive_id)
 # --------------------------------

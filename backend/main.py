@@ -2,20 +2,39 @@
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-import sys
 import threading
 
 # 3rd Party Imports
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
 # Local Imports
-from backend.services import race_service
+from backend.services.race import race_service
 from backend.database.database import get_db_conn, put_db_conn
-from backend.routers import race, pool, plex, fieldwatch, auto_logins, notifications
-from backend.tasks import swimming_pool_monitor, plex_dl_monitor, notification_worker, field_status_watcher, jury_watch
+from backend.routers import (
+        race,
+        pool,
+        plex,
+        fieldwatch,
+        auto_logins,
+        notifications,
+        app_update,
+        speedtest,
+        autographs,
+        weather,
+    )
+from backend.tasks import (
+    swimming_pool_monitor,
+    plex_dl_monitor,
+    notification_worker,
+    field_status_watcher,
+        # jury_watch,
+    speed_test_worker,
+    weather_monitor,
+    )
 
 TEST_MODE = False
 
@@ -37,7 +56,9 @@ async def lifespan(app: FastAPI):
             swimming_pool_monitor.run_pool_monitor,
             plex_dl_monitor.main,
             field_status_watcher.run_monitor,
-            jury_watch.run_monitor,
+            # jury_watch.run_monitor,
+            speed_test_worker.run_monitor,
+            weather_monitor.run_weather_monitor,
         ]
 
         # 0 - Kick off the Threads
@@ -56,6 +77,10 @@ routers = [
     fieldwatch.router,
     auto_logins.router,
     notifications.router,
+    app_update.router,
+    speedtest.router,
+    autographs.router,
+    weather.router,
 ]
 
 for router in routers:
@@ -73,7 +98,12 @@ app.add_middleware(
 # Mount our images directory
 app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
 
-# Serve React build at /race
+# Serve React pages for race and draft
+@app.get("/race/draft", include_in_schema=False)
+@app.get("/race/draft/{full_path:path}", include_in_schema=False)
+async def serve_race_draft(full_path: str = ""):
+    return FileResponse(RACE_DIST_DIR / "index.html")
+
 app.mount('/race', StaticFiles(directory=str(RACE_DIST_DIR), html=True), name='race')
 
 def db_dependency():

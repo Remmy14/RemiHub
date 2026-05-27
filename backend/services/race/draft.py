@@ -2,7 +2,7 @@
 
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
-from backend.leaderboard import save_pool_standings_to_db
+from backend.services.race.leaderboard import save_pool_standings_to_db
 
 
 def set_race_draft_status(status: str, pool_id: int = 0, ):
@@ -41,14 +41,14 @@ def get_starting_grid_status(pool_id: int) -> list[dict]:
                     'name': row[1],
                     'starting_position': row[2],
                     'takenBy': row[3],  # May be None if unassigned
-                    'car_image_url': f'/static/images/{row[0]}.png',
+                    'car_image_url': f'static/images/{row[0]}.png',
                 }
                 for row in rows
             ]
     finally:
         put_db_conn(conn)
 
-def assign_driver_to_participant(pool_id: int, participant_name: str, car_number: str) -> bool:
+def assign_driver_to_participant(pool_id: int, participant_name: str, car_number: str, pick_number: int) -> bool:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -71,9 +71,9 @@ def assign_driver_to_participant(pool_id: int, participant_name: str, car_number
 
             # Insert into pool-specific assignments
             cur.execute("""
-                INSERT INTO indy_pool_assignments (participant_name, car_number, driver_name, pool_id)
-                VALUES (%s, %s, %s, %s)
-            """, (participant_name, car_number, driver_name, pool_id))
+                INSERT INTO indy_pool_assignments (participant_name, car_number, driver_name, pool_id, pick_number)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (participant_name, car_number, driver_name, pool_id, pick_number))
 
         conn.commit()
         return True
@@ -225,7 +225,11 @@ def make_pick(pool_id: int, car_number: str) -> bool:
     state = get_current_draft_pick(pool_id)
     participant = state['participant']
 
-    success = assign_driver_to_participant(pool_id, participant, car_number)
+    # Get the pick number
+    _, total_picks = get_current_draft_status(pool_id)
+    pick_number = total_picks + 1
+
+    success = assign_driver_to_participant(pool_id, participant, car_number, pick_number)
     if success:
         # This is where we can hook in and check if the draft is completed
         advance_draft(pool_id)
@@ -433,7 +437,34 @@ def get_draft_status(pool_id: int, ):
                 "current_picker": current_picker,
                 "on_deck": on_deck,
                 "total_picks": total_picks,
+                "participants": full_order,
             }
+    finally:
+        put_db_conn(conn)
+
+def get_recent_picks(pool_id: int, limit: int = 5) -> list[dict]:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT participant_name, driver_name, car_number, pick_number
+                FROM indy_pool_assignments
+                WHERE pool_id=%s
+                ORDER BY pick_number DESC
+                LIMIT %s
+            """, (pool_id, limit))
+
+            rows = cur.fetchall()
+
+            return [
+                {
+                    "participant": row[0],
+                    "driver_name": row[1],
+                    "car_number": row[2],
+                    "pick_number": row[3],
+                }
+                for row in rows
+            ]
     finally:
         put_db_conn(conn)
 
