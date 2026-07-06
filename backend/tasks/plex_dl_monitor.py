@@ -241,6 +241,7 @@ def main():
     download_dir = config['download_dir']
     media_root = config['media_dir']
     libraries = ['TV', 'Movies', ]
+    logger.info(f"Monitoring Downlaod Directory: {download_dir}")
 
     # Get an instance of our Plex server
     baseurl = config['baseurl']

@@ -9,6 +9,7 @@ from backend.services import pool_service
 
 router = APIRouter(prefix="/pool", tags=["Pool"])
 
+
 @router.get("/getLatestTemp")
 def get_latest_temps():
     data = pool_service.get_latest_pool_temp()
@@ -24,6 +25,15 @@ def get_temps_in_range(
 ):
     data = pool_service.get_pool_temps_in_range(start, end)
     return {"success": True, "data": data}
+
+
+@router.get("/getDashboard")
+def get_pool_dashboard():
+    data = pool_service.get_pool_dashboard()
+    if data:
+        return {"success": True, "data": data}
+    return {"success": False, "message": "No pool dashboard data available"}
+
 
 @router.get('/getMode')
 def get_pool_mode():

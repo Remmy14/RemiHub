@@ -1,6 +1,7 @@
 # Python Imports
 import asyncio
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 from pathlib import Path
 import threading
 
@@ -15,15 +16,17 @@ from starlette.staticfiles import StaticFiles
 from backend.services.race import race_service
 from backend.database.database import get_db_conn, put_db_conn
 from backend.routers import (
-        race,
-        pool,
-        plex,
-        fieldwatch,
-        auto_logins,
-        notifications,
         app_update,
-        speedtest,
+        auto_logins,
         autographs,
+        fieldwatch,
+        finance,
+        notifications,
+        plex,
+        pool,
+        race,
+        rh_storage,
+        speedtest,
         weather,
     )
 from backend.tasks import (
@@ -31,9 +34,10 @@ from backend.tasks import (
     plex_dl_monitor,
     notification_worker,
     field_status_watcher,
-        # jury_watch,
+    # jury_watch,
     speed_test_worker,
     weather_monitor,
+    finance_worker,
     )
 
 TEST_MODE = False
@@ -41,7 +45,13 @@ TEST_MODE = False
 # Add the main directory to the path for some reason
 BASE_DIR = Path(__file__).resolve().parent.parent  # /opt/remihub
 STATIC_DIR = BASE_DIR / 'backend' / 'static'
-RACE_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
+WEB_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
+
+# Load environment variables
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_ENV_PATH = _PROJECT_ROOT / "config" / "remihub.env"
+
+load_dotenv(dotenv_path=_ENV_PATH, override=False)
 
 # Define the lifespan of the app
 @asynccontextmanager
@@ -59,6 +69,7 @@ async def lifespan(app: FastAPI):
             # jury_watch.run_monitor,
             speed_test_worker.run_monitor,
             weather_monitor.run_weather_monitor,
+            finance_worker.run_finance_worker,
         ]
 
         # 0 - Kick off the Threads
@@ -81,6 +92,8 @@ routers = [
     speedtest.router,
     autographs.router,
     weather.router,
+    rh_storage.router,
+    finance.router,
 ]
 
 for router in routers:
@@ -102,9 +115,14 @@ app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
 @app.get("/race/draft", include_in_schema=False)
 @app.get("/race/draft/{full_path:path}", include_in_schema=False)
 async def serve_race_draft(full_path: str = ""):
-    return FileResponse(RACE_DIST_DIR / "index.html")
+    return FileResponse(WEB_DIST_DIR / "index.html")
 
-app.mount('/race', StaticFiles(directory=str(RACE_DIST_DIR), html=True), name='race')
+@app.get("/storage", include_in_schema=False)
+@app.get("/storage/{full_path:path}", include_in_schema=False)
+async def serve_storage_status(full_path: str = ""):
+    return FileResponse(WEB_DIST_DIR / "index.html")
+
+app.mount('/race', StaticFiles(directory=str(WEB_DIST_DIR), html=True), name='race')
 
 def db_dependency():
     conn = get_db_conn()
