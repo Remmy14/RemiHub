@@ -28,16 +28,19 @@ from backend.routers import (
         rh_storage,
         speedtest,
         weather,
+        kids_investing,
+        spotify,
     )
 from backend.tasks import (
-    swimming_pool_monitor,
-    plex_dl_monitor,
-    notification_worker,
-    field_status_watcher,
-    # jury_watch,
-    speed_test_worker,
-    weather_monitor,
-    finance_worker,
+        swimming_pool_monitor,
+        plex_dl_monitor,
+        notification_worker,
+        field_status_watcher,
+        # jury_watch,
+        speed_test_worker,
+        weather_monitor,
+        finance_worker,
+        kids_investing_worker,
     )
 
 TEST_MODE = False
@@ -70,6 +73,7 @@ async def lifespan(app: FastAPI):
             speed_test_worker.run_monitor,
             weather_monitor.run_weather_monitor,
             finance_worker.run_finance_worker,
+            kids_investing_worker.run_kids_investing_worker,
         ]
 
         # 0 - Kick off the Threads
@@ -94,6 +98,8 @@ routers = [
     weather.router,
     rh_storage.router,
     finance.router,
+    kids_investing.router,
+    spotify.router,
 ]
 
 for router in routers:

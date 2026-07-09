@@ -15,10 +15,14 @@ DASHBOARD_GRAPH_HOURS = 72
 DASHBOARD_LOOKBACK_DAYS = 21
 FETCH_BUFFER_HOURS = 1
 RANGE_CHANGE_HOURS = (12, 24, 48, 72)
-TREND_WINDOW_HOURS = 3
-TREND_WARMING_THRESHOLD_F_PER_HOUR = 0.25
-TREND_COOLING_THRESHOLD_F_PER_HOUR = -0.25
+TREND_WINDOW_HOURS = 1
+TREND_WARMING_THRESHOLD_F_PER_HOUR = 0.15
+TREND_COOLING_THRESHOLD_F_PER_HOUR = -0.15
 DEFAULT_PEAK_TIME = time(hour=18, minute=0)
+PEAK_SEARCH_START_TIME = time(hour=10, minute=0)
+PEAK_REACHED_EARLIEST_TIME = time(hour=14, minute=0)
+PEAK_REACHED_DROP_F = 0.2
+PEAK_REACHED_MIN_HOURS_SINCE_PEAK = 1.0
 
 
 def get_latest_pool_temp():
@@ -174,24 +178,52 @@ def _calculate_trend(readings: list[dict]) -> dict:
             "sampleCount": 0,
         }
 
-    latest_timestamp = _parse_timestamp(readings[-1]["timestamp"])
+    latest = readings[-1]
+    latest_timestamp = _parse_timestamp(latest["timestamp"])
+    latest_temp = _safe_float(latest.get("inletTemp"))
+
+    if latest_temp is None:
+        return {
+            "degreesPerHour": None,
+            "label": "Unknown",
+            "windowHours": TREND_WINDOW_HOURS,
+            "sampleCount": 0,
+        }
+
     trend_start = latest_timestamp - timedelta(hours=TREND_WINDOW_HOURS)
+
+    baseline_temp = _interpolated_value_at(
+        readings=readings,
+        target_timestamp=trend_start,
+        value_key="inletTemp",
+    )
+
     trend_readings = [
         reading
         for reading in readings
         if _parse_timestamp(reading["timestamp"]) >= trend_start
+        and reading.get("inletTemp") is not None
     ]
 
-    slope = _linear_regression_slope(trend_readings, value_key="inletTemp")
+    if baseline_temp is None:
+        slope = None
+    else:
+        elapsed_hours = (
+            latest_timestamp - trend_start
+        ).total_seconds() / 3600
+
+        if elapsed_hours <= 0:
+            slope = None
+        else:
+            slope = (latest_temp - baseline_temp) / elapsed_hours
+
     label = _trend_label(slope)
 
     return {
         "degreesPerHour": _round_optional(slope, digits=2),
         "label": label,
         "windowHours": TREND_WINDOW_HOURS,
-        "sampleCount": len(
-            [reading for reading in trend_readings if reading.get("inletTemp") is not None]
-        ),
+        "sampleCount": len(trend_readings),
     }
 
 
@@ -228,7 +260,21 @@ def _calculate_predicted_peak(
             "confidence": "low",
         }
 
-    todays_peak = max(todays_readings, key=lambda reading: reading["inletTemp"])
+    # Midnight and early-morning highs are often just yesterday's leftover heat.
+    # For "peak reached" logic, prefer daytime readings so we don't call
+    # 12:00 AM today's peak at 9 AM.
+    daytime_peak_readings = [
+        reading
+        for reading in todays_readings
+        if _parse_timestamp(reading["timestamp"]).time() >= PEAK_SEARCH_START_TIME
+    ]
+
+    peak_candidate_readings = daytime_peak_readings or todays_readings
+
+    todays_peak = max(
+        peak_candidate_readings,
+        key=lambda reading: _safe_float(reading.get("inletTemp")) or float("-inf"),
+    )
     todays_peak_temp = _safe_float(todays_peak.get("inletTemp")) or latest_temp
     todays_peak_timestamp = _parse_timestamp(todays_peak["timestamp"])
 
@@ -237,13 +283,18 @@ def _calculate_predicted_peak(
         latest_timestamp - todays_peak_timestamp
     ).total_seconds() / 3600
 
-    peak_likely_reached = (
-        hours_since_peak >= 1.0
-        and latest_temp <= todays_peak_temp - 0.2
-        and slope <= 0.0
-    ) or (
-        latest_timestamp.time() >= time(hour=19, minute=0)
-        and slope <= 0.1
+    can_mark_peak_reached = latest_timestamp.time() >= PEAK_REACHED_EARLIEST_TIME
+
+    peak_likely_reached = can_mark_peak_reached and (
+        (
+            hours_since_peak >= PEAK_REACHED_MIN_HOURS_SINCE_PEAK
+            and latest_temp <= todays_peak_temp - PEAK_REACHED_DROP_F
+            and slope <= 0.0
+        )
+        or (
+            latest_timestamp.time() >= time(hour=19, minute=0)
+            and slope <= 0.1
+        )
     )
 
     if peak_likely_reached:
@@ -259,11 +310,13 @@ def _calculate_predicted_peak(
         all_readings=all_readings,
         comparison_timestamp=latest_timestamp,
     )
+
     default_peak_timestamp = datetime.combine(
         latest_timestamp.date(),
         DEFAULT_PEAK_TIME,
         tzinfo=latest_timestamp.tzinfo,
     )
+
     remaining_hours = max(
         0.0,
         (default_peak_timestamp - latest_timestamp).total_seconds() / 3600,
@@ -271,7 +324,6 @@ def _calculate_predicted_peak(
     trend_remaining_gain = max(0.0, slope) * remaining_hours
 
     if historical_gain["sampleCount"] >= 2:
-        # Mostly trust the pool's own history, but let today's current trend nudge it.
         remaining_gain = (historical_gain["medianRemainingGain"] * 0.7) + (
             trend_remaining_gain * 0.3
         )
@@ -282,6 +334,7 @@ def _calculate_predicted_peak(
     remaining_gain = max(0.0, min(remaining_gain, 6.0))
 
     predicted_temp = max(latest_temp + remaining_gain, todays_peak_temp)
+
     predicted_time = _predicted_peak_time(
         historical_peak_minutes=historical_gain["medianPeakMinute"],
         latest_timestamp=latest_timestamp,

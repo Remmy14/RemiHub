@@ -1,5 +1,5 @@
 # Python Imports
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
 import time
@@ -22,6 +22,8 @@ log_handler = RotatingFileHandler('backend/logs/pool_monitor.log', maxBytes=1_00
 formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)
+
+SAMPLE_INTERVAL_MINUTES = 5
 
 # ----------------------
 # Save to Database
@@ -103,32 +105,38 @@ def fetch_raymote_temperatures(_config):
 # ----------------------
 # Main Loop
 # ----------------------
+def next_interval_boundary(now: datetime, interval_minutes: int) -> datetime:
+    minutes_to_add = interval_minutes - (now.minute % interval_minutes)
+
+    # If we're exactly on a boundary but have already passed second/microsecond 0,
+    # schedule the next boundary instead of trying to run "late" for this one.
+    if minutes_to_add == interval_minutes and now.second == 0 and now.microsecond == 0:
+        minutes_to_add = 0
+
+    next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_add)
+
+    if next_run <= now:
+        next_run += timedelta(minutes=interval_minutes)
+
+    return next_run
+
 def run_pool_monitor(_config=None):
     if not _config:
         _config = config.load_config('config/config.ini')
 
-    last_run_minute = None
-
     logger.info("Pool monitor started.")
     while True:
-        summer_mode = pool_watch_meta.get_summer_mode()
-        if not summer_mode:
-            logger.info('Pool monitor is disabled (winter mode). Skipping scrape.')
-            time.sleep(60)
-            continue
-
         now = datetime.now()
-        if now.minute in [0, 15, 30, 45] and now.minute != last_run_minute:
-            print('Beginning to scrape pool temps')
-            try:
-                temps = fetch_raymote_temperatures(_config['Pool Monitor'])
-                save_data_to_database(temps)
-                last_run_minute = now.minute
-            except Exception as e:
-                logger.error(f"Error during scheduled run: {e}")
-        else:
-            print('Not time to scrape pool temps')
-            time.sleep(60)
+        next_run = next_interval_boundary(now, SAMPLE_INTERVAL_MINUTES)
+
+        sleep_seconds = max(0, (next_run - now).total_seconds())
+        logger.error(f"Next pool scrape scheduled for {next_run.isoformat()}")
+        time.sleep(sleep_seconds)
+        try:
+            temps = fetch_raymote_temperatures(_config["Pool Monitor"])
+            save_data_to_database(temps)
+        except Exception as e:
+            logger.error(f"Error during scheduled run: {e}")
 
 # ----------------------
 # Entry Point
