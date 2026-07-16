@@ -3,10 +3,9 @@ import logging
 
 # 3rd Party Imports
 from fastapi.responses import FileResponse
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query
 
 # Local Imports
-from backend.core.auth import require_app_auth
 from backend.services.app_update_service import (
     get_app_release_by_id,
     get_latest_app_release,
@@ -17,7 +16,6 @@ from backend.services.app_update_service import (
 router = APIRouter(
     prefix="/app-update",
     tags=["app-update"],
-    # dependencies=[Depends(require_app_auth)],
 )
 
 @router.get("/latest")

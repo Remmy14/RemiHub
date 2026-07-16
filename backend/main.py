@@ -2,11 +2,12 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+import logging
 from pathlib import Path
 import threading
 
 # 3rd Party Imports
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -14,9 +15,11 @@ from starlette.staticfiles import StaticFiles
 
 # Local Imports
 from backend.services.race import race_service
+from backend.core.auth import AuthMode, get_auth_mode, get_current_principal
 from backend.database.database import get_db_conn, put_db_conn
 from backend.routers import (
         app_update,
+        auth,
         auto_logins,
         autographs,
         fieldwatch,
@@ -44,6 +47,7 @@ from backend.tasks import (
     )
 
 TEST_MODE = False
+logger = logging.getLogger("remihub.main")
 
 # Add the main directory to the path for some reason
 BASE_DIR = Path(__file__).resolve().parent.parent  # /opt/remihub
@@ -59,6 +63,13 @@ load_dotenv(dotenv_path=_ENV_PATH, override=False)
 # Define the lifespan of the app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    auth_mode = get_auth_mode()
+    logger.info("RemiHub API authentication mode: %s", auth_mode.value)
+    if auth_mode is AuthMode.TRANSITION:
+        logger.warning(
+            "API authentication is in transition mode; requests without credentials are still permitted"
+        )
+
     # Start background tasks
     if not TEST_MODE:
         # 1 - Kick off our Race Day family pool monitor
@@ -85,6 +96,11 @@ async def lifespan(app: FastAPI):
 
 # Create the API and add the routers
 app = FastAPI(lifespan=lifespan)
+
+# Authentication verification has its own strict dependency so it remains
+# testable while the rest of the API is temporarily in transition mode.
+app.include_router(auth.router)
+
 routers = [
     race.router,
     pool.router,
@@ -103,7 +119,10 @@ routers = [
 ]
 
 for router in routers:
-    app.include_router(router)
+    app.include_router(
+        router,
+        dependencies=[Depends(get_current_principal)],
+    )
 
 # Allow connections from anywhere
 app.add_middleware(

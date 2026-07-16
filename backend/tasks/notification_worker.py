@@ -39,7 +39,22 @@ def get_access_token(credentials):
     return credentials.token
 
 
-def send_fcm_notification(title: str, body: str, fcm_token: str):
+def normalize_notification_data(data: dict | None) -> dict[str, str]:
+    if not data:
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in data.items()
+        if value is not None
+    }
+
+
+def send_fcm_notification(
+    title: str,
+    body: str,
+    fcm_token: str,
+    data: dict | None = None,
+):
     credentials = load_credentials()
     access_token = get_access_token(credentials)
 
@@ -64,6 +79,10 @@ def send_fcm_notification(title: str, body: str, fcm_token: str):
         }
     }
 
+    normalized_data = normalize_notification_data(data)
+    if normalized_data:
+        payload["message"]["data"] = normalized_data
+
     response = httpx.post(url, headers=headers, json=payload)
     return response
 
@@ -71,8 +90,8 @@ def send_fcm_notification(title: str, body: str, fcm_token: str):
 def get_unsent_notifications(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, title, body
-            FROM notifications
+            SELECT id, title, body, data
+            FROM public.notifications
             WHERE sent = FALSE
             ORDER BY created_at ASC
             LIMIT 10;
@@ -84,7 +103,7 @@ def get_active_device_tokens(conn):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, device_id, fcm_token, device_name, platform
-            FROM device_push_tokens
+            FROM public.device_push_tokens
             WHERE is_active = TRUE
             ORDER BY updated_at DESC NULLS LAST, created_at DESC;
         """)
@@ -94,7 +113,7 @@ def get_active_device_tokens(conn):
 def mark_notification_sent(conn, notif_id: int):
     with conn.cursor() as cur:
         cur.execute("""
-            UPDATE notifications
+            UPDATE public.notifications
             SET sent = TRUE, sent_at = CURRENT_TIMESTAMP
             WHERE id = %s;
         """, (notif_id,))
@@ -103,7 +122,7 @@ def mark_notification_sent(conn, notif_id: int):
 def deactivate_device_token(conn, token_id: int):
     with conn.cursor() as cur:
         cur.execute("""
-            UPDATE device_push_tokens
+            UPDATE public.device_push_tokens
             SET is_active = FALSE,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = %s;
@@ -132,7 +151,13 @@ def is_unregistered_token_response(resp) -> bool:
     return False
 
 
-def process_notification(conn, notif_id: int, title: str, body: str):
+def process_notification(
+    conn,
+    notif_id: int,
+    title: str,
+    body: str,
+    data: dict | None = None,
+):
     device_rows = get_active_device_tokens(conn)
 
     if not device_rows:
@@ -145,7 +170,7 @@ def process_notification(conn, notif_id: int, title: str, body: str):
         token_id, device_id, fcm_token, device_name, platform = token_row
 
         try:
-            resp = send_fcm_notification(title, body, fcm_token)
+            resp = send_fcm_notification(title, body, fcm_token, data=data)
         except Exception as e:
             logger.error(
                 f"Error sending notification to device_id={device_id} "
@@ -192,8 +217,8 @@ def run_notification_worker():
                 logger.debug(f"Processing {len(rows)} pending notifications")
 
             for row in rows:
-                notif_id, title, body = row
-                process_notification(conn, notif_id, title, body)
+                notif_id, title, body, data = row
+                process_notification(conn, notif_id, title, body, data=data)
 
             conn.commit()
         except Exception as e:

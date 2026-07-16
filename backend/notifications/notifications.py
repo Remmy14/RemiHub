@@ -1,8 +1,6 @@
 # Python Imports
-from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel
-import psycopg2
+from pydantic import BaseModel, Field
+from psycopg2.extras import Json
 
 # 3rd Party Imports
 
@@ -15,6 +13,7 @@ class Notification(BaseModel):
     body: str
     module: str
     priority: int = 0
+    data: dict[str, str] = Field(default_factory=dict)
 
 def insert_notification(notification: Notification, conn=None):
     new_conn = False
@@ -24,9 +23,15 @@ def insert_notification(notification: Notification, conn=None):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO notifications (title, body, module, priority)
-                VALUES (%s, %s, %s, %s);
-            """, (notification.title, notification.body, notification.module, notification.priority))
+                INSERT INTO public.notifications (title, body, module, priority, data)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (
+                notification.title,
+                notification.body,
+                notification.module,
+                notification.priority,
+                Json(notification.data),
+            ))
 
         conn.commit()
     finally:

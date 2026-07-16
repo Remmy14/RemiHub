@@ -1,10 +1,14 @@
-from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException
+import logging
 
+from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+
+from backend.core.auth import AuthenticatedPrincipal, get_current_principal
 from backend.database.database import get_db_conn, put_db_conn
 
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
+logger = logging.getLogger("remihub.notifications")
 
 
 class DeviceTokenRegistrationRequest(BaseModel):
@@ -16,7 +20,10 @@ class DeviceTokenRegistrationRequest(BaseModel):
 
 
 @router.post("/register-token")
-def register_token(payload: DeviceTokenRegistrationRequest):
+def register_token(
+    payload: DeviceTokenRegistrationRequest,
+    principal: AuthenticatedPrincipal | None = Depends(get_current_principal),
+):
     if not payload.device_id.strip():
         raise HTTPException(status_code=400, detail="device_id cannot be blank")
 
@@ -31,25 +38,29 @@ def register_token(payload: DeviceTokenRegistrationRequest):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO device_push_tokens (
+                INSERT INTO public.device_push_tokens (
                     device_id,
                     platform,
                     fcm_token,
                     device_name,
                     app_version,
+                    user_id,
                     is_active,
                     last_seen_at
                 )
-                VALUES (%s, %s, %s, %s, %s, TRUE, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, %s, %s, %s, TRUE, CURRENT_TIMESTAMP)
                 ON CONFLICT (device_id)
                 DO UPDATE SET
                     platform = EXCLUDED.platform,
                     fcm_token = EXCLUDED.fcm_token,
                     device_name = EXCLUDED.device_name,
                     app_version = EXCLUDED.app_version,
+                    user_id = COALESCE(EXCLUDED.user_id, device_push_tokens.user_id),
                     is_active = TRUE,
                     last_seen_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
+                WHERE device_push_tokens.user_id IS NULL
+                   OR device_push_tokens.user_id = EXCLUDED.user_id
                 RETURNING
                     id,
                     device_id,
@@ -67,9 +78,16 @@ def register_token(payload: DeviceTokenRegistrationRequest):
                     payload.fcm_token,
                     payload.device_name,
                     payload.app_version,
+                    principal.id if principal else None,
                 ),
             )
             row = cur.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Device is already registered to another authenticated user",
+            )
 
         conn.commit()
 
@@ -87,11 +105,15 @@ def register_token(payload: DeviceTokenRegistrationRequest):
                 "updated_at": row[8].isoformat() if row[8] else None,
             },
         }
-    except Exception as e:
+    except HTTPException:
         conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to register device push token")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to register device push token: {e}",
+            detail="Failed to register device push token",
         )
     finally:
         put_db_conn(conn)

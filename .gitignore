@@ -1,5 +1,6 @@
 *.log
 __pycache__/
+.ruff_cache/
 logs/
 send_test_notification.py
 .venv
