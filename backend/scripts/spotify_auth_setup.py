@@ -11,7 +11,11 @@ SPOTIFY_SCOPE = (
     "playlist-read-private "
     "playlist-read-collaborative "
     "playlist-modify-private "
-    "playlist-modify-public"
+    "playlist-modify-public "
+    "user-read-private "
+    "user-read-playback-state "
+    "user-read-currently-playing "
+    "user-modify-playback-state"
 )
 
 

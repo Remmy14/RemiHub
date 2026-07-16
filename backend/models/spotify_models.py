@@ -16,6 +16,8 @@ class SpotifyMobileConfigResponse(BaseModel):
     redirectUri: str
     goodSongOptionsPlaylistId: str
     goodSongOptionsPlaylistUri: str
+    usesBackendPlayer: bool = True
+
 
 class SpotifyTrack(BaseModel):
     id: int | None = None
@@ -25,6 +27,8 @@ class SpotifyTrack(BaseModel):
     artists: str = ""
     albumName: str = ""
     albumId: str = ""
+    releaseDate: str = ""
+    releaseYear: int | None = None
     durationMs: int | None = None
     explicit: bool | None = None
     popularity: int | None = None
@@ -32,6 +36,56 @@ class SpotifyTrack(BaseModel):
     artworkUrl: str = ""
     spotifyUrl: str = ""
     normalizedTitleArtistKey: str = ""
+
+
+class SpotifyDevice(BaseModel):
+    id: str | None = None
+    name: str = ""
+    type: str = ""
+    isActive: bool = False
+    isRestricted: bool = False
+    volumePercent: int | None = None
+
+
+class SpotifyPlayerStateResponse(BaseModel):
+    success: bool
+    isPlaying: bool = False
+    progressMs: int | None = None
+    device: SpotifyDevice | None = None
+    track: SpotifyTrack | None = None
+    contextUri: str = ""
+    currentlyPlayingType: str = ""
+    hasActiveDevice: bool = False
+    message: str = ""
+    errors: list[str] = Field(default_factory=list)
+
+
+class SpotifyDevicesResponse(BaseModel):
+    success: bool
+    devices: list[SpotifyDevice] = Field(default_factory=list)
+    count: int = 0
+    activeDeviceId: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class SpotifyPlaybackCommandRequest(BaseModel):
+    deviceId: str | None = None
+    position: int | None = None
+    spotifyTrackId: str | None = None
+    spotifyUri: str | None = None
+
+
+class SpotifyPlaybackCommandResponse(BaseModel):
+    success: bool
+    action: str
+    player: SpotifyPlayerStateResponse | None = None
+    message: str = ""
+    errors: list[str] = Field(default_factory=list)
+
+
+class SpotifyCurrentTrackVoteRequest(BaseModel):
+    note: str = ""
+    skipAfterReview: bool = True
 
 
 class SpotifyPlaylist(BaseModel):
@@ -75,6 +129,7 @@ class SpotifyVoteRequest(BaseModel):
     spotifyTrackId: str | None = None
     spotifyUri: str | None = None
     note: str = ""
+    skipAfterReview: bool = False
 
 
 class SpotifyVoteResponse(BaseModel):
@@ -83,6 +138,7 @@ class SpotifyVoteResponse(BaseModel):
     track: SpotifyTrack | None = None
     addedToGoodSongs: bool = False
     removedFromGoodSongOptions: bool = False
+    skippedAfterReview: bool = False
     errors: list[str] = Field(default_factory=list)
 
 

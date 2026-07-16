@@ -18,7 +18,11 @@ SPOTIFY_SCOPE = (
     "playlist-read-private "
     "playlist-read-collaborative "
     "playlist-modify-private "
-    "playlist-modify-public"
+    "playlist-modify-public "
+    "user-read-private "
+    "user-read-playback-state "
+    "user-read-currently-playing "
+    "user-modify-playback-state"
 )
 
 VERSION_WORDS_RE = re.compile(
@@ -157,6 +161,15 @@ def extract_track_payload(track: dict[str, Any]) -> dict[str, Any]:
     spotify_uri = track.get("uri") or f"spotify:track:{spotify_track_id}"
     track_name = track.get("name") or ""
 
+    release_date = album.get("release_date") or ""
+    release_year = None
+
+    if release_date:
+        try:
+            release_year = int(release_date[:4])
+        except ValueError:
+            release_year = None
+
     return {
         "spotifyTrackId": spotify_track_id,
         "spotifyUri": spotify_uri,
@@ -164,6 +177,8 @@ def extract_track_payload(track: dict[str, Any]) -> dict[str, Any]:
         "artists": artists_text,
         "albumName": album.get("name") or "",
         "albumId": album.get("id") or "",
+        "releaseDate": release_date,
+        "releaseYear": release_year,
         "durationMs": track.get("duration_ms"),
         "explicit": track.get("explicit"),
         "popularity": track.get("popularity"),
@@ -171,6 +186,17 @@ def extract_track_payload(track: dict[str, Any]) -> dict[str, Any]:
         "artworkUrl": images[0].get("url", "") if images else "",
         "spotifyUrl": (track.get("external_urls") or {}).get("spotify", ""),
         "normalizedTitleArtistKey": title_artist_key(track_name, artists_text),
+    }
+
+
+def extract_device_payload(device: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": device.get("id"),
+        "name": device.get("name") or "",
+        "type": device.get("type") or "",
+        "isActive": bool(device.get("is_active")),
+        "isRestricted": bool(device.get("is_restricted")),
+        "volumePercent": device.get("volume_percent"),
     }
 
 
@@ -183,6 +209,8 @@ def track_row_to_api(row: dict[str, Any]) -> dict[str, Any]:
         "artists": row.get("artists") or "",
         "albumName": row.get("album_name") or "",
         "albumId": row.get("album_id") or "",
+        "releaseDate": row.get("release_date") or "",
+        "releaseYear": row.get("release_year"),
         "durationMs": row.get("duration_ms"),
         "explicit": row.get("explicit"),
         "popularity": row.get("popularity"),
@@ -211,6 +239,8 @@ def upsert_track(conn: PgConnection, payload: dict[str, Any]) -> dict[str, Any]:
                 artwork_url,
                 spotify_url,
                 normalized_title_artist_key,
+                release_date,
+                release_year,
                 updated_at
             )
             VALUES (
@@ -227,6 +257,8 @@ def upsert_track(conn: PgConnection, payload: dict[str, Any]) -> dict[str, Any]:
                 %(artworkUrl)s,
                 %(spotifyUrl)s,
                 %(normalizedTitleArtistKey)s,
+                %(releaseDate)s,
+                %(releaseYear)s,
                 now()
             )
             ON CONFLICT (spotify_track_id)
@@ -243,6 +275,8 @@ def upsert_track(conn: PgConnection, payload: dict[str, Any]) -> dict[str, Any]:
                 artwork_url = EXCLUDED.artwork_url,
                 spotify_url = EXCLUDED.spotify_url,
                 normalized_title_artist_key = EXCLUDED.normalized_title_artist_key,
+                release_date = EXCLUDED.release_date,
+                release_year = EXCLUDED.release_year,
                 updated_at = now()
             RETURNING *
             """,
@@ -337,6 +371,464 @@ def get_db_track_by_uri(conn: PgConnection, spotify_uri: str) -> dict[str, Any] 
         row = cur.fetchone()
 
     return dict(row) if row else None
+
+
+def spotify_current_playback(sp: spotipy.Spotify, market: str = "US") -> dict[str, Any] | None:
+    try:
+        return spotify_call(sp.current_playback, market=market, additional_types="track")
+    except TypeError:
+        return spotify_call(sp.current_playback, market=market)
+
+
+def player_state_to_api(conn: PgConnection, state: dict[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return {
+            "success": True,
+            "isPlaying": False,
+            "progressMs": None,
+            "device": None,
+            "track": None,
+            "contextUri": "",
+            "currentlyPlayingType": "",
+            "hasActiveDevice": False,
+            "message": "No active Spotify playback was returned.",
+            "errors": [],
+        }
+
+    device = state.get("device") or {}
+    item = state.get("item") or None
+    currently_playing_type = state.get("currently_playing_type") or (item or {}).get("type") or ""
+    context = state.get("context") or {}
+
+    track_api = None
+    message = ""
+
+    if item and item.get("type") == "track":
+        payload = extract_track_payload(item)
+        if payload["spotifyTrackId"]:
+            db_track = upsert_track(conn, payload)
+            track_api = track_row_to_api(db_track)
+    elif item:
+        message = f"Spotify is currently playing a {currently_playing_type}, not a track."
+
+    return {
+        "success": True,
+        "isPlaying": bool(state.get("is_playing")),
+        "progressMs": state.get("progress_ms"),
+        "device": extract_device_payload(device) if device else None,
+        "track": track_api,
+        "contextUri": context.get("uri") or "",
+        "currentlyPlayingType": currently_playing_type,
+        "hasActiveDevice": bool(device.get("id")),
+        "message": message,
+        "errors": [],
+    }
+
+
+def get_player_state_with_client(
+    conn: PgConnection,
+    sp: spotipy.Spotify,
+    market: str = "US",
+) -> dict[str, Any]:
+    state = spotify_current_playback(sp, market=market)
+    response = player_state_to_api(conn, state)
+    conn.commit()
+    return response
+
+
+def get_player_state(conn: PgConnection, market: str = "US") -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    return get_player_state_with_client(conn=conn, sp=sp, market=market)
+
+
+def get_devices_with_client(sp: spotipy.Spotify) -> dict[str, Any]:
+    data = spotify_call(sp.devices) or {}
+    devices = [extract_device_payload(device) for device in data.get("devices") or []]
+    active_device_id = next((device["id"] for device in devices if device["isActive"]), None)
+
+    return {
+        "success": True,
+        "devices": devices,
+        "count": len(devices),
+        "activeDeviceId": active_device_id,
+        "errors": [],
+    }
+
+
+def get_devices() -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    return get_devices_with_client(sp)
+
+
+def choose_playback_device_id(
+    sp: spotipy.Spotify,
+    requested_device_id: str | None = None,
+    market: str = "US",
+) -> str | None:
+    requested_device_id = (requested_device_id or "").strip()
+    if requested_device_id:
+        return requested_device_id
+
+    state = spotify_current_playback(sp, market=market)
+    active_device_id = ((state or {}).get("device") or {}).get("id")
+    if active_device_id:
+        return active_device_id
+
+    devices = get_devices_with_client(sp).get("devices") or []
+    for device in devices:
+        if device.get("id") and not device.get("isRestricted"):
+            return device["id"]
+
+    return None
+
+
+def playback_command_response(
+    conn: PgConnection,
+    sp: spotipy.Spotify,
+    action: str,
+    success: bool,
+    message: str = "",
+    errors: list[str] | None = None,
+    market: str = "US",
+    refresh_player: bool = True,
+) -> dict[str, Any]:
+    response_errors = errors or []
+    player = None
+
+    if refresh_player:
+        try:
+            time.sleep(0.25)
+            player = get_player_state_with_client(conn=conn, sp=sp, market=market)
+        except Exception as exc:
+            conn.rollback()
+            response_errors.append(f"player refresh failed: {exc}")
+
+    return {
+        "success": success,
+        "action": action,
+        "player": player,
+        "message": message,
+        "errors": response_errors,
+    }
+
+
+def play_good_song_options_playlist(
+    conn: PgConnection,
+    device_id: str | None = None,
+    position: int | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    selected_device_id = choose_playback_device_id(sp, device_id, market=market)
+
+    if not selected_device_id:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="play_good_song_options",
+            success=False,
+            message="No available Spotify Connect device found. Start Spotify on a phone, desktop, or speaker, then try again.",
+            refresh_player=False,
+        )
+
+    offset = {"position": position} if position is not None else None
+
+    try:
+        spotify_call(
+            sp.start_playback,
+            device_id=selected_device_id,
+            context_uri=f"spotify:playlist:{get_good_song_options_playlist_id()}",
+            offset=offset,
+        )
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="play_good_song_options",
+            success=False,
+            message="Spotify rejected the play request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="play_good_song_options",
+        success=True,
+        message="Started the Good Song Options playlist.",
+        market=market,
+    )
+
+
+def play_track(
+    conn: PgConnection,
+    spotify_track_id: str | None = None,
+    spotify_uri: str | None = None,
+    device_id: str | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    selected_device_id = choose_playback_device_id(sp, device_id, market=market)
+
+    if not selected_device_id:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="play_track",
+            success=False,
+            message="No available Spotify Connect device found. Start Spotify on a phone, desktop, or speaker, then try again.",
+            refresh_player=False,
+        )
+
+    try:
+        db_track = find_or_fetch_track(
+            conn=conn,
+            sp=sp,
+            spotify_track_id=spotify_track_id,
+            spotify_uri=spotify_uri,
+            market=market,
+        )
+        spotify_call(
+            sp.start_playback,
+            device_id=selected_device_id,
+            uris=[db_track["spotify_uri"]],
+        )
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="play_track",
+            success=False,
+            message="Spotify rejected the play-track request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="play_track",
+        success=True,
+        message="Started the requested track.",
+        market=market,
+    )
+
+
+def resume_playback(
+    conn: PgConnection,
+    device_id: str | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    selected_device_id = choose_playback_device_id(sp, device_id, market=market)
+
+    if not selected_device_id:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="resume",
+            success=False,
+            message="No available Spotify Connect device found. Start Spotify on a phone, desktop, or speaker, then try again.",
+            refresh_player=False,
+        )
+
+    try:
+        spotify_call(sp.start_playback, device_id=selected_device_id)
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="resume",
+            success=False,
+            message="Spotify rejected the resume request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="resume",
+        success=True,
+        message="Resumed Spotify playback.",
+        market=market,
+    )
+
+
+def pause_playback(
+    conn: PgConnection,
+    device_id: str | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+
+    try:
+        spotify_call(sp.pause_playback, device_id=(device_id or None))
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="pause",
+            success=False,
+            message="Spotify rejected the pause request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="pause",
+        success=True,
+        message="Paused Spotify playback.",
+        market=market,
+    )
+
+
+def next_track(
+    conn: PgConnection,
+    device_id: str | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+
+    try:
+        spotify_call(sp.next_track, device_id=(device_id or None))
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="next",
+            success=False,
+            message="Spotify rejected the next-track request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="next",
+        success=True,
+        message="Skipped to the next Spotify track.",
+        market=market,
+    )
+
+
+def previous_track(
+    conn: PgConnection,
+    device_id: str | None = None,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+
+    try:
+        spotify_call(sp.previous_track, device_id=(device_id or None))
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="previous",
+            success=False,
+            message="Spotify rejected the previous-track request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="previous",
+        success=True,
+        message="Skipped to the previous Spotify track.",
+        market=market,
+    )
+
+
+def transfer_playback(
+    conn: PgConnection,
+    device_id: str,
+    force_play: bool = True,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+
+    try:
+        spotify_call(sp.transfer_playback, device_id=device_id, force_play=force_play)
+    except Exception as exc:
+        return playback_command_response(
+            conn=conn,
+            sp=sp,
+            action="transfer",
+            success=False,
+            message="Spotify rejected the transfer-playback request.",
+            errors=[str(exc)],
+        )
+
+    return playback_command_response(
+        conn=conn,
+        sp=sp,
+        action="transfer",
+        success=True,
+        message="Transferred Spotify playback.",
+        market=market,
+    )
+
+
+def get_current_track_for_review(
+    conn: PgConnection,
+    sp: spotipy.Spotify,
+    market: str = "US",
+) -> dict[str, Any]:
+    state = spotify_current_playback(sp, market=market)
+    if not state:
+        raise RuntimeError("Spotify did not return an active currently-playing track.")
+
+    item = state.get("item") or {}
+    if item.get("type") != "track":
+        item_type = state.get("currently_playing_type") or item.get("type") or "unknown item"
+        raise RuntimeError(f"Spotify is currently playing a {item_type}, not a track.")
+
+    payload = extract_track_payload(item)
+    if not payload["spotifyTrackId"]:
+        raise RuntimeError("Spotify returned a track without a Spotify track ID.")
+
+    return upsert_track(conn, payload)
+
+
+def thumbs_up_current_track(
+    conn: PgConnection,
+    note: str = "",
+    skip_after_review: bool = True,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    db_track = get_current_track_for_review(conn=conn, sp=sp, market=market)
+
+    return thumbs_up_track(
+        conn=conn,
+        spotify_track_id=db_track["spotify_track_id"],
+        spotify_uri=db_track["spotify_uri"],
+        note=note,
+        market=market,
+        sp=sp,
+        skip_after_review=skip_after_review,
+    )
+
+
+def thumbs_down_current_track(
+    conn: PgConnection,
+    note: str = "",
+    skip_after_review: bool = True,
+    market: str = "US",
+) -> dict[str, Any]:
+    sp = make_spotify_client(open_browser=False)
+    db_track = get_current_track_for_review(conn=conn, sp=sp, market=market)
+
+    return thumbs_down_track(
+        conn=conn,
+        spotify_track_id=db_track["spotify_track_id"],
+        spotify_uri=db_track["spotify_uri"],
+        note=note,
+        market=market,
+        sp=sp,
+        skip_after_review=skip_after_review,
+    )
 
 
 def sync_playlist(
@@ -704,8 +1196,11 @@ def thumbs_up_track(
     spotify_uri: str | None = None,
     note: str = "",
     market: str = "US",
+    sp: spotipy.Spotify | None = None,
+    skip_after_review: bool = False,
+    device_id: str | None = None,
 ) -> dict[str, Any]:
-    sp = make_spotify_client(open_browser=False)
+    sp = sp or make_spotify_client(open_browser=False)
 
     good_song_options_playlist_id = get_good_song_options_playlist_id()
     good_songs_playlist_id = get_good_songs_playlist_id()
@@ -758,13 +1253,23 @@ def thumbs_up_track(
 
     conn.commit()
 
+    errors: list[str] = []
+    skipped_after_review = False
+    if skip_after_review:
+        try:
+            spotify_call(sp.next_track, device_id=(device_id or None))
+            skipped_after_review = True
+        except Exception as exc:
+            errors.append(f"review saved, but skip failed: {exc}")
+
     return {
         "success": True,
         "decision": "thumbs_up",
         "track": track_row_to_api(db_track),
         "addedToGoodSongs": added_to_good_songs,
         "removedFromGoodSongOptions": True,
-        "errors": [],
+        "skippedAfterReview": skipped_after_review,
+        "errors": errors,
     }
 
 
@@ -774,8 +1279,11 @@ def thumbs_down_track(
     spotify_uri: str | None = None,
     note: str = "",
     market: str = "US",
+    sp: spotipy.Spotify | None = None,
+    skip_after_review: bool = False,
+    device_id: str | None = None,
 ) -> dict[str, Any]:
-    sp = make_spotify_client(open_browser=False)
+    sp = sp or make_spotify_client(open_browser=False)
 
     good_song_options_playlist_id = get_good_song_options_playlist_id()
 
@@ -813,13 +1321,23 @@ def thumbs_down_track(
 
     conn.commit()
 
+    errors: list[str] = []
+    skipped_after_review = False
+    if skip_after_review:
+        try:
+            spotify_call(sp.next_track, device_id=(device_id or None))
+            skipped_after_review = True
+        except Exception as exc:
+            errors.append(f"review saved, but skip failed: {exc}")
+
     return {
         "success": True,
         "decision": "thumbs_down",
         "track": track_row_to_api(db_track),
         "addedToGoodSongs": False,
         "removedFromGoodSongOptions": True,
-        "errors": [],
+        "skippedAfterReview": skipped_after_review,
+        "errors": errors,
     }
 
 
@@ -936,6 +1454,7 @@ def resolve_track_by_search(
         "track": track_row_to_api(db_track),
     }
 
+
 def add_track_to_local_playlist(
     conn: PgConnection,
     role: str,
@@ -987,10 +1506,7 @@ def remove_track_from_local_playlist(
 
 def get_mobile_config() -> dict[str, Any]:
     good_song_options_playlist_id = get_good_song_options_playlist_id()
-    android_redirect_uri = os.environ.get("SPOTIFY_ANDROID_REDIRECT_URI")
-
-    if not android_redirect_uri:
-        raise RuntimeError("Missing required environment variable: SPOTIFY_ANDROID_REDIRECT_URI")
+    android_redirect_uri = os.environ.get("SPOTIFY_ANDROID_REDIRECT_URI", "")
 
     return {
         "success": True,
@@ -998,4 +1514,5 @@ def get_mobile_config() -> dict[str, Any]:
         "redirectUri": android_redirect_uri,
         "goodSongOptionsPlaylistId": good_song_options_playlist_id,
         "goodSongOptionsPlaylistUri": f"spotify:playlist:{good_song_options_playlist_id}",
+        "usesBackendPlayer": True,
     }
