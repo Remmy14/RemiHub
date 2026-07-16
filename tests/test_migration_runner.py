@@ -19,7 +19,10 @@ class MigrationDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(
             [(migration.version, migration.name) for migration in migrations],
-            [("0001", "auth_foundation")],
+            [
+                ("0001", "auth_foundation"),
+                ("0002", "remove_uv_alert_prototype"),
+            ],
         )
 
     def test_discovers_up_and_down_migration(self):

@@ -58,7 +58,9 @@ cd /opt/remihub
 
 Verify in QA:
 
-1. `0001_auth_foundation` reports `applied`.
+1. `0001_auth_foundation` and `0002_remove_uv_alert_prototype` report
+   `applied`. Migration `0002` intentionally removes the abandoned UV alert
+   proof-of-concept tables and their data.
 2. Existing API calls without an `Authorization` header still work in
    `transition` mode.
 3. `/auth/me` returns `401` without a bearer token.
@@ -90,17 +92,20 @@ Firebase bearer tokens and their authenticated release has been verified.
 
 ## Rollback
 
-Migration `0001` is additive, so the safest application rollback is to restore
-the previous source and dependencies, restart RemiHub, and leave the new tables
-and columns in place. The old application will ignore them.
+The safest application rollback is to restore the previous source and
+dependencies, restart RemiHub, and leave both database migrations applied.
+The old application will ignore the additive authentication schema, and the UV
+alert prototype was unused.
 
-Only run the destructive `down` migration if there is a specific reason to
-remove the added schema. Stop RemiHub first, retain a verified backup, restore
-the old application code, and then run:
+Only downgrade if there is a specific reason to recreate the removed UV table
+structures. Stop RemiHub first, retain a verified backup, restore the old
+application code, and then run:
 
 ```bash
 .venv/bin/python -m backend.database.migration_runner downgrade --steps 1
 ```
 
-The down migration removes user associations and notification data stored by
-this phase.
+This reverses only migration `0002`. It recreates empty UV alert tables; it
+cannot restore the prototype data deleted by the upgrade. Reversing migration
+`0001` as well would remove user associations and notification data introduced
+by the authentication foundation and should not be part of a routine rollback.

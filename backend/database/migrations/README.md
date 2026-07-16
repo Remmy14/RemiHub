@@ -30,6 +30,8 @@ Rules:
 - Keep each file transactional. Do not use statements such as `CREATE INDEX
   CONCURRENTLY` that cannot run inside the runner's transaction.
 - Treat `down` migrations as an explicit recovery tool. They can discard data.
+- Destructive migrations require explicit approval and a verified backup. State
+  clearly when a `down` migration cannot restore deleted data.
 - Run and verify migrations against QA before production.
 
 The first `status` invocation creates the empty migration-history table if it
