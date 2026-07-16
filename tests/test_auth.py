@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
@@ -11,7 +12,10 @@ from backend.core.auth import (
     get_current_principal,
     require_current_principal,
 )
-from backend.core.firebase_auth import FirebaseConfigurationError
+from backend.core.firebase_auth import (
+    FirebaseConfigurationError,
+    get_service_account_path,
+)
 from backend.services.auth_service import (
     InactiveUserError,
     UserNotAuthorizedError,
@@ -48,6 +52,29 @@ class AuthModeTests(unittest.TestCase):
         with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": "sometimes"}, clear=True):
             with self.assertRaises(RuntimeError):
                 get_auth_mode()
+
+
+class FirebaseConfigurationTests(unittest.TestCase):
+    def test_uses_configured_service_account_path(self):
+        configured_path = Path("/secure/firebase-service-account.json")
+
+        with patch.dict(
+            os.environ,
+            {"FIREBASE_SERVICE_ACCOUNT_FILE": str(configured_path)},
+            clear=True,
+        ):
+            self.assertEqual(get_service_account_path(), configured_path)
+
+    def test_empty_configuration_uses_repository_default(self):
+        with patch.dict(
+            os.environ,
+            {"FIREBASE_SERVICE_ACCOUNT_FILE": ""},
+            clear=True,
+        ):
+            resolved = get_service_account_path()
+
+        self.assertEqual(resolved.name, "firebase-service-account.json")
+        self.assertEqual(resolved.parent.name, "config")
 
 
 class AuthenticationDependencyTests(unittest.TestCase):

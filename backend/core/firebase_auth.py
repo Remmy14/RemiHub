@@ -16,7 +16,7 @@ class FirebaseConfigurationError(RuntimeError):
     """Raised when server-side Firebase authentication is not configured."""
 
 
-def _get_service_account_path() -> Path:
+def get_service_account_path() -> Path:
     configured = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE")
     return Path(configured) if configured else _DEFAULT_SERVICE_ACCOUNT_PATH
 
@@ -50,7 +50,7 @@ def _get_firebase_app():
         except ValueError:
             pass
 
-        service_account_path = _get_service_account_path()
+        service_account_path = get_service_account_path()
         if not service_account_path.is_file():
             raise FirebaseConfigurationError(
                 f"Firebase service account file not found: {service_account_path}"

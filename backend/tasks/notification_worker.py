@@ -8,6 +8,7 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
 # Local Imports
+from backend.core.firebase_auth import get_service_account_path
 from backend.database.database import get_db_conn, put_db_conn
 
 
@@ -23,12 +24,9 @@ logger = logging.getLogger("notification_worker")
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 FCM_URL_TEMPLATE = "https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 
-SERVICE_ACCOUNT_FILE = "config/firebase-service-account.json"
-
-
 def load_credentials():
     credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
+        str(get_service_account_path()),
         scopes=[FCM_SCOPE]
     )
     return credentials

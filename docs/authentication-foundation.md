@@ -38,6 +38,9 @@ FIREBASE_CHECK_REVOKED=true
 `REMIHUB_DATABASE_CONFIG` lets the running service use a permission-restricted
 application credential outside the source checkout. It does not affect the
 migration runner when that command is given its separate `--config` path.
+`FIREBASE_SERVICE_ACCOUNT_FILE` is shared by authentication and the push
+notification worker, so neither subsystem depends on a credential in the
+source checkout.
 
 `REMIHUB_ADMIN_EMAILS` is a comma-separated bootstrap allowlist. A verified
 Firebase identity on that list is enrolled as the first RemiHub administrator.
