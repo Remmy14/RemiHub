@@ -11,6 +11,7 @@ from playwright.sync_api import sync_playwright
 from backend.database.database import get_db_conn, put_db_conn
 from backend.scripts import pool_watch_meta
 from backend import config
+from backend.core.runtime_paths import ensure_log_directory
 
 # ----------------------
 # Configure Logging
@@ -18,7 +19,8 @@ from backend import config
 logger = logging.getLogger('PoolMonitor')
 logger.setLevel(logging.INFO)
 
-log_handler = RotatingFileHandler('backend/logs/pool_monitor.log', maxBytes=1_000_000, backupCount=3)
+LOG_DIR = ensure_log_directory()
+log_handler = RotatingFileHandler(LOG_DIR / 'pool_monitor.log', maxBytes=1_000_000, backupCount=3)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)
@@ -122,7 +124,7 @@ def next_interval_boundary(now: datetime, interval_minutes: int) -> datetime:
 
 def run_pool_monitor(_config=None):
     if not _config:
-        _config = config.load_config('config/config.ini')
+        _config = config.load_application_config()
 
     logger.info("Pool monitor started.")
     while True:
@@ -142,7 +144,7 @@ def run_pool_monitor(_config=None):
 # Entry Point
 # ----------------------
 if __name__ == '__main__':
-    _config = config.load_config('config/config.ini')
+    _config = config.load_application_config()
     # run_pool_monitor(_config['Pool Monitor'])
 
     temps = fetch_raymote_temperatures(_config['Pool Monitor'])

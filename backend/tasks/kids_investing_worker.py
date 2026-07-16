@@ -4,7 +4,6 @@ from io import StringIO
 import csv
 import logging
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 import time
 import pandas as pd
 from datetime import date
@@ -15,10 +14,9 @@ import yfinance as yf
 import requests
 
 from backend.services import kids_investing_service
+from backend.core.runtime_paths import ensure_log_directory
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-LOG_DIR = BASE_DIR / "backend" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = ensure_log_directory()
 
 logger = logging.getLogger("KidsInvestingWorker")
 logger.setLevel(logging.INFO)

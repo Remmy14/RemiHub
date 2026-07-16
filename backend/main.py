@@ -15,6 +15,7 @@ from starlette.staticfiles import StaticFiles
 
 # Local Imports
 from backend.services.race import race_service
+from backend.config import resolve_environment_file_path
 from backend.core.auth import AuthMode, get_auth_mode, get_current_principal
 from backend.database.database import get_db_conn, put_db_conn
 from backend.routers import (
@@ -55,8 +56,7 @@ STATIC_DIR = BASE_DIR / 'backend' / 'static'
 WEB_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
 
 # Load environment variables
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_ENV_PATH = _PROJECT_ROOT / "config" / "remihub.env"
+_ENV_PATH = resolve_environment_file_path()
 
 load_dotenv(dotenv_path=_ENV_PATH, override=False)
 
@@ -133,8 +133,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount our images directory
-app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
+# Static assets and the web bundle are generated or runtime-managed files and
+# may not exist in a clean development worktree. Defer the directory check
+# until the mount is requested; deployment validation still verifies them.
+app.mount(
+    '/static',
+    StaticFiles(directory=str(STATIC_DIR), check_dir=False),
+    name='static',
+)
 
 # Serve React pages for race and draft
 @app.get("/race/draft", include_in_schema=False)
@@ -147,7 +153,11 @@ async def serve_race_draft(full_path: str = ""):
 async def serve_storage_status(full_path: str = ""):
     return FileResponse(WEB_DIST_DIR / "index.html")
 
-app.mount('/race', StaticFiles(directory=str(WEB_DIST_DIR), html=True), name='race')
+app.mount(
+    '/race',
+    StaticFiles(directory=str(WEB_DIST_DIR), html=True, check_dir=False),
+    name='race',
+)
 
 def db_dependency():
     conn = get_db_conn()

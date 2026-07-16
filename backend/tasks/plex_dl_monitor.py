@@ -15,7 +15,8 @@ from plexapi.server import PlexServer
 
 # Local Imports
 sys.path.append('M:/Q_Drive/Projects/RemiHub/')
-from backend.config import load_config
+from backend.config import load_application_config
+from backend.core.runtime_paths import ensure_log_directory
 
 # ----------------------
 # Configure Logging
@@ -23,7 +24,8 @@ from backend.config import load_config
 logger = logging.getLogger('PlexMonitor')
 logger.setLevel(logging.INFO)
 
-log_handler = RotatingFileHandler('backend/logs/plex_dl_monitor.log', maxBytes=1_000_000, backupCount=3)
+LOG_DIR = ensure_log_directory()
+log_handler = RotatingFileHandler(LOG_DIR / 'plex_dl_monitor.log', maxBytes=1_000_000, backupCount=3)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)
@@ -236,7 +238,7 @@ def main():
     logger.info(f'Starting Plex DL Monitor Service')
 
     # Initialize our config
-    config = load_config('config/config.ini')['Plex Monitor']
+    config = load_application_config()['Plex Monitor']
 
     download_dir = config['download_dir']
     media_root = config['media_dir']

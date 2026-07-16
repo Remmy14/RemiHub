@@ -28,12 +28,19 @@ production path used in this rollout is
 `/opt/remihub-agent/config/remihub.env`:
 
 ```dotenv
+REMIHUB_CONFIG_FILE=/opt/remihub-agent/config/application.ini
 REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/config/prod-app.ini
+REMIHUB_ENV_FILE=/opt/remihub-agent/config/remihub.env
 REMIHUB_AUTH_MODE=transition
 REMIHUB_ADMIN_EMAILS=your-google-account@example.com
 FIREBASE_SERVICE_ACCOUNT_FILE=/opt/remihub-agent/config/firebase-service-account.json
 FIREBASE_CHECK_REVOKED=true
 ```
+
+`REMIHUB_CONFIG_FILE` points legacy application components at their protected
+non-database INI configuration. The protected copy must not contain a
+`[Database]` section. `REMIHUB_ENV_FILE` gives API entry points and manual
+scripts the same protected dotenv path used by systemd.
 
 `REMIHUB_DATABASE_CONFIG` lets the running service use a permission-restricted
 application credential outside the source checkout. It does not affect the

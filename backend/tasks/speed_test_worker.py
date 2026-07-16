@@ -3,13 +3,12 @@ import logging
 import subprocess
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 
 # Local Imports
+from backend.core.runtime_paths import ensure_log_directory
 from backend.database.database import get_db_conn, put_db_conn
 
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = ensure_log_directory()
 LOG_FILE = LOG_DIR / "speed_test.log"
 
 logger = logging.getLogger("speed_test")

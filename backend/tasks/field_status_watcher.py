@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
 from backend.notifications.notifications import insert_notification, Notification
+from backend.core.runtime_paths import ensure_log_directory
 
 FIELD_STATUS_URL = "https://lakotasports.org/facility_status.php"
 
@@ -23,7 +24,8 @@ FIELD_STATUS_URL = "https://lakotasports.org/facility_status.php"
 logger = logging.getLogger('FieldStatusMonitor')
 logger.setLevel(logging.INFO)
 
-log_handler = RotatingFileHandler('backend/logs/field_status_monitor.log', maxBytes=1_000_000, backupCount=3)
+LOG_DIR = ensure_log_directory()
+log_handler = RotatingFileHandler(LOG_DIR / 'field_status_monitor.log', maxBytes=1_000_000, backupCount=3)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
 log_handler.setFormatter(formatter)
 logger.addHandler(log_handler)

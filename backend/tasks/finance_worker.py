@@ -7,7 +7,6 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import re
 import requests
@@ -26,17 +25,16 @@ from cryptography.fernet import Fernet
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
 from backend.notifications.notifications import insert_notification, Notification
-from backend.config import load_config
+from backend.config import load_application_config, resolve_environment_file_path
+from backend.core.runtime_paths import ensure_log_directory
 
 # Initialize config
-cfg = load_config('config/config.ini')
+cfg = load_application_config()
 finance_config = cfg.get('Finance', {})
 
 
 # Create loggers
-BASE_DIR = Path(__file__).resolve().parent.parent.parent  # /opt/remihub
-LOG_DIR = BASE_DIR / "backend" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = ensure_log_directory()
 
 logger = logging.getLogger("FinanceWorker")
 logger.setLevel(logging.INFO)
@@ -1329,6 +1327,6 @@ def run_finance_worker():
 
 
 if __name__ == "__main__":
-    load_dotenv("config/remihub.env")
+    load_dotenv(dotenv_path=resolve_environment_file_path(), override=False)
     print(preview_monthly_finance_snapshot_items())
 

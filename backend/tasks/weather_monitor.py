@@ -10,7 +10,7 @@ from typing import Any
 # Local Imports
 from backend.database.database import get_db_conn, put_db_conn
 sys.path.append('M:/Q_Drive/Projects/RemiHub/')
-from backend.config import load_config
+from backend.config import load_application_config
 
 AMBIENT_DEVICES_URL = "https://api.ambientweather.net/v1/devices"
 
@@ -18,7 +18,7 @@ AMBIENT_DEVICES_URL = "https://api.ambientweather.net/v1/devices"
 class AmbientWeatherError(Exception):
     pass
 
-cfg = load_config('config/config.ini')
+cfg = load_application_config()
 weather_cfg = cfg.get('Weather', {})
 
 api_key = weather_cfg.get('api_key')

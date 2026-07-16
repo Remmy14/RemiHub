@@ -3,8 +3,9 @@ from dotenv import load_dotenv
 
 import os
 import sys
-from pathlib import Path
 from spotipy.oauth2 import SpotifyOAuth
+
+from backend.config import resolve_environment_file_path
 
 
 SPOTIFY_SCOPE = (
@@ -79,8 +80,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     # Load environment variables
-    _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-    _ENV_PATH = _PROJECT_ROOT / "config" / "remihub.env"
+    _ENV_PATH = resolve_environment_file_path()
     print(f'Environment variables: {_ENV_PATH}')
     print(f'Current Directory: {os.getcwd()}')
     load_dotenv(dotenv_path=_ENV_PATH, override=False)

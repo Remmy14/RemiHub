@@ -11,7 +11,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-from backend.config import load_config
+from backend.config import load_application_config
 
 @dataclass
 class AutoLoginResult:
@@ -62,7 +62,7 @@ class AutoLoginService:
     # ---------- providers ----------
 
     def _login_fanduel(self, code: str, logs: List[str]) -> None:
-        cfg = load_config('config/config.ini')
+        cfg = load_application_config()
         fd = cfg.get('Auto Login.fanduel', {})
 
         activate_url = fd.get('activate_url')  # e.g. https://fanduelsportsnetwork.com/mvpd/connect

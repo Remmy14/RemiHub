@@ -21,9 +21,10 @@ from backend.tasks.finance_worker import (
     mark_plaid_item_error,
     mark_plaid_item_success,
 )
+from backend.config import resolve_environment_file_path
 
 
-load_dotenv(dotenv_path='config/remihub.env')
+load_dotenv(dotenv_path=resolve_environment_file_path(), override=False)
 
 app = Flask(__name__)
 

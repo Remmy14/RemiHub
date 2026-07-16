@@ -11,7 +11,7 @@ import asyncpg
 from fastapi import APIRouter, HTTPException
 
 # Local Imports
-from backend.config import load_config
+from backend.config import load_application_config
 
 
 router = APIRouter(prefix="/rh-storage", tags=["RH Storage"])
@@ -39,7 +39,7 @@ def _gb(value: int | None) -> float | None:
 def _get_rh_storage_database_url() -> str:
     url = os.environ.get("RH_STORAGE_DATABASE_URL")
     if not url:
-        cfg = load_config("config/config.ini")
+        cfg = load_application_config()
         config = cfg.get("RHStorage", {})
         url = config.get("db_url")
     return url
