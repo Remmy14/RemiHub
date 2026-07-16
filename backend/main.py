@@ -19,6 +19,7 @@ from backend.config import resolve_environment_file_path
 from backend.core.auth import AuthMode, get_auth_mode, get_current_principal
 from backend.database.database import get_db_conn, put_db_conn
 from backend.routers import (
+        agent,
         app_update,
         auth,
         auto_logins,
@@ -100,6 +101,10 @@ app = FastAPI(lifespan=lifespan)
 # Authentication verification has its own strict dependency so it remains
 # testable while the rest of the API is temporarily in transition mode.
 app.include_router(auth.router)
+
+# Agent operations are always strict and administrator-only, even while legacy
+# RemiHub routes remain in transition mode.
+app.include_router(agent.router)
 
 routers = [
     race.router,

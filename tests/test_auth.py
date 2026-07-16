@@ -8,8 +8,10 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from backend.core.auth import (
     AuthMode,
+    AuthenticatedPrincipal,
     get_auth_mode,
     get_current_principal,
+    require_admin_principal,
     require_current_principal,
 )
 from backend.core.firebase_auth import (
@@ -97,6 +99,35 @@ class AuthenticationDependencyTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as caught:
                 require_current_principal(None)
         self.assertEqual(caught.exception.status_code, 401)
+
+    def test_admin_dependency_accepts_administrator(self):
+        principal = AuthenticatedPrincipal(
+            id="c346f3f4-3867-4ddb-83ea-7d24db8817bc",
+            firebase_uid="firebase-user-1",
+            email="alex@example.com",
+            display_name="Alex",
+            role="admin",
+        )
+
+        self.assertIs(require_admin_principal(principal), principal)
+
+    def test_admin_dependency_rejects_member(self):
+        principal = AuthenticatedPrincipal(
+            id="c346f3f4-3867-4ddb-83ea-7d24db8817bc",
+            firebase_uid="firebase-user-1",
+            email="alex@example.com",
+            display_name="Alex",
+            role="member",
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            require_admin_principal(principal)
+
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertEqual(
+            caught.exception.detail,
+            "Administrator access required",
+        )
 
     @patch("backend.core.auth.resolve_authenticated_user", return_value=user_record())
     @patch(

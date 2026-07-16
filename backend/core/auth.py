@@ -133,5 +133,17 @@ def require_current_principal(
     return _principal_from_credentials(credentials)
 
 
+def require_admin_principal(
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+) -> AuthenticatedPrincipal:
+    if principal.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required",
+        )
+
+    return principal
+
+
 # Kept as a compatibility alias for any existing router imports.
 require_app_auth = get_current_principal

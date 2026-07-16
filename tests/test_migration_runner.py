@@ -22,8 +22,19 @@ class MigrationDiscoveryTests(unittest.TestCase):
             [
                 ("0001", "auth_foundation"),
                 ("0002", "remove_uv_alert_prototype"),
+                ("0003", "agent_workflow_foundation"),
             ],
         )
+
+    def test_agent_migration_enforces_single_open_card_and_active_run(self):
+        migration = (
+            MIGRATIONS_DIR / "0003_agent_workflow_foundation.up.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CREATE SCHEMA agent", migration)
+        self.assertIn("CREATE UNIQUE INDEX agent_one_open_card_uidx", migration)
+        self.assertIn("CREATE UNIQUE INDEX agent_one_active_run_uidx", migration)
+        self.assertIn("GRANT USAGE ON SCHEMA agent", migration)
 
     def test_discovers_up_and_down_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:

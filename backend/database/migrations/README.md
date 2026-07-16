@@ -33,6 +33,9 @@ Rules:
 - Destructive migrations require explicit approval and a verified backup. State
   clearly when a `down` migration cannot restore deleted data.
 - Run and verify migrations against QA before production.
+- Migration `0003_agent_workflow_foundation.down.sql` drops all agent cards and
+  history. Treat that downgrade as destructive even before the feature is in
+  regular use.
 
 The first `status` invocation creates the empty migration-history table if it
 does not already exist.
