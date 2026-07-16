@@ -23,14 +23,21 @@ Only FastAPI routers are behind the new dependency. Static web assets,
 
 ## Configuration
 
-Add these values to `/opt/remihub/config/remihub.env`:
+Add these values to the permission-restricted systemd environment file. The
+production path used in this rollout is
+`/opt/remihub-agent/config/remihub.env`:
 
 ```dotenv
+REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/config/prod-app.ini
 REMIHUB_AUTH_MODE=transition
 REMIHUB_ADMIN_EMAILS=your-google-account@example.com
-FIREBASE_SERVICE_ACCOUNT_FILE=/opt/remihub/config/firebase-service-account.json
+FIREBASE_SERVICE_ACCOUNT_FILE=/opt/remihub-agent/config/firebase-service-account.json
 FIREBASE_CHECK_REVOKED=true
 ```
+
+`REMIHUB_DATABASE_CONFIG` lets the running service use a permission-restricted
+application credential outside the source checkout. It does not affect the
+migration runner when that command is given its separate `--config` path.
 
 `REMIHUB_ADMIN_EMAILS` is a comma-separated bootstrap allowlist. A verified
 Firebase identity on that list is enrolled as the first RemiHub administrator.
