@@ -6,10 +6,10 @@ this is not a separate database.
 
 ## Safety boundary
 
-This increment does not invoke Codex, create Git worktrees, run builds, apply
-migrations, restart services, or deploy releases. It records administrator
-requests and creates durable queued runs for a separate worker to process in a
-later increment.
+The schema/API foundation itself does not invoke Codex, create Git worktrees,
+run builds, apply migrations, restart services, or deploy releases. It records
+administrator requests and creates durable queued runs for a separate worker;
+later worker increments consume that queue while preserving these boundaries.
 
 All `/agent` endpoints require a valid Firebase bearer token for an active
 RemiHub administrator. They remain strict even while legacy API routes use

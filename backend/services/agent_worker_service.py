@@ -92,6 +92,7 @@ def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
         worker_id=row["worker_id"],
         title=row["title"],
         description=row["description"],
+        codex_thread_id=row["codex_thread_id"],
         messages=tuple(messages),
     )
 
@@ -131,6 +132,7 @@ def claim_next_run(
     *,
     worker_id: str,
     lease_seconds: int,
+    allowed_phases: frozenset[RunPhase],
 ) -> ClaimedRun | None:
     normalized_worker_id = worker_id.strip()
     if not normalized_worker_id:
@@ -141,6 +143,14 @@ def claim_next_run(
         lease_seconds,
         field="lease_seconds",
     )
+    normalized_phases = sorted(
+        {
+            phase.value if isinstance(phase, RunPhase) else RunPhase(phase).value
+            for phase in allowed_phases
+        }
+    )
+    if not normalized_phases:
+        raise ValueError("allowed_phases must not be empty")
 
     conn = get_db_conn()
     try:
@@ -158,19 +168,23 @@ def claim_next_run(
                        cards.status AS card_status,
                        cards.resume_status,
                        cards.title,
-                       cards.description
+                       cards.description,
+                       cards.codex_thread_id
                 FROM agent.runs AS runs
                 JOIN agent.cards AS cards
                   ON cards.id = runs.card_id
-                WHERE (
-                    runs.status = 'queued'
-                    AND runs.available_at <= CURRENT_TIMESTAMP
-                ) OR (
-                    runs.status = 'blocked'
-                    AND runs.available_at <= CURRENT_TIMESTAMP
-                ) OR (
-                    runs.status IN ('claimed', 'running')
-                    AND runs.lease_expires_at <= CURRENT_TIMESTAMP
+                WHERE runs.phase = ANY(%s)
+                  AND (
+                    (
+                        runs.status = 'queued'
+                        AND runs.available_at <= CURRENT_TIMESTAMP
+                    ) OR (
+                        runs.status = 'blocked'
+                        AND runs.available_at <= CURRENT_TIMESTAMP
+                    ) OR (
+                        runs.status IN ('claimed', 'running')
+                        AND runs.lease_expires_at <= CURRENT_TIMESTAMP
+                    )
                 )
                 ORDER BY
                     CASE
@@ -183,7 +197,8 @@ def claim_next_run(
                     runs.id
                 FOR UPDATE OF runs, cards SKIP LOCKED
                 LIMIT 1
-                """
+                """,
+                (normalized_phases,),
             )
             row = _row_to_dict(cur, cur.fetchone())
 
@@ -194,7 +209,9 @@ def claim_next_run(
             phase, previous_card_status, active_card_status = _validate_candidate(row)
             previous_run_status = RunStatus(row["run_status"])
             lease_token = str(uuid4())
-            attempt_count = row["attempt_count"] + 1
+            attempt_count = row["attempt_count"] + (
+                0 if previous_run_status is RunStatus.BLOCKED else 1
+            )
 
             cur.execute(
                 f"""
@@ -405,6 +422,61 @@ def heartbeat_run(claim: ClaimedRun, *, lease_seconds: int) -> None:
                     f"Lease lost for agent run {claim.id} owned by {claim.worker_id}"
                 )
 
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def persist_codex_thread_id(claim: ClaimedRun, *, thread_id: str) -> None:
+    normalized_thread_id = thread_id.strip()
+    if not normalized_thread_id:
+        raise ValueError("thread_id must not be blank")
+    if len(normalized_thread_id) > 500:
+        raise ValueError("thread_id must be at most 500 characters")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _lock_owned_run(
+                cur,
+                claim,
+                statuses=(RunStatus.RUNNING.value,),
+            )
+            cur.execute(
+                """
+                UPDATE agent.cards
+                SET codex_thread_id = %s
+                WHERE id = %s
+                  AND (
+                      codex_thread_id IS NULL
+                      OR codex_thread_id = %s
+                  )
+                """,
+                (
+                    normalized_thread_id,
+                    claim.card_id,
+                    normalized_thread_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise AgentQueueStateError(
+                    f"Card {claim.card_id} already has a different Codex thread"
+                )
+            _insert_event(
+                cur,
+                card_id=claim.card_id,
+                event_type="codex.thread_attached",
+                actor_type="worker",
+                actor_user_id=None,
+                payload={
+                    "run_id": claim.id,
+                    "thread_id": normalized_thread_id,
+                    "worker_id": claim.worker_id,
+                },
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -658,10 +730,12 @@ class DatabaseAgentQueue:
         *,
         worker_id: str,
         lease_seconds: int,
+        allowed_phases: frozenset[RunPhase],
     ) -> ClaimedRun | None:
         return claim_next_run(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
+            allowed_phases=allowed_phases,
         )
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None:
@@ -669,6 +743,14 @@ class DatabaseAgentQueue:
 
     def heartbeat_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None:
         heartbeat_run(claim, lease_seconds=lease_seconds)
+
+    def persist_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        thread_id: str,
+    ) -> None:
+        persist_codex_thread_id(claim, thread_id=thread_id)
 
     def complete_run(self, claim: ClaimedRun, result: ExecutionResult) -> None:
         complete_run(claim, result)

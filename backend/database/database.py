@@ -10,7 +10,7 @@ DEFAULT_DATABASE_CONFIG = PROJECT_ROOT / "config" / "config.ini"
 database_config_path = resolve_database_config_path(DEFAULT_DATABASE_CONFIG)
 config = load_config(str(database_config_path))["Database"]
 
-db_pool = pool.SimpleConnectionPool(
+db_pool = pool.ThreadedConnectionPool(
     minconn=1,
     maxconn=5,
     user=config["user"],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -43,6 +44,7 @@ class ClaimedRun:
     worker_id: str
     title: str
     description: str
+    codex_thread_id: str | None = None
     messages: tuple[dict, ...] = field(default_factory=tuple)
 
 
@@ -54,6 +56,9 @@ class ExecutionResult:
 
 
 class AgentExecutor(Protocol):
+    @property
+    def allowed_phases(self) -> frozenset[RunPhase]: ...
+
     def execute(self, claim: ClaimedRun) -> ExecutionResult: ...
 
 
@@ -63,11 +68,19 @@ class AgentQueue(Protocol):
         *,
         worker_id: str,
         lease_seconds: int,
+        allowed_phases: frozenset[RunPhase],
     ) -> ClaimedRun | None: ...
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None: ...
 
     def heartbeat_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None: ...
+
+    def persist_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        thread_id: str,
+    ) -> None: ...
 
     def complete_run(self, claim: ClaimedRun, result: ExecutionResult) -> None: ...
 
@@ -84,6 +97,8 @@ class AgentQueue(Protocol):
 
 class FakeAgentExecutor:
     """Deterministic executor for QA queue validation only."""
+
+    allowed_phases = frozenset(RunPhase)
 
     def execute(self, claim: ClaimedRun) -> ExecutionResult:
         if claim.phase is RunPhase.PLANNING:
@@ -124,12 +139,17 @@ class AgentWorker:
         executor: AgentExecutor,
         worker_id: str,
         lease_seconds: int,
+        heartbeat_seconds: int,
         max_attempts: int,
     ):
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
         if lease_seconds < 5:
             raise ValueError("lease_seconds must be at least 5")
+        if heartbeat_seconds < 1:
+            raise ValueError("heartbeat_seconds must be at least 1")
+        if heartbeat_seconds >= lease_seconds:
+            raise ValueError("heartbeat_seconds must be less than lease_seconds")
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
@@ -137,12 +157,14 @@ class AgentWorker:
         self.executor = executor
         self.worker_id = worker_id.strip()
         self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self.max_attempts = max_attempts
 
     def process_once(self) -> bool:
         claim = self.queue.claim_next_run(
             worker_id=self.worker_id,
             lease_seconds=self.lease_seconds,
+            allowed_phases=self.executor.allowed_phases,
         )
 
         if claim is None:
@@ -164,7 +186,10 @@ class AgentWorker:
             return True
 
         try:
-            result = self.executor.execute(claim)
+            result = self._execute_with_heartbeat(claim)
+        except AgentLeaseLostError:
+            self._log_lease_lost(claim)
+            return True
         except AgentTemporarilyBlockedError as exc:
             try:
                 self.queue.block_run(
@@ -192,6 +217,46 @@ class AgentWorker:
             self._log_lease_lost(claim)
 
         return True
+
+    def _execute_with_heartbeat(self, claim: ClaimedRun) -> ExecutionResult:
+        stop_event = threading.Event()
+        lease_lost = threading.Event()
+
+        def heartbeat() -> None:
+            while not stop_event.wait(self.heartbeat_seconds):
+                try:
+                    self.queue.heartbeat_run(
+                        claim,
+                        lease_seconds=self.lease_seconds,
+                    )
+                except AgentLeaseLostError:
+                    lease_lost.set()
+                    stop_event.set()
+                    return
+                except Exception:
+                    logger.exception(
+                        "Agent heartbeat failed and will be retried: run=%s",
+                        claim.id,
+                    )
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"agent-heartbeat-{claim.id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        try:
+            result = self.executor.execute(claim)
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=self.heartbeat_seconds + 1)
+
+        if lease_lost.is_set():
+            raise AgentLeaseLostError(
+                f"Lease lost while executor was running: {claim.id}"
+            )
+
+        return result
 
     @staticmethod
     def _log_lease_lost(claim: ClaimedRun) -> None:

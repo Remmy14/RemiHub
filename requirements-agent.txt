@@ -1,0 +1,6 @@
+# Minimal dependencies for the dedicated agent-worker environment. Do not
+# install requirements.txt into that environment: the SDK currently requires a
+# newer Pydantic than the production API pins. The worker imports only the
+# queue/database boundary plus the SDK.
+openai-codex==0.1.0b3
+psycopg2-binary==2.9.11

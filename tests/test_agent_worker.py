@@ -1,4 +1,5 @@
 import os
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,17 @@ from backend.core.agent_worker import (
     ExecutionResult,
     FakeAgentExecutor,
 )
+
+
+def _wait_until(predicate, *, timeout: float) -> bool:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
 
 
 def claimed_run(
@@ -44,11 +56,13 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
     def setUp(self):
         self.queue = MagicMock()
         self.executor = MagicMock()
+        self.executor.allowed_phases = frozenset({RunPhase.PLANNING})
         self.worker = AgentWorker(
             queue=self.queue,
             executor=self.executor,
             worker_id="qa-worker",
             lease_seconds=120,
+            heartbeat_seconds=30,
             max_attempts=3,
         )
 
@@ -56,6 +70,11 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
         self.queue.claim_next_run.return_value = None
 
         self.assertFalse(self.worker.process_once())
+        self.queue.claim_next_run.assert_called_once_with(
+            worker_id="qa-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.PLANNING}),
+        )
         self.queue.start_run.assert_not_called()
 
     def test_successful_execution_completes_run(self):
@@ -75,6 +94,73 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
         )
         self.executor.execute.assert_called_once_with(claim)
         self.queue.complete_run.assert_called_once_with(claim, result)
+        self.queue.fail_run.assert_not_called()
+
+    def test_long_execution_renews_lease(self):
+        claim = claimed_run()
+        result = ExecutionResult(
+            message="Plan ready",
+            card_status=CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+        )
+        execution_started = threading.Event()
+        execution_release = threading.Event()
+
+        def execute(_claim):
+            execution_started.set()
+            self.assertTrue(execution_release.wait(timeout=2))
+            return result
+
+        self.worker.heartbeat_seconds = 0.01
+        self.queue.claim_next_run.return_value = claim
+        self.executor.execute.side_effect = execute
+
+        worker_thread = threading.Thread(target=self.worker.process_once)
+        worker_thread.start()
+        self.assertTrue(execution_started.wait(timeout=1))
+        self.assertTrue(
+            _wait_until(
+                lambda: self.queue.heartbeat_run.call_count >= 1,
+                timeout=1,
+            )
+        )
+        execution_release.set()
+        worker_thread.join(timeout=2)
+
+        self.assertFalse(worker_thread.is_alive())
+        self.queue.complete_run.assert_called_once_with(claim, result)
+
+    def test_lease_loss_during_execution_fences_completion(self):
+        claim = claimed_run()
+        execution_started = threading.Event()
+        execution_release = threading.Event()
+
+        def execute(_claim):
+            execution_started.set()
+            self.assertTrue(execution_release.wait(timeout=2))
+            return ExecutionResult(
+                message="Plan ready",
+                card_status=CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+            )
+
+        self.worker.heartbeat_seconds = 0.01
+        self.queue.claim_next_run.return_value = claim
+        self.queue.heartbeat_run.side_effect = AgentLeaseLostError("reclaimed")
+        self.executor.execute.side_effect = execute
+
+        with self.assertLogs("remihub.agent_worker", level="WARNING"):
+            worker_thread = threading.Thread(target=self.worker.process_once)
+            worker_thread.start()
+            self.assertTrue(execution_started.wait(timeout=1))
+            self.assertTrue(
+                _wait_until(
+                    lambda: self.queue.heartbeat_run.call_count >= 1,
+                    timeout=1,
+                )
+            )
+            execution_release.set()
+            worker_thread.join(timeout=2)
+
+        self.queue.complete_run.assert_not_called()
         self.queue.fail_run.assert_not_called()
 
     def test_temporary_limit_blocks_run_for_retry(self):

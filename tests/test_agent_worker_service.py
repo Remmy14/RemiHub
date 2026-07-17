@@ -6,7 +6,9 @@ from backend.core.agent_worker import AgentLeaseLostError
 from backend.services.agent_worker_service import (
     AgentQueueStateError,
     _validate_candidate,
+    claim_next_run,
     heartbeat_run,
+    persist_codex_thread_id,
     verify_worker_identity,
 )
 from tests.test_agent_worker import claimed_run
@@ -61,6 +63,39 @@ class AgentClaimCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentQueueStateError, "expected planning"):
             _validate_candidate(candidate(card_status="implementing"))
 
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_claim_query_is_filtered_to_executor_phases(
+        self,
+        get_db_conn,
+        put_db_conn,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        get_db_conn.return_value = connection
+
+        result = claim_next_run(
+            worker_id="qa-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.PLANNING}),
+        )
+
+        self.assertIsNone(result)
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("runs.phase = ANY(%s)", sql)
+        self.assertEqual(parameters, (["planning"],))
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    def test_claim_rejects_empty_phase_capability(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            claim_next_run(
+                worker_id="qa-worker",
+                lease_seconds=120,
+                allowed_phases=frozenset(),
+            )
+
 
 class AgentHeartbeatTests(unittest.TestCase):
     @patch("backend.services.agent_worker_service.put_db_conn")
@@ -102,6 +137,64 @@ class AgentHeartbeatTests(unittest.TestCase):
 
         connection.rollback.assert_called_once_with()
         connection.commit.assert_not_called()
+        put_db_conn.assert_called_once_with(connection)
+
+
+class CodexThreadPersistenceTests(unittest.TestCase):
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_thread_id_is_saved_only_under_the_owned_lease(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 1
+        get_db_conn.return_value = connection
+        claim = claimed_run()
+
+        persist_codex_thread_id(claim, thread_id="thr_remihub_123")
+
+        lock_owned_run.assert_called_once()
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("SET codex_thread_id = %s", sql)
+        self.assertEqual(
+            parameters,
+            ("thr_remihub_123", claim.card_id, "thr_remihub_123"),
+        )
+        insert_event.assert_called_once()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_conflicting_thread_id_fails_closed(
+        self,
+        get_db_conn,
+        put_db_conn,
+        _lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 0
+        get_db_conn.return_value = connection
+
+        with self.assertRaisesRegex(AgentQueueStateError, "different Codex thread"):
+            persist_codex_thread_id(
+                claimed_run(),
+                thread_id="thr_conflict",
+            )
+
+        insert_event.assert_not_called()
+        connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
 
