@@ -44,6 +44,23 @@ class RecordingGateway:
             final_response=json.dumps(self.response),
             duration_ms=1234,
             sdk_version="0.1.0b3",
+            usage={
+                "last": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 25,
+                    "output_tokens": 50,
+                    "reasoning_output_tokens": 10,
+                    "total_tokens": 150,
+                },
+                "total": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 25,
+                    "output_tokens": 50,
+                    "reasoning_output_tokens": 10,
+                    "total_tokens": 150,
+                },
+                "model_context_window": 200000,
+            },
         )
 
 
@@ -76,6 +93,10 @@ class CodexPlanningExecutorTests(unittest.TestCase):
         self.assertIn("Add the module", result.message)
         self.assertEqual(result.metadata["sandbox"], "read-only")
         self.assertEqual(result.metadata["thread_id"], "thr_new")
+        self.assertEqual(
+            result.metadata["usage"]["last"]["total_tokens"],
+            150,
+        )
         self.thread_store.persist_codex_thread_id.assert_called_once()
         call = gateway.calls[0]
         self.assertIsNone(call["existing_thread_id"])
@@ -169,6 +190,7 @@ class OpenAICodexGatewayTests(unittest.TestCase):
                 }
             )
             duration_ms = 50
+            usage = None
 
         class Thread:
             id = "thr_456"

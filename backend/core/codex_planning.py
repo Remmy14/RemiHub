@@ -67,6 +67,7 @@ class CodexPlanningTurn:
     final_response: str
     duration_ms: int | None = None
     sdk_version: str | None = None
+    usage: dict | None = None
 
 
 class CodexPlanningGateway(Protocol):
@@ -153,6 +154,11 @@ class OpenAICodexPlanningGateway:
             final_response=final_response,
             duration_ms=result.duration_ms,
             sdk_version=getattr(openai_codex, "__version__", None),
+            usage=(
+                result.usage.model_dump(mode="json")
+                if result.usage is not None
+                else None
+            ),
         )
 
 
@@ -234,6 +240,7 @@ class CodexPlanningExecutor:
                 "sdk_version": turn.sdk_version,
                 "thread_id": turn.thread_id,
                 "turn_id": turn.turn_id,
+                "usage": turn.usage,
             },
         )
 

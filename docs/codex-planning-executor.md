@@ -25,6 +25,12 @@ Boolean readiness decision. A ready plan moves to
 `awaiting_implementation_approval`; a plan with blocking questions moves to
 `awaiting_feedback`.
 
+Successful run metadata records the SDK's per-turn and cumulative-thread token
+usage when available: input, cached-input, output, reasoning-output, and total
+tokens, along with the model context-window size. These are operational usage
+measurements; account quota percentages, reset windows, and credit balances are
+separate account-level data.
+
 ## Process and dependency isolation
 
 Run this worker in its own virtual environment and Linux account. Install only
