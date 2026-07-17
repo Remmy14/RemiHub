@@ -92,6 +92,9 @@ def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
         worker_id=row["worker_id"],
         title=row["title"],
         description=row["description"],
+        base_branch=row["base_branch"],
+        feature_branch=row["feature_branch"],
+        worktree_path=row["worktree_path"],
         codex_thread_id=row["codex_thread_id"],
         messages=tuple(messages),
     )
@@ -169,6 +172,9 @@ def claim_next_run(
                        cards.resume_status,
                        cards.title,
                        cards.description,
+                       cards.base_branch,
+                       cards.feature_branch,
+                       cards.worktree_path,
                        cards.codex_thread_id
                 FROM agent.runs AS runs
                 JOIN agent.cards AS cards
@@ -485,6 +491,80 @@ def persist_codex_thread_id(claim: ClaimedRun, *, thread_id: str) -> None:
         put_db_conn(conn)
 
 
+def persist_implementation_workspace(
+    claim: ClaimedRun,
+    *,
+    feature_branch: str,
+    worktree_path: str,
+) -> None:
+    if claim.phase is not RunPhase.IMPLEMENTATION:
+        raise AgentQueueStateError(
+            "Implementation workspace metadata requires an implementation run"
+        )
+    normalized_branch = feature_branch.strip()
+    normalized_path = worktree_path.strip()
+    if not normalized_branch:
+        raise ValueError("feature_branch must not be blank")
+    if len(normalized_branch) > 500:
+        raise ValueError("feature_branch must be at most 500 characters")
+    if not normalized_path:
+        raise ValueError("worktree_path must not be blank")
+    if len(normalized_path) > 2000:
+        raise ValueError("worktree_path must be at most 2000 characters")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _lock_owned_run(
+                cur,
+                claim,
+                statuses=(RunStatus.RUNNING.value,),
+            )
+            cur.execute(
+                """
+                UPDATE agent.cards
+                SET feature_branch = %s,
+                    worktree_path = %s
+                WHERE id = %s
+                  AND (
+                      (feature_branch IS NULL AND worktree_path IS NULL)
+                      OR (feature_branch = %s AND worktree_path = %s)
+                  )
+                """,
+                (
+                    normalized_branch,
+                    normalized_path,
+                    claim.card_id,
+                    normalized_branch,
+                    normalized_path,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise AgentQueueStateError(
+                    f"Card {claim.card_id} already has a different implementation "
+                    "workspace"
+                )
+            _insert_event(
+                cur,
+                card_id=claim.card_id,
+                event_type="implementation.workspace_attached",
+                actor_type="worker",
+                actor_user_id=None,
+                payload={
+                    "feature_branch": normalized_branch,
+                    "run_id": claim.id,
+                    "worker_id": claim.worker_id,
+                    "worktree_path": normalized_path,
+                },
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
     message = result.message.strip()
     if not message:
@@ -751,6 +831,19 @@ class DatabaseAgentQueue:
         thread_id: str,
     ) -> None:
         persist_codex_thread_id(claim, thread_id=thread_id)
+
+    def persist_implementation_workspace(
+        self,
+        claim: ClaimedRun,
+        *,
+        feature_branch: str,
+        worktree_path: str,
+    ) -> None:
+        persist_implementation_workspace(
+            claim,
+            feature_branch=feature_branch,
+            worktree_path=worktree_path,
+        )
 
     def complete_run(self, claim: ClaimedRun, result: ExecutionResult) -> None:
         complete_run(claim, result)

@@ -44,6 +44,9 @@ class ClaimedRun:
     worker_id: str
     title: str
     description: str
+    base_branch: str = "main"
+    feature_branch: str | None = None
+    worktree_path: str | None = None
     codex_thread_id: str | None = None
     messages: tuple[dict, ...] = field(default_factory=tuple)
 
@@ -80,6 +83,14 @@ class AgentQueue(Protocol):
         claim: ClaimedRun,
         *,
         thread_id: str,
+    ) -> None: ...
+
+    def persist_implementation_workspace(
+        self,
+        claim: ClaimedRun,
+        *,
+        feature_branch: str,
+        worktree_path: str,
     ) -> None: ...
 
     def complete_run(self, claim: ClaimedRun, result: ExecutionResult) -> None: ...
@@ -232,6 +243,7 @@ class AgentWorker:
                 except AgentLeaseLostError:
                     lease_lost.set()
                     stop_event.set()
+                    self._cancel_executor(claim)
                     return
                 except Exception:
                     logger.exception(
@@ -257,6 +269,18 @@ class AgentWorker:
             )
 
         return result
+
+    def _cancel_executor(self, claim: ClaimedRun) -> None:
+        cancel = getattr(self.executor, "cancel", None)
+        if cancel is None:
+            return
+        try:
+            cancel(claim)
+        except Exception:
+            logger.exception(
+                "Agent executor cancellation failed: run=%s",
+                claim.id,
+            )
 
     @staticmethod
     def _log_lease_lost(claim: ClaimedRun) -> None:

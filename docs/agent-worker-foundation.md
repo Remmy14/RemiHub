@@ -5,9 +5,10 @@ running development work. The API creates durable runs; a worker claims one run
 at a time and reports its result later. Android requests never remain open while
 work is executing.
 
-The queue and lease boundary is shared by fake QA execution and the later
-planning-only Codex executor. It does not create Git worktrees, build Android,
-restart RemiHub, or deploy a release.
+The queue and lease boundary is shared by fake QA execution, the planning-only
+Codex executor, and the separately operated implementation-only Codex executor.
+The implementation executor may create an isolated worktree, but no executor
+builds a release, restarts RemiHub, or deploys.
 
 ## Lease and recovery model
 
@@ -78,7 +79,10 @@ REMIHUB_AGENT_ALLOW_FAKE_EXECUTOR=true
 The fake executor only advances workflow states and writes an explicit message
 that it performed no repository or deployment operation. It cannot run when the
 environment is `production`. The real `codex-planning` executor is described in
-`docs/codex-planning-executor.md` and advertises only the planning phase.
+`docs/codex-planning-executor.md` and advertises only the planning phase. The
+real `codex-implementation` executor is described in
+`docs/codex-implementation-executor.md`, advertises only implementation, and
+requires a separately validated outer sandbox wrapper.
 
 Useful worker settings are:
 
@@ -90,11 +94,14 @@ Useful worker settings are:
 | `REMIHUB_AGENT_MAX_ATTEMPTS` | 3 | Attempts before permanent failure |
 | `REMIHUB_AGENT_RUN_ONCE` | false | Process at most one run, useful for QA |
 | `REMIHUB_AGENT_WORKER_ID` | host and PID | Human-readable worker identity |
+| `REMIHUB_AGENT_GIT_TIMEOUT_SECONDS` | 120 | Worker-owned Git command timeout |
 
 The worker runs an independent heartbeat thread while an executor is active.
 The default heartbeat is every 30 seconds against a 120-second lease. A lost
 lease fences the stale executor from recording completion even if its external
-work finishes later. The shared PostgreSQL connection pool uses psycopg2's
+work finishes later. Executors that expose a cancellation hook are also asked
+to stop immediately; the implementation executor maps that hook to the active
+Codex turn interrupt. The shared PostgreSQL connection pool uses psycopg2's
 thread-safe pool implementation so the executor and heartbeat may acquire
 independent connections safely.
 

@@ -12,6 +12,8 @@ from backend.core.agent_worker import (
     AgentWorkerConfigurationError,
     FakeAgentExecutor,
 )
+from backend.core.agent_workspace import GitImplementationWorkspaceManager
+from backend.core.codex_implementation import CodexImplementationExecutor
 from backend.core.codex_planning import CodexPlanningExecutor
 from backend.services.agent_worker_service import DatabaseAgentQueue
 
@@ -56,6 +58,10 @@ class AgentWorkerSettings:
     run_once: bool
     allow_fake_executor: bool
     repository_path: str | None
+    worktree_root: str | None
+    artifact_root: str | None
+    git_timeout_seconds: int
+    codex_bin: str | None
     codex_model: str | None
     codex_retry_seconds: int
 
@@ -112,6 +118,9 @@ class AgentWorkerSettings:
             )
 
         repository_path = os.environ.get("REMIHUB_AGENT_REPOSITORY")
+        worktree_root = os.environ.get("REMIHUB_AGENT_WORKTREE_ROOT")
+        artifact_root = os.environ.get("REMIHUB_AGENT_ARTIFACT_ROOT")
+        codex_bin = os.environ.get("REMIHUB_CODEX_BIN")
         codex_model = os.environ.get("REMIHUB_CODEX_MODEL")
 
         return cls(
@@ -127,6 +136,25 @@ class AgentWorkerSettings:
             repository_path=(
                 repository_path.strip()
                 if repository_path and repository_path.strip()
+                else None
+            ),
+            worktree_root=(
+                worktree_root.strip()
+                if worktree_root and worktree_root.strip()
+                else None
+            ),
+            artifact_root=(
+                artifact_root.strip()
+                if artifact_root and artifact_root.strip()
+                else None
+            ),
+            git_timeout_seconds=_positive_int(
+                "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS",
+                120,
+            ),
+            codex_bin=(
+                codex_bin.strip()
+                if codex_bin and codex_bin.strip()
                 else None
             ),
             codex_model=(
@@ -174,6 +202,45 @@ def build_executor(
         return CodexPlanningExecutor(
             repository_path=settings.repository_path,
             thread_store=queue,
+            model=settings.codex_model,
+            retry_after_seconds=settings.codex_retry_seconds,
+        )
+
+    if settings.executor_name == "codex-implementation":
+        if queue is None:
+            raise AgentWorkerConfigurationError(
+                "The codex implementation executor requires an agent queue"
+            )
+        if settings.repository_path is None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_REPOSITORY is required for codex-implementation"
+            )
+        if settings.worktree_root is None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_WORKTREE_ROOT is required for "
+                "codex-implementation"
+            )
+        if settings.artifact_root is None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_ARTIFACT_ROOT is required for "
+                "codex-implementation"
+            )
+        if settings.codex_bin is None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_CODEX_BIN is required for codex-implementation; "
+                "configure the approved outer sandbox wrapper"
+            )
+
+        workspace_manager = GitImplementationWorkspaceManager(
+            source_repository=settings.repository_path,
+            worktree_root=settings.worktree_root,
+            artifact_root=settings.artifact_root,
+            command_timeout_seconds=settings.git_timeout_seconds,
+        )
+        return CodexImplementationExecutor(
+            workspace_manager=workspace_manager,
+            workspace_store=queue,
+            codex_bin=settings.codex_bin,
             model=settings.codex_model,
             retry_after_seconds=settings.codex_retry_seconds,
         )

@@ -162,6 +162,7 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
 
         self.queue.complete_run.assert_not_called()
         self.queue.fail_run.assert_not_called()
+        self.executor.cancel.assert_called_once_with(claim)
 
     def test_temporary_limit_blocks_run_for_retry(self):
         claim = claimed_run()
@@ -302,6 +303,83 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             "restricted to QA",
         ):
             build_executor(settings)
+
+    @patch("backend.agent_worker.CodexImplementationExecutor")
+    @patch("backend.agent_worker.GitImplementationWorkspaceManager")
+    def test_implementation_executor_requires_and_uses_workspace_paths(
+        self,
+        workspace_manager,
+        implementation_executor,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+                "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS": "45",
+                "REMIHUB_CODEX_BIN": "/srv/agent/bin/codex-sandbox",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        queue = MagicMock()
+        result = build_executor(settings, queue=queue)
+
+        self.assertEqual(result, implementation_executor.return_value)
+        workspace_manager.assert_called_once_with(
+            source_repository="/srv/agent/source.git",
+            worktree_root="/srv/agent/worktrees",
+            artifact_root="/srv/agent/artifacts",
+            command_timeout_seconds=45,
+        )
+        implementation_executor.assert_called_once_with(
+            workspace_manager=workspace_manager.return_value,
+            workspace_store=queue,
+            codex_bin="/srv/agent/bin/codex-sandbox",
+            model=None,
+            retry_after_seconds=900,
+        )
+
+    def test_implementation_executor_rejects_missing_artifact_root(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_CODEX_BIN": "/srv/agent/bin/codex-sandbox",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_ARTIFACT_ROOT",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+    def test_implementation_executor_rejects_missing_sandbox_wrapper(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_CODEX_BIN",
+        ):
+            build_executor(settings, queue=MagicMock())
 
 
 if __name__ == "__main__":

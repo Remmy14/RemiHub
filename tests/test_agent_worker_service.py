@@ -9,6 +9,7 @@ from backend.services.agent_worker_service import (
     claim_next_run,
     heartbeat_run,
     persist_codex_thread_id,
+    persist_implementation_workspace,
     verify_worker_identity,
 )
 from tests.test_agent_worker import claimed_run
@@ -196,6 +197,78 @@ class CodexThreadPersistenceTests(unittest.TestCase):
         insert_event.assert_not_called()
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
+
+
+class ImplementationWorkspacePersistenceTests(unittest.TestCase):
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_workspace_is_saved_only_under_the_owned_lease(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 1
+        get_db_conn.return_value = connection
+        claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
+
+        persist_implementation_workspace(
+            claim,
+            feature_branch=f"agent/card-{claim.card_id}",
+            worktree_path=f"/opt/remihub-agent/worktrees/card-{claim.card_id}",
+        )
+
+        lock_owned_run.assert_called_once()
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("SET feature_branch = %s", sql)
+        self.assertEqual(parameters[2], claim.card_id)
+        insert_event.assert_called_once()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_conflicting_workspace_fails_closed(
+        self,
+        get_db_conn,
+        put_db_conn,
+        _lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 0
+        get_db_conn.return_value = connection
+        claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
+
+        with self.assertRaisesRegex(AgentQueueStateError, "different"):
+            persist_implementation_workspace(
+                claim,
+                feature_branch=f"agent/card-{claim.card_id}",
+                worktree_path=(
+                    f"/opt/remihub-agent/worktrees/card-{claim.card_id}"
+                ),
+            )
+
+        insert_event.assert_not_called()
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    def test_planning_run_cannot_attach_implementation_workspace(self):
+        with self.assertRaisesRegex(AgentQueueStateError, "implementation run"):
+            persist_implementation_workspace(
+                claimed_run(),
+                feature_branch="agent/card-example",
+                worktree_path="/tmp/card-example",
+            )
+
 
 
 class AgentWorkerIdentityTests(unittest.TestCase):
