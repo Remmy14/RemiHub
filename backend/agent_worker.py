@@ -7,6 +7,10 @@ import socket
 import threading
 from dataclasses import dataclass
 
+from backend.core.agent_deployment import (
+    GitQaDeploymentExecutor,
+    GitQaDeploymentManager,
+)
 from backend.core.agent_worker import (
     AgentWorker,
     AgentWorkerConfigurationError,
@@ -60,6 +64,10 @@ class AgentWorkerSettings:
     repository_path: str | None
     worktree_root: str | None
     artifact_root: str | None
+    deployment_target_repository: str | None
+    deployment_worktree_root: str | None
+    deployment_artifact_root: str | None
+    deployment_target_branch: str
     git_timeout_seconds: int
     codex_bin: str | None
     codex_model: str | None
@@ -120,6 +128,23 @@ class AgentWorkerSettings:
         repository_path = os.environ.get("REMIHUB_AGENT_REPOSITORY")
         worktree_root = os.environ.get("REMIHUB_AGENT_WORKTREE_ROOT")
         artifact_root = os.environ.get("REMIHUB_AGENT_ARTIFACT_ROOT")
+        deployment_target_repository = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY"
+        )
+        deployment_worktree_root = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT"
+        )
+        deployment_artifact_root = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT"
+        )
+        deployment_target_branch = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH",
+            "qa-main",
+        ).strip()
+        if not deployment_target_branch:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH must not be blank"
+            )
         codex_bin = os.environ.get("REMIHUB_CODEX_BIN")
         codex_model = os.environ.get("REMIHUB_CODEX_MODEL")
 
@@ -148,6 +173,23 @@ class AgentWorkerSettings:
                 if artifact_root and artifact_root.strip()
                 else None
             ),
+            deployment_target_repository=(
+                deployment_target_repository.strip()
+                if deployment_target_repository
+                and deployment_target_repository.strip()
+                else None
+            ),
+            deployment_worktree_root=(
+                deployment_worktree_root.strip()
+                if deployment_worktree_root and deployment_worktree_root.strip()
+                else None
+            ),
+            deployment_artifact_root=(
+                deployment_artifact_root.strip()
+                if deployment_artifact_root and deployment_artifact_root.strip()
+                else None
+            ),
+            deployment_target_branch=deployment_target_branch,
             git_timeout_seconds=_positive_int(
                 "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS",
                 120,
@@ -243,6 +285,44 @@ def build_executor(
             codex_bin=settings.codex_bin,
             model=settings.codex_model,
             retry_after_seconds=settings.codex_retry_seconds,
+        )
+
+    if settings.executor_name == "git-deployment-qa":
+        if settings.environment != "qa":
+            raise AgentWorkerConfigurationError(
+                "The phase-one Git deployment executor is restricted to QA"
+            )
+        required_paths = {
+            "REMIHUB_AGENT_REPOSITORY": settings.repository_path,
+            "REMIHUB_AGENT_WORKTREE_ROOT": settings.worktree_root,
+            "REMIHUB_AGENT_ARTIFACT_ROOT": settings.artifact_root,
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": (
+                settings.deployment_target_repository
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
+                settings.deployment_worktree_root
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
+                settings.deployment_artifact_root
+            ),
+        }
+        missing = [name for name, value in required_paths.items() if value is None]
+        if missing:
+            raise AgentWorkerConfigurationError(
+                f"{missing[0]} is required for git-deployment-qa"
+            )
+        deployment_manager = GitQaDeploymentManager(
+            source_repository=settings.repository_path,
+            source_worktree_root=settings.worktree_root,
+            source_artifact_root=settings.artifact_root,
+            target_repository=settings.deployment_target_repository,
+            candidate_worktree_root=settings.deployment_worktree_root,
+            deployment_artifact_root=settings.deployment_artifact_root,
+            target_branch=settings.deployment_target_branch,
+            command_timeout_seconds=settings.git_timeout_seconds,
+        )
+        return GitQaDeploymentExecutor(
+            deployment_manager=deployment_manager,
         )
 
     raise AgentWorkerConfigurationError(

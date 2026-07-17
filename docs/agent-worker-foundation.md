@@ -82,7 +82,10 @@ environment is `production`. The real `codex-planning` executor is described in
 `docs/codex-planning-executor.md` and advertises only the planning phase. The
 real `codex-implementation` executor is described in
 `docs/codex-implementation-executor.md`, advertises only implementation, and
-requires a separately validated outer sandbox wrapper.
+requires a separately validated outer sandbox wrapper. The phase-one
+`git-deployment-qa` executor is described in
+`docs/git-qa-deployment-executor.md`; it advertises only deployment, is
+restricted to QA, and can fast-forward only a local documentation-only target.
 
 Useful worker settings are:
 

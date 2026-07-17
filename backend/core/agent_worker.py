@@ -33,6 +33,13 @@ class AgentTemporarilyBlockedError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DeploymentSource:
+    approval_id: str
+    implementation_run_id: str
+    implementation_result_metadata: dict
+
+
+@dataclass(frozen=True)
 class ClaimedRun:
     id: str
     card_id: str
@@ -48,6 +55,7 @@ class ClaimedRun:
     feature_branch: str | None = None
     worktree_path: str | None = None
     codex_thread_id: str | None = None
+    deployment_source: DeploymentSource | None = None
     messages: tuple[dict, ...] = field(default_factory=tuple)
 
 

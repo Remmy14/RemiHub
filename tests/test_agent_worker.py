@@ -382,5 +382,98 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             build_executor(settings, queue=MagicMock())
 
 
+class QaDeploymentWorkerSettingsTests(unittest.TestCase):
+    @patch("backend.agent_worker.GitQaDeploymentExecutor")
+    @patch("backend.agent_worker.GitQaDeploymentManager")
+    def test_qa_deployment_executor_uses_separate_target_paths(
+        self,
+        deployment_manager,
+        deployment_executor,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-deployment-qa",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+                "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": (
+                    "/srv/agent/qa-deployment.git"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
+                    "/srv/agent/deployment-worktrees"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
+                    "/srv/agent/deployment-artifacts"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH": "qa-main",
+                "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS": "45",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        result = build_executor(settings, queue=MagicMock())
+
+        self.assertEqual(result, deployment_executor.return_value)
+        deployment_manager.assert_called_once_with(
+            source_repository="/srv/agent/source.git",
+            source_worktree_root="/srv/agent/worktrees",
+            source_artifact_root="/srv/agent/artifacts",
+            target_repository="/srv/agent/qa-deployment.git",
+            candidate_worktree_root="/srv/agent/deployment-worktrees",
+            deployment_artifact_root="/srv/agent/deployment-artifacts",
+            target_branch="qa-main",
+            command_timeout_seconds=45,
+        )
+        deployment_executor.assert_called_once_with(
+            deployment_manager=deployment_manager.return_value
+        )
+
+    def test_qa_deployment_executor_is_rejected_in_production(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "production",
+                "REMIHUB_AGENT_EXECUTOR": "git-deployment-qa",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "restricted to QA",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+    def test_qa_deployment_executor_requires_target_repository(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-deployment-qa",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+                "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
+                    "/srv/agent/deployment-worktrees"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
+                    "/srv/agent/deployment-artifacts"
+                ),
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+
 if __name__ == "__main__":
     unittest.main()

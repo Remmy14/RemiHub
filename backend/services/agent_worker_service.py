@@ -15,6 +15,7 @@ from backend.core.agent_state import (
 from backend.core.agent_worker import (
     AgentLeaseLostError,
     ClaimedRun,
+    DeploymentSource,
     ExecutionResult,
 )
 from backend.services.agent_service import (
@@ -80,6 +81,29 @@ def _validate_positive_seconds(value: int, *, field: str) -> int:
     return value
 
 
+def _deployment_source_from_row(row: dict) -> DeploymentSource | None:
+    values = (
+        row.get("deployment_approval_id"),
+        row.get("implementation_run_id"),
+        row.get("implementation_result_metadata"),
+    )
+    if not any(value is not None for value in values):
+        return None
+    if not all(value is not None for value in values):
+        raise AgentQueueStateError(
+            f"Deployment context is incomplete for run {row['id']}"
+        )
+    if not isinstance(row["implementation_result_metadata"], dict):
+        raise AgentQueueStateError(
+            f"Implementation result metadata is invalid for run {row['id']}"
+        )
+    return DeploymentSource(
+        approval_id=row["deployment_approval_id"],
+        implementation_run_id=row["implementation_run_id"],
+        implementation_result_metadata=row["implementation_result_metadata"],
+    )
+
+
 def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
     return ClaimedRun(
         id=row["id"],
@@ -96,6 +120,7 @@ def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
         feature_branch=row["feature_branch"],
         worktree_path=row["worktree_path"],
         codex_thread_id=row["codex_thread_id"],
+        deployment_source=_deployment_source_from_row(row),
         messages=tuple(messages),
     )
 
@@ -124,6 +149,9 @@ def _validate_candidate(row: dict) -> tuple[RunPhase, CardStatus, CardStatus]:
             f"{row['card_id']} is {current_card_status.value}; expected "
             f"{expected.value}"
         )
+
+    if phase is RunPhase.DEPLOYMENT:
+        _deployment_source_from_row(row)
 
     if current_card_status is not active_card_status:
         require_card_transition(current_card_status, active_card_status)
@@ -175,10 +203,36 @@ def claim_next_run(
                        cards.base_branch,
                        cards.feature_branch,
                        cards.worktree_path,
-                       cards.codex_thread_id
+                       cards.codex_thread_id,
+                       deployment_approval.id AS deployment_approval_id,
+                       implementation_run.id AS implementation_run_id,
+                       implementation_run.result_metadata
+                           AS implementation_result_metadata
                 FROM agent.runs AS runs
                 JOIN agent.cards AS cards
                   ON cards.id = runs.card_id
+                LEFT JOIN LATERAL (
+                    SELECT approvals.id
+                    FROM agent.approvals AS approvals
+                    WHERE approvals.card_id = runs.card_id
+                      AND approvals.approval_type = 'deployment'
+                      AND approvals.decision = 'approved'
+                      AND approvals.card_revision = runs.card_revision
+                    ORDER BY approvals.created_at DESC, approvals.id DESC
+                    LIMIT 1
+                ) AS deployment_approval
+                  ON runs.phase = 'deployment'
+                LEFT JOIN LATERAL (
+                    SELECT prior_runs.id, prior_runs.result_metadata
+                    FROM agent.runs AS prior_runs
+                    WHERE prior_runs.card_id = runs.card_id
+                      AND prior_runs.phase = 'implementation'
+                      AND prior_runs.status = 'succeeded'
+                      AND prior_runs.card_revision = runs.card_revision
+                    ORDER BY prior_runs.created_at DESC, prior_runs.id DESC
+                    LIMIT 1
+                ) AS implementation_run
+                  ON runs.phase = 'deployment'
                 WHERE runs.phase = ANY(%s)
                   AND (
                     (

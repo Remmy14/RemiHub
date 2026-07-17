@@ -64,6 +64,32 @@ class AgentClaimCandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentQueueStateError, "expected planning"):
             _validate_candidate(candidate(card_status="implementing"))
 
+
+    def test_deployment_candidate_requires_approval_and_implementation_evidence(self):
+        with self.assertRaisesRegex(AgentQueueStateError, "incomplete"):
+            _validate_candidate(
+                candidate(
+                    phase="deployment",
+                    card_status="deployment_queued",
+                    deployment_approval_id="approval",
+                )
+            )
+
+    def test_deployment_candidate_accepts_bound_implementation_evidence(self):
+        phase, previous, active = _validate_candidate(
+            candidate(
+                phase="deployment",
+                card_status="deployment_queued",
+                deployment_approval_id="approval",
+                implementation_run_id="implementation-run",
+                implementation_result_metadata={"phase": "implementation"},
+            )
+        )
+
+        self.assertEqual(phase, RunPhase.DEPLOYMENT)
+        self.assertEqual(previous, CardStatus.DEPLOYMENT_QUEUED)
+        self.assertEqual(active, CardStatus.DEPLOYING)
+
     @patch("backend.services.agent_worker_service.put_db_conn")
     @patch("backend.services.agent_worker_service.get_db_conn")
     def test_claim_query_is_filtered_to_executor_phases(

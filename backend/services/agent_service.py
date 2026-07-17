@@ -261,6 +261,56 @@ def _insert_approval(
     return approval_id
 
 
+def _deployment_implementation_result(
+    cur,
+    *,
+    card_id: str,
+    card_revision: int,
+) -> dict:
+    cur.execute(
+        """
+        SELECT id, result_metadata
+        FROM agent.runs
+        WHERE card_id = %s
+          AND phase = 'implementation'
+          AND status = 'succeeded'
+          AND card_revision = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (card_id, card_revision),
+    )
+    result = _row_to_dict(cur, cur.fetchone())
+    if result is None:
+        raise AgentStateConflictError(
+            "Deployment requires a successful implementation run for this revision"
+        )
+    metadata = result.get("result_metadata")
+    workspace = metadata.get("workspace") if isinstance(metadata, dict) else None
+    required_workspace_fields = {
+        "artifact_patch",
+        "base_branch",
+        "base_commit",
+        "branch",
+        "changed_files",
+        "head_commit",
+        "patch_size_bytes",
+        "status_porcelain",
+        "worktree_path",
+    }
+    if (
+        metadata.get("phase") != RunPhase.IMPLEMENTATION.value
+        if isinstance(metadata, dict)
+        else True
+    ) or not isinstance(workspace, dict) or not required_workspace_fields.issubset(
+        workspace
+    ):
+        raise AgentStateConflictError(
+            "Implementation review evidence is incomplete for deployment"
+        )
+    return result
+
+
 def _insert_event(
     cur,
     *,
@@ -684,6 +734,11 @@ def approve_deployment(
         with conn.cursor() as cur:
             card = _locked_card(cur, card_id)
             _require_transition(card["status"], target_status)
+            implementation_result = _deployment_implementation_result(
+                cur,
+                card_id=card_id,
+                card_revision=card["revision"],
+            )
             approval_id = _insert_approval(
                 cur,
                 card_id=card_id,
@@ -712,6 +767,7 @@ def approve_deployment(
                 actor_user_id=approved_by,
                 payload={
                     "approval_id": approval_id,
+                    "implementation_run_id": implementation_result["id"],
                     "revision": card["revision"],
                     "run_id": run_id,
                     "to_status": target_status.value,
