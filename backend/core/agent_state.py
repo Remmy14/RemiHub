@@ -13,6 +13,7 @@ class CardStatus(str, Enum):
     REVIEW_READY = "review_ready"
     DEPLOYMENT_QUEUED = "deployment_queued"
     DEPLOYING = "deploying"
+    BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -39,6 +40,10 @@ class InvalidCardTransitionError(ValueError):
     pass
 
 
+class InvalidRunCompletionError(ValueError):
+    pass
+
+
 TERMINAL_CARD_STATUSES = frozenset(
     {
         CardStatus.COMPLETED,
@@ -60,6 +65,7 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
         {
             CardStatus.AWAITING_FEEDBACK,
             CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+            CardStatus.BLOCKED,
             CardStatus.FAILED,
             CardStatus.CANCELLED,
         }
@@ -87,6 +93,7 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
     CardStatus.IMPLEMENTING: frozenset(
         {
             CardStatus.REVIEW_READY,
+            CardStatus.BLOCKED,
             CardStatus.FAILED,
             CardStatus.CANCELLED,
         }
@@ -107,8 +114,18 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
     ),
     CardStatus.DEPLOYING: frozenset(
         {
+            CardStatus.BLOCKED,
             CardStatus.COMPLETED,
             CardStatus.FAILED,
+        }
+    ),
+    CardStatus.BLOCKED: frozenset(
+        {
+            CardStatus.PLANNING,
+            CardStatus.IMPLEMENTING,
+            CardStatus.DEPLOYING,
+            CardStatus.FAILED,
+            CardStatus.CANCELLED,
         }
     ),
     CardStatus.COMPLETED: frozenset({CardStatus.CLOSED}),
@@ -139,6 +156,32 @@ FOLLOW_UP_TARGETS: dict[CardStatus, tuple[CardStatus, RunPhase]] = {
         CardStatus.IMPLEMENTATION_QUEUED,
         RunPhase.IMPLEMENTATION,
     ),
+}
+
+
+QUEUED_CARD_STATUS_BY_PHASE: dict[RunPhase, CardStatus] = {
+    RunPhase.PLANNING: CardStatus.PLANNING_QUEUED,
+    RunPhase.IMPLEMENTATION: CardStatus.IMPLEMENTATION_QUEUED,
+    RunPhase.DEPLOYMENT: CardStatus.DEPLOYMENT_QUEUED,
+}
+
+
+ACTIVE_CARD_STATUS_BY_PHASE: dict[RunPhase, CardStatus] = {
+    RunPhase.PLANNING: CardStatus.PLANNING,
+    RunPhase.IMPLEMENTATION: CardStatus.IMPLEMENTING,
+    RunPhase.DEPLOYMENT: CardStatus.DEPLOYING,
+}
+
+
+COMPLETION_CARD_STATUSES_BY_PHASE: dict[RunPhase, frozenset[CardStatus]] = {
+    RunPhase.PLANNING: frozenset(
+        {
+            CardStatus.AWAITING_FEEDBACK,
+            CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+        }
+    ),
+    RunPhase.IMPLEMENTATION: frozenset({CardStatus.REVIEW_READY}),
+    RunPhase.DEPLOYMENT: frozenset({CardStatus.COMPLETED}),
 }
 
 
@@ -179,3 +222,36 @@ def follow_up_target(
         raise InvalidCardTransitionError(
             f"Card does not accept follow-up messages while {current_status.value}"
         ) from exc
+
+
+def coerce_run_phase(value: RunPhase | str) -> RunPhase:
+    if isinstance(value, RunPhase):
+        return value
+
+    try:
+        return RunPhase(value)
+    except ValueError as exc:
+        raise InvalidRunCompletionError(f"Unknown run phase: {value!r}") from exc
+
+
+def queued_card_status_for_phase(phase: RunPhase | str) -> CardStatus:
+    return QUEUED_CARD_STATUS_BY_PHASE[coerce_run_phase(phase)]
+
+
+def active_card_status_for_phase(phase: RunPhase | str) -> CardStatus:
+    return ACTIVE_CARD_STATUS_BY_PHASE[coerce_run_phase(phase)]
+
+
+def require_run_completion_status(
+    phase: RunPhase | str,
+    target: CardStatus | str,
+) -> tuple[RunPhase, CardStatus]:
+    run_phase = coerce_run_phase(phase)
+    target_status = coerce_card_status(target)
+
+    if target_status not in COMPLETION_CARD_STATUSES_BY_PHASE[run_phase]:
+        raise InvalidRunCompletionError(
+            f"A {run_phase.value} run cannot complete as {target_status.value}"
+        )
+
+    return run_phase, target_status

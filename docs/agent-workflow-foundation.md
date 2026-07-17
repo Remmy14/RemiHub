@@ -34,6 +34,10 @@ A failed card still occupies the open-card slot until it is retried, cancelled,
 or closed. A completed or cancelled card releases the slot; closing it hides it
 from the default card list.
 
+Worker migration `0004_agent_worker_leases` also adds a temporary `blocked`
+state. A blocked card retains the open-card slot and records when and where its
+run should resume.
+
 ## Card lifecycle
 
 The intended successful path is:

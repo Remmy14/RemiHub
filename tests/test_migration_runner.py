@@ -23,6 +23,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0001", "auth_foundation"),
                 ("0002", "remove_uv_alert_prototype"),
                 ("0003", "agent_workflow_foundation"),
+                ("0004", "agent_worker_leases"),
             ],
         )
 
@@ -35,6 +36,17 @@ class MigrationDiscoveryTests(unittest.TestCase):
         self.assertIn("CREATE UNIQUE INDEX agent_one_open_card_uidx", migration)
         self.assertIn("CREATE UNIQUE INDEX agent_one_active_run_uidx", migration)
         self.assertIn("GRANT USAGE ON SCHEMA agent", migration)
+
+    def test_agent_worker_migration_adds_lease_fencing_and_blocking(self):
+        migration = (
+            MIGRATIONS_DIR / "0004_agent_worker_leases.up.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ADD COLUMN lease_token uuid", migration)
+        self.assertIn("ADD COLUMN attempt_count integer", migration)
+        self.assertIn("agent_runs_lease_state_check", migration)
+        self.assertIn("agent_cards_blocked_state_check", migration)
+        self.assertIn("WHERE status IN ('queued', 'blocked')", migration)
 
     def test_discovers_up_and_down_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:

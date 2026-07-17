@@ -25,6 +25,9 @@ CARD_COLUMNS = """
     feature_branch,
     worktree_path,
     codex_thread_id,
+    resume_status,
+    blocked_reason,
+    blocked_until,
     created_by,
     closed_at,
     created_at,
@@ -310,6 +313,15 @@ def _update_card_status(
     if close:
         assignments.append("closed_at = CURRENT_TIMESTAMP")
 
+    if status is not CardStatus.BLOCKED:
+        assignments.extend(
+            [
+                "resume_status = NULL",
+                "blocked_reason = NULL",
+                "blocked_until = NULL",
+            ]
+        )
+
     values.append(card_id)
     cur.execute(
         f"""
@@ -364,9 +376,15 @@ def _card_detail(conn, card_id: str) -> dict:
                    requested_by,
                    worker_id,
                    lease_expires_at,
+                   attempt_count,
+                   last_heartbeat_at,
+                   available_at,
+                   blocked_reason,
                    started_at,
                    finished_at,
                    error_message,
+                   result_message_id,
+                   result_metadata,
                    created_at,
                    updated_at
             FROM agent.runs
@@ -731,10 +749,12 @@ def cancel_card(
                 """
                 UPDATE agent.runs
                 SET status = %s,
+                    lease_token = NULL,
                     lease_expires_at = NULL,
+                    blocked_reason = NULL,
                     finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP)
                 WHERE card_id = %s
-                  AND status IN ('queued', 'claimed', 'running')
+                  AND status IN ('queued', 'claimed', 'running', 'blocked')
                 """,
                 (RunStatus.CANCELLED.value, card_id),
             )

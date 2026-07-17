@@ -36,6 +36,9 @@ Rules:
 - Migration `0003_agent_workflow_foundation.down.sql` drops all agent cards and
   history. Treat that downgrade as destructive even before the feature is in
   regular use.
+- Stop the agent worker before downgrading migration `0004`. Its down migration
+  marks claimed, running, and blocked runs as failed before removing their
+  lease metadata.
 
 The first `status` invocation creates the empty migration-history table if it
 does not already exist.
