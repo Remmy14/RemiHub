@@ -236,6 +236,29 @@ class GitQaDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(second.target_before, self.base_commit)
         self.assertEqual(second.target_after, first.candidate_commit)
 
+    def test_validation_does_not_write_source_object_database(self):
+        source_objects = self.source / "objects"
+        directories = [
+            path for path in source_objects.rglob("*") if path.is_dir()
+        ]
+        directories.append(source_objects)
+        original_modes = {
+            path: path.stat().st_mode & 0o777 for path in directories
+        }
+        for path in directories:
+            path.chmod(original_modes[path] & ~0o222)
+
+        try:
+            candidate = self.manager.deploy(self.deployment_claim)
+        finally:
+            for path in reversed(directories):
+                path.chmod(original_modes[path])
+
+        self.assertEqual(
+            _git(self.target, "rev-parse", "qa-main"),
+            candidate.candidate_commit,
+        )
+
     def test_tracked_document_change_preserves_porcelain_leading_space(self):
         (self.implementation_workspace.path / "docs" / "existing.md").write_text(
             "# Updated existing\n",

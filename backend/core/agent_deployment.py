@@ -698,8 +698,17 @@ class GitQaDeploymentManager:
             prefix="remihub-deployment-index-",
             dir=self.deployment_artifact_root,
         ) as temporary_directory:
-            index_path = Path(temporary_directory) / "index"
-            environment_overrides = {"GIT_INDEX_FILE": str(index_path)}
+            temporary_root = Path(temporary_directory)
+            index_path = temporary_root / "index"
+            object_directory = temporary_root / "objects"
+            object_directory.mkdir(mode=0o750)
+            environment_overrides = {
+                "GIT_INDEX_FILE": str(index_path),
+                "GIT_OBJECT_DIRECTORY": str(object_directory),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                    self.source_common_directory / "objects"
+                ),
+            }
             self._run_git(
                 worktree,
                 "read-tree",
@@ -986,8 +995,12 @@ class GitQaDeploymentManager:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AgentDeploymentError(error_context) from exc
         if result.returncode not in allowed_return_codes:
-            detail = result.stderr.strip().splitlines()
-            suffix = f": {detail[-1]}" if detail else ""
+            detail = [
+                line.strip()
+                for line in result.stderr.splitlines()
+                if line.strip()
+            ]
+            suffix = f": {' | '.join(detail[-3:])}" if detail else ""
             raise AgentDeploymentError(f"{error_context}{suffix}")
         return result
 
