@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import grp
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -159,6 +160,95 @@ def require_runtime_state(environment: Environment, expected: str) -> None:
         fail(f"runtime has tracked modifications: {details}")
 
 
+def _tracked_file_modes(repository: Path) -> dict[Path, int]:
+    index = run(
+        [GIT, "-C", str(repository), "ls-files", "--stage", "-z"],
+    ).stdout
+    tracked: dict[Path, int] = {}
+    for record in index.split("\0"):
+        if not record:
+            continue
+        try:
+            metadata, relative_text = record.split("\t", 1)
+            mode_text = metadata.split(" ", 1)[0]
+        except ValueError:
+            fail("Git index contains an invalid record")
+        relative = Path(relative_text)
+        if relative_text.startswith("/") or ".." in relative.parts:
+            fail("Git index contains an unsafe path")
+        if mode_text == "100644":
+            file_mode = 0o640
+        elif mode_text == "100755":
+            file_mode = 0o750
+        else:
+            fail(f"repository contains unsupported tracked mode {mode_text}")
+        tracked[relative] = file_mode
+    return tracked
+
+
+def harden_planning_checkout(expected: str) -> None:
+    if not PLANNING_REPO.is_dir() or PLANNING_REPO.is_symlink():
+        fail("planning checkout is missing or unsafe")
+    if git(PLANNING_REPO, "symbolic-ref", "--quiet", "--short", "HEAD", user="alex") != "main":
+        fail("planning checkout is not on main before hardening")
+    if resolve(PLANNING_REPO, "HEAD", user="alex") != expected:
+        fail("planning checkout does not match the expected commit before hardening")
+    full_status = git(
+        PLANNING_REPO,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        user="alex",
+    )
+    if full_status:
+        details = "; ".join(full_status.splitlines())
+        fail(f"planning checkout is not clean before hardening: {details}")
+
+    try:
+        owner_uid = pwd.getpwnam("alex").pw_uid
+        group_gid = grp.getgrnam("remihub-agent").gr_gid
+    except KeyError:
+        fail("planning checkout owner or group is missing")
+
+    tracked = _tracked_file_modes(PLANNING_REPO)
+    for directory, names, files in os.walk(PLANNING_REPO, topdown=True, followlinks=False):
+        current = Path(directory)
+        if current.is_symlink():
+            fail(f"planning checkout contains an unexpected directory symlink: {current}")
+        os.chown(current, owner_uid, group_gid)
+        os.chmod(current, 0o2750)
+        for name in names:
+            child = current / name
+            if child.is_symlink():
+                fail(f"planning checkout contains an unexpected directory symlink: {child}")
+        for filename in files:
+            file_path = current / filename
+            if file_path.is_symlink():
+                fail(f"planning checkout contains an unexpected file symlink: {file_path}")
+            os.chown(file_path, owner_uid, group_gid)
+            os.chmod(file_path, 0o640)
+
+    for relative, file_mode in tracked.items():
+        file_path = PLANNING_REPO / relative
+        if not file_path.is_file() or file_path.is_symlink():
+            fail(f"planning checkout tracked file is missing or unsafe: {relative}")
+        os.chown(file_path, owner_uid, group_gid)
+        os.chmod(file_path, file_mode)
+
+    if resolve(PLANNING_REPO, "HEAD", user="remihub-agent") != expected:
+        fail("planning worker cannot resolve the hardened checkout")
+    if git(
+        PLANNING_REPO,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+        user="remihub-agent",
+    ):
+        fail("planning worker sees tracked modifications after hardening")
+    worker_module = PLANNING_REPO / "backend" / "agent_worker.py"
+    run(["/usr/bin/test", "-r", str(worker_module)], user="remihub-agent")
+
+
 def harden_qa_runtime(environment: Environment, expected: str) -> None:
     if environment.target_branch != "qa-main":
         fail("runtime hardening is QA-only")
@@ -187,27 +277,7 @@ def harden_qa_runtime(environment: Environment, expected: str) -> None:
     if not git_directory.is_dir() or git_directory.is_symlink():
         fail("QA runtime Git directory is missing or unsafe")
 
-    index = run(
-        [GIT, "-C", str(runtime), "ls-files", "--stage", "-z"],
-    ).stdout
-    tracked: dict[Path, int] = {}
-    for record in index.split("\0"):
-        if not record:
-            continue
-        try:
-            metadata, relative_text = record.split("\t", 1)
-            mode_text = metadata.split(" ", 1)[0]
-        except ValueError:
-            fail("QA runtime index contains an invalid record")
-        if relative_text.startswith("/") or ".." in Path(relative_text).parts:
-            fail("QA runtime index contains an unsafe path")
-        if mode_text == "100644":
-            file_mode = 0o640
-        elif mode_text == "100755":
-            file_mode = 0o750
-        else:
-            fail(f"QA runtime contains unsupported tracked mode {mode_text}")
-        tracked[Path(relative_text)] = file_mode
+    tracked = _tracked_file_modes(runtime)
 
     os.chown(runtime, 0, qa_gid)
     os.chmod(runtime, 0o2750)
@@ -359,6 +429,12 @@ def require_source_state(expected: str) -> None:
         fail("planning checkout does not match the expected commit")
     if git(PLANNING_REPO, "status", "--porcelain=v1", "--untracked-files=no", user="alex"):
         fail("planning checkout has tracked modifications")
+    if resolve(PLANNING_REPO, "HEAD", user="remihub-agent") != expected:
+        fail("planning worker cannot resolve the planning checkout")
+    run(
+        ["/usr/bin/test", "-r", str(PLANNING_REPO / "backend" / "agent_worker.py")],
+        user="remihub-agent",
+    )
 
 
 def synchronize_sources(environment: Environment, args: list[str]) -> None:
@@ -412,6 +488,7 @@ def synchronize_sources(environment: Environment, args: list[str]) -> None:
             [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", candidate],
             user="alex",
         )
+        harden_planning_checkout(candidate)
         require_source_state(candidate)
     except BaseException:
         run(
@@ -424,6 +501,10 @@ def synchronize_sources(environment: Environment, args: list[str]) -> None:
             user="alex",
             check=False,
         )
+        try:
+            harden_planning_checkout(base)
+        except BaseException:
+            pass
         raise
 
 
@@ -454,6 +535,7 @@ def restore_sources(environment: Environment, args: list[str]) -> None:
             [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", rollback],
             user="alex",
         )
+    harden_planning_checkout(rollback)
     require_source_state(rollback)
 
 
@@ -481,6 +563,13 @@ def main() -> None:
         if len(args) != 1:
             fail("harden-runtime requires the expected commit")
         harden_qa_runtime(environment, commit(args[0]))
+        return
+    if action == "harden-planning":
+        if environment is not ENVIRONMENTS["production"]:
+            fail("planning hardening is production-only")
+        if len(args) != 1:
+            fail("harden-planning requires the expected commit")
+        harden_planning_checkout(commit(args[0]))
         return
     if action == "verify-runtime":
         verify_runtime(environment, args)

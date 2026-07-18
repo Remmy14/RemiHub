@@ -129,8 +129,12 @@ All ref movements use expected-old commit checks. The implementation source is
 updated by its owning `remihub-agent` account from the deployment target. The
 `alex`-owned planning checkout fetches the same verified candidate from the
 `alex`-owned production runtime instead of crossing into the mode-`750`
-implementation repository. Production source synchronization is transactional
-and is reversed during automatic rollback.
+implementation repository. After every planning reset, the fixed root helper
+restores `alex:remihub-agent` ownership, setgid traversal, group-readable files,
+and Git-index executable modes. It then proves the `remihub-agent` planning
+worker can resolve the exact commit and read `backend/agent_worker.py`.
+Production source synchronization is transactional and applies the same
+hardening after automatic restoration.
 
 ## Manifest and retries
 

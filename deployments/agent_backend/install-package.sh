@@ -137,6 +137,30 @@
     done
   }
 
+  wait_for_service_stable() {
+    local service="${1:?service required}"
+    local stable_checks=0
+    local state
+
+    for _ in $(seq 1 30); do
+      state="$(systemctl show "$service" --property=ActiveState --value)"
+      if [[ "$state" == "active" ]]; then
+        stable_checks=$((stable_checks + 1))
+        if [[ "$stable_checks" -ge 5 ]]; then
+          return 0
+        fi
+      else
+        stable_checks=0
+      fi
+      sleep 1
+    done
+
+    echo "$service did not remain active for five consecutive checks." >&2
+    systemctl status "$service" --no-pager --full >&2 || true
+    journalctl -u "$service" -n 100 --no-pager >&2 || true
+    return 1
+  }
+
   print_path_chain() {
     local path="${1:?path required}"
     local current="/"
@@ -205,6 +229,8 @@
     systemctl stop remihub-agent-deployment-qa.service remihub-agent-deployment-production.service remihub-backend-qa.service
     if [[ "$PLANNING_PROMOTED" -eq 1 ]]; then
       runuser -u alex -- git -C "$PLANNING" reset --hard "$EXPECTED_BASE"
+      /usr/local/libexec/remihub-backend-deployment-control \
+        harden-planning production "$EXPECTED_BASE" 2>/dev/null || true
     fi
     if [[ "$SOURCE_PROMOTED" -eq 1 ]]; then
       runuser -u remihub-agent -- git --git-dir="$SOURCE" update-ref refs/heads/main "$EXPECTED_BASE" "$NEW_COMMIT"
@@ -277,6 +303,7 @@
   [[ "$(runuser -u remihub-agent -- git --git-dir="$SOURCE" rev-parse refs/heads/main)" == "$EXPECTED_BASE" ]]
   [[ "$(runuser -u alex -- git -C "$PLANNING" rev-parse HEAD)" == "$EXPECTED_BASE" ]]
   [[ -z "$(runuser -u alex -- git -C "$PLANNING" status --porcelain=v1 --untracked-files=no)" ]]
+  runuser -u remihub-agent -- /usr/bin/test -r "$PLANNING/backend/agent_worker.py"
   systemctl is-active --quiet remihub.service || {
     echo "remihub.service must be active before installation." >&2
     exit 1
@@ -597,6 +624,8 @@
     GIT_TERMINAL_PROMPT=0 \
     git -C "$PLANNING" fetch --no-tags "$PROD" refs/heads/main
   runuser -u alex -- git -C "$PLANNING" reset --hard "$NEW_COMMIT"
+  /usr/local/libexec/remihub-backend-deployment-control \
+    harden-planning production "$NEW_COMMIT"
   PLANNING_PROMOTED=1
 
   echo "[9/10] Restart production and verify process/OpenAPI health"
@@ -614,6 +643,8 @@
   [[ "$(runuser -u alex -- git -C "$PROD" rev-parse main)" == "$NEW_COMMIT" ]]
   [[ "$(runuser -u remihub-agent -- git --git-dir="$SOURCE" rev-parse refs/heads/main)" == "$NEW_COMMIT" ]]
   [[ "$(runuser -u alex -- git -C "$PLANNING" rev-parse HEAD)" == "$NEW_COMMIT" ]]
+  [[ "$(runuser -u remihub-agent -- git -C "$PLANNING" rev-parse HEAD)" == "$NEW_COMMIT" ]]
+  runuser -u remihub-agent -- /usr/bin/test -r "$PLANNING/backend/agent_worker.py"
   [[ "$(runuser -u remihub-deployer -- git --git-dir=/opt/remihub-agent/deployment/qa/repository.git rev-parse qa-main)" == "$NEW_COMMIT" ]]
   [[ "$(runuser -u remihub-deployer -- git --git-dir=/opt/remihub-agent/deployment/production/repository.git rev-parse production-main)" == "$NEW_COMMIT" ]]
   [[ -z "$(runuser -u alex -- git -C "$PROD" status --porcelain=v1 --untracked-files=no)" ]]
@@ -624,11 +655,11 @@
     >"$BACKUP/postgresql-client-paths.txt"
   if [[ "${ACTIVE[remihub-agent-worker.service]}" -eq 1 ]]; then
     systemctl start remihub-agent-worker.service
-    systemctl is-active --quiet remihub-agent-worker.service
+    wait_for_service_stable remihub-agent-worker.service
   fi
   if [[ "${ACTIVE[remihub-agent-implementation.service]}" -eq 1 ]]; then
     systemctl start remihub-agent-implementation.service
-    systemctl is-active --quiet remihub-agent-implementation.service
+    wait_for_service_stable remihub-agent-implementation.service
   fi
   ! systemctl is-active --quiet remihub-agent-deployment-qa.service
   ! systemctl is-active --quiet remihub-agent-deployment-production.service

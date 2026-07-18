@@ -30,6 +30,15 @@ production checkout, which is readable by its owning `alex` account, rather
 than from the mode-`750` implementation bare repository owned by
 `remihub-agent`.
 
+The planning checkout is also hardened from Git index metadata after every
+source synchronization or rollback. Its owner remains `alex`, its group is
+`remihub-agent`, directories are setgid `2750`, regular tracked files are
+`0640`, and executable tracked files are `0750`. The helper verifies the
+planning worker can resolve the exact commit and read its entry module before
+source synchronization is accepted. Installer worker checks require five
+consecutive active states so a short-lived start followed by an import failure
+cannot be mistaken for readiness.
+
 The QA application clone is created with `--no-hardlinks` before runtime
 hardening. This prevents local-clone object inodes from being shared with the
 deployment target bare repository. Runtime hardening is performed by the fixed

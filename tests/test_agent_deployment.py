@@ -871,6 +871,7 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
             patch.object(module, "run", side_effect=fake_run),
             patch.object(module, "require_source_state") as require_source_state,
             patch.object(module, "require_runtime_state") as require_runtime_state,
+            patch.object(module, "harden_planning_checkout") as harden_planning,
         ):
             module.synchronize_sources(
                 environment,
@@ -880,6 +881,7 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
         require_source_state.assert_any_call(base)
         require_source_state.assert_any_call(candidate)
         require_runtime_state.assert_called_once_with(environment, candidate)
+        harden_planning.assert_called_once_with(candidate)
 
         planning_fetches = [
             command
@@ -893,6 +895,85 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
         self.assertIn(str(environment.runtime), planning_fetch)
         self.assertIn(environment.runtime_branch, planning_fetch)
         self.assertNotIn(str(module.SOURCE_REPO), planning_fetch)
+
+    def test_planning_hardening_restores_worker_readability_and_git_modes(self):
+        helper_path = (
+            Path(__file__).resolve().parents[1]
+            / "deployments"
+            / "agent_backend"
+            / "libexec"
+            / "remihub-backend-deployment-control"
+        )
+        loader = importlib.machinery.SourceFileLoader(
+            "remihub_backend_deployment_control_planning_modes_test",
+            str(helper_path),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = module
+        try:
+            loader.exec_module(module)
+        finally:
+            sys.modules.pop(loader.name, None)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            planning = Path(temporary_directory) / "planning"
+            planning.mkdir()
+            _git(planning, "init", "-b", "main")
+            _git(planning, "config", "user.name", "RemiHub Test")
+            _git(planning, "config", "user.email", "remihub-test@invalid.local")
+            (planning / "backend").mkdir()
+            worker = planning / "backend" / "agent_worker.py"
+            worker.write_text("VALUE = 1\n", encoding="utf-8")
+            executable = planning / "deploy.sh"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            _git(planning, "add", ".")
+            _git(planning, "commit", "-m", "Base")
+            expected = _git(planning, "rev-parse", "HEAD")
+
+            worker.chmod(0o600)
+            executable.chmod(0o700)
+
+            def local_run(command, *, user=None, check=True):
+                del user
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if check and result.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        result.returncode,
+                        command,
+                        result.stdout,
+                        result.stderr,
+                    )
+                return result
+
+            owner = SimpleNamespace(pw_uid=os.getuid())
+            group = SimpleNamespace(gr_gid=os.getgid())
+            with (
+                patch.object(module, "PLANNING_REPO", planning),
+                patch.object(module.pwd, "getpwnam", return_value=owner),
+                patch.object(module.grp, "getgrnam", return_value=group),
+                patch.object(module, "run", side_effect=local_run),
+            ):
+                module.harden_planning_checkout(expected)
+
+            self.assertEqual(planning.stat().st_mode & 0o7777, 0o2750)
+            self.assertEqual(worker.stat().st_mode & 0o7777, 0o640)
+            self.assertEqual(executable.stat().st_mode & 0o7777, 0o750)
+            self.assertEqual(
+                (planning / ".git" / "config").stat().st_mode & 0o7777,
+                0o640,
+            )
+            self.assertEqual(
+                _git(planning, "status", "--porcelain=v1", "--untracked-files=no"),
+                "",
+            )
 
     def test_qa_runtime_hardening_preserves_git_modes_across_promote_and_restore(self):
         helper_path = (
@@ -1101,11 +1182,11 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
             installer,
         )
         self.assertIn(
-            'systemctl is-active --quiet remihub-agent-worker.service',
+            'wait_for_service_stable remihub-agent-worker.service',
             installer,
         )
         self.assertIn(
-            'systemctl is-active --quiet remihub-agent-implementation.service',
+            'wait_for_service_stable remihub-agent-implementation.service',
             installer,
         )
 
@@ -1399,6 +1480,22 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
         )
         self.assertNotIn(
             'git -C "$PLANNING" fetch --no-tags "$SOURCE" refs/heads/main',
+            installer,
+        )
+        self.assertIn(
+            'harden-planning production "$NEW_COMMIT"',
+            installer,
+        )
+        self.assertIn(
+            'runuser -u remihub-agent -- /usr/bin/test -r "$PLANNING/backend/agent_worker.py"',
+            installer,
+        )
+        self.assertIn(
+            'wait_for_service_stable remihub-agent-worker.service',
+            installer,
+        )
+        self.assertNotIn(
+            'systemctl start remihub-agent-worker.service\n    systemctl is-active --quiet remihub-agent-worker.service',
             installer,
         )
 
