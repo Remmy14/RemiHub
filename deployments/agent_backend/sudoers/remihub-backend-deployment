@@ -1,0 +1,2 @@
+Defaults:remihub-deployer env_reset
+remihub-deployer ALL=(root) NOPASSWD: /usr/local/libexec/remihub-backend-deployment-control *

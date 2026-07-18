@@ -382,11 +382,17 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             build_executor(settings, queue=MagicMock())
 
 
-class QaDeploymentWorkerSettingsTests(unittest.TestCase):
-    @patch("backend.agent_worker.GitQaDeploymentExecutor")
-    @patch("backend.agent_worker.GitQaDeploymentManager")
-    def test_qa_deployment_executor_uses_separate_target_paths(
+class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
+    @patch("backend.agent_worker.GitBackendDeploymentExecutor")
+    @patch("backend.agent_worker.GitBackendDeploymentManager")
+    @patch("backend.agent_worker.PrivilegedDeploymentRuntime")
+    @patch("backend.agent_worker.PostgresDeploymentDatabase")
+    @patch("backend.agent_worker.SandboxBackendValidator")
+    def test_qa_backend_deployment_executor_uses_separate_authority_objects(
         self,
+        sandbox_validator,
+        deployment_database,
+        deployment_runtime,
         deployment_manager,
         deployment_executor,
     ):
@@ -394,7 +400,7 @@ class QaDeploymentWorkerSettingsTests(unittest.TestCase):
             os.environ,
             {
                 "REMIHUB_AGENT_ENVIRONMENT": "qa",
-                "REMIHUB_AGENT_EXECUTOR": "git-deployment-qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
                 "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
                 "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
                 "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
@@ -408,6 +414,26 @@ class QaDeploymentWorkerSettingsTests(unittest.TestCase):
                     "/srv/agent/deployment-artifacts"
                 ),
                 "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH": "qa-main",
+                "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": (
+                    "/srv/agent/config/qa-migrator.ini"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub_qa_owner",
+                "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+                "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": (
+                    "/usr/lib/postgresql/16/bin/pg_dump"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": (
+                    "/usr/lib/postgresql/16/bin/pg_restore"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/bin/validate",
+                "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": (
+                    "/srv/agent/bin/runtime-helper"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_HEALTH_URL": (
+                    "http://127.0.0.1:8001/openapi.json"
+                ),
+                "REMIHUB_AGENT_DEPLOYMENT_TIMEOUT_SECONDS": "600",
+                "REMIHUB_AGENT_DEPLOYMENT_RETRY_SECONDS": "75",
                 "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS": "45",
             },
             clear=True,
@@ -417,7 +443,26 @@ class QaDeploymentWorkerSettingsTests(unittest.TestCase):
         result = build_executor(settings, queue=MagicMock())
 
         self.assertEqual(result, deployment_executor.return_value)
+        sandbox_validator.assert_called_once_with(
+            validation_command="/srv/agent/bin/validate",
+            timeout_seconds=600,
+        )
+        deployment_database.assert_called_once_with(
+            config_path="/srv/agent/config/qa-migrator.ini",
+            backup_root="/srv/agent/backups",
+            owner_role="remihub_qa_owner",
+            pg_dump_binary="/usr/lib/postgresql/16/bin/pg_dump",
+            pg_restore_binary="/usr/lib/postgresql/16/bin/pg_restore",
+            command_timeout_seconds=600,
+        )
+        deployment_runtime.assert_called_once_with(
+            environment="qa",
+            helper_path="/srv/agent/bin/runtime-helper",
+            health_url="http://127.0.0.1:8001/openapi.json",
+            command_timeout_seconds=600,
+        )
         deployment_manager.assert_called_once_with(
+            environment="qa",
             source_repository="/srv/agent/source.git",
             source_worktree_root="/srv/agent/worktrees",
             source_artifact_root="/srv/agent/artifacts",
@@ -425,13 +470,102 @@ class QaDeploymentWorkerSettingsTests(unittest.TestCase):
             candidate_worktree_root="/srv/agent/deployment-worktrees",
             deployment_artifact_root="/srv/agent/deployment-artifacts",
             target_branch="qa-main",
+            validator=sandbox_validator.return_value,
+            database=deployment_database.return_value,
+            runtime=deployment_runtime.return_value,
             command_timeout_seconds=45,
         )
         deployment_executor.assert_called_once_with(
-            deployment_manager=deployment_manager.return_value
+            deployment_manager=deployment_manager.return_value,
+            retry_after_seconds=75,
         )
 
-    def test_qa_deployment_executor_is_rejected_in_production(self):
+    @patch("backend.agent_worker.GitBackendDeploymentExecutor")
+    @patch("backend.agent_worker.GitBackendDeploymentManager")
+    @patch("backend.agent_worker.PrivilegedDeploymentRuntime")
+    @patch("backend.agent_worker.PostgresDeploymentDatabase")
+    @patch("backend.agent_worker.SandboxBackendValidator")
+    def test_production_backend_deployment_uses_production_target(
+        self,
+        sandbox_validator,
+        deployment_database,
+        deployment_runtime,
+        deployment_manager,
+        deployment_executor,
+    ):
+        environment = {
+            "REMIHUB_AGENT_ENVIRONMENT": "production",
+            "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+            "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+            "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": (
+                "/srv/agent/production-deployment.git"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
+                "/srv/agent/production-worktrees"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
+                "/srv/agent/production-artifacts"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": (
+                "/srv/agent/config/prod-migrator.ini"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub",
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": (
+                "/usr/lib/postgresql/16/bin/pg_dump"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": (
+                "/usr/lib/postgresql/16/bin/pg_restore"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/bin/validate",
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": (
+                "/srv/agent/bin/runtime-helper"
+            ),
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = AgentWorkerSettings.from_environment()
+
+        result = build_executor(settings, queue=MagicMock())
+
+        self.assertEqual(settings.deployment_target_branch, "production-main")
+        self.assertEqual(result, deployment_executor.return_value)
+        self.assertEqual(
+            deployment_manager.call_args.kwargs["environment"],
+            "production",
+        )
+        self.assertEqual(
+            deployment_manager.call_args.kwargs["target_branch"],
+            "production-main",
+        )
+
+    def test_backend_deployment_requires_explicit_postgresql_clients(self):
+        environment = {
+            "REMIHUB_AGENT_ENVIRONMENT": "qa",
+            "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+            "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+            "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": "/srv/agent/qa.git",
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": "/srv/agent/qa-worktrees",
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": "/srv/agent/qa-artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": "/srv/agent/qa.ini",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub_qa_owner",
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/validate",
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": "/srv/agent/helper",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+    def test_legacy_qa_executor_name_is_rejected_in_production(self):
         with patch.dict(
             os.environ,
             {
@@ -448,21 +582,17 @@ class QaDeploymentWorkerSettingsTests(unittest.TestCase):
         ):
             build_executor(settings, queue=MagicMock())
 
-    def test_qa_deployment_executor_requires_target_repository(self):
+    def test_backend_deployment_requires_target_repository_first(
+        self,
+    ):
         with patch.dict(
             os.environ,
             {
                 "REMIHUB_AGENT_ENVIRONMENT": "qa",
-                "REMIHUB_AGENT_EXECUTOR": "git-deployment-qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
                 "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
                 "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
                 "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
-                "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
-                    "/srv/agent/deployment-worktrees"
-                ),
-                "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
-                    "/srv/agent/deployment-artifacts"
-                ),
             },
             clear=True,
         ):

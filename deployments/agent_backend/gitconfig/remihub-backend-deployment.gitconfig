@@ -1,0 +1,12 @@
+# Root-owned protected Git configuration for the backend deployment boundary.
+# These entries only trust the fixed repositories/worktrees that the deployment
+# worker and fixed privileged helper are explicitly designed to inspect.
+[safe]
+	directory = /opt/remihub
+	directory = /opt/remihub/.git
+	directory = /opt/remihub-agent/repositories/remihub-planning
+	directory = /opt/remihub-agent/repositories/remihub-implementation.git
+	directory = /opt/remihub-agent/implementation/worktrees/*
+	directory = /opt/remihub-agent/deployment/qa/repository.git
+	directory = /opt/remihub-agent/deployment/qa/application
+	directory = /opt/remihub-agent/deployment/production/repository.git

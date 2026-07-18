@@ -1,0 +1,55 @@
+[Unit]
+Description=RemiHub Backend QA Runtime
+After=postgresql.service
+ConditionPathIsDirectory=/opt/remihub-agent/deployment/qa/application
+ConditionFileIsExecutable=/opt/remihub/.venv/bin/python
+ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-qa-server
+
+[Service]
+Type=simple
+User=remihub-qa-app
+Group=remihub-qa-app
+WorkingDirectory=/opt/remihub-agent/deployment/qa/application
+ExecStartPre=/usr/bin/test -x /opt/remihub-agent/deployment
+ExecStartPre=/usr/bin/test -x /opt/remihub-agent/deployment/qa
+ExecStartPre=/usr/bin/test -x /opt/remihub-agent/deployment/qa/application
+ExecStartPre=/usr/bin/test -r /opt/remihub-agent/deployment/qa/application/backend/main.py
+ExecStartPre=/usr/bin/test -x /opt/remihub-agent/deployment/config
+ExecStartPre=/usr/bin/test -r /opt/remihub-agent/deployment/config/qa-app.ini
+ExecStartPre=/usr/bin/test -r /opt/remihub-agent/deployment/config/qa-application.ini
+ExecStart=/opt/remihub/.venv/bin/python /usr/local/libexec/remihub-backend-qa-server
+Restart=no
+TimeoutStartSec=90
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0027
+
+Environment=HOME=/nonexistent
+Environment=PATH=/opt/remihub/.venv/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/opt/remihub-agent/deployment/qa/application
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=America/New_York
+Environment=REMIHUB_CONFIG_FILE=/opt/remihub-agent/deployment/config/qa-application.ini
+Environment=REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/qa-app.ini
+Environment=REMIHUB_ENV_FILE=/dev/null
+Environment=REMIHUB_LOG_DIR=/opt/remihub-agent/deployment/qa/logs
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=/opt/remihub-agent/deployment/qa/logs
+
+[Install]
+# Static run-once validation runtime. Controlled by the deployment helper.

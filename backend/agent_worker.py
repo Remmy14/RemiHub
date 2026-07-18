@@ -8,8 +8,11 @@ import threading
 from dataclasses import dataclass
 
 from backend.core.agent_deployment import (
-    GitQaDeploymentExecutor,
-    GitQaDeploymentManager,
+    GitBackendDeploymentExecutor,
+    GitBackendDeploymentManager,
+    PostgresDeploymentDatabase,
+    PrivilegedDeploymentRuntime,
+    SandboxBackendValidator,
 )
 from backend.core.agent_worker import (
     AgentWorker,
@@ -68,6 +71,16 @@ class AgentWorkerSettings:
     deployment_worktree_root: str | None
     deployment_artifact_root: str | None
     deployment_target_branch: str
+    deployment_database_config: str | None
+    deployment_database_owner_role: str | None
+    deployment_backup_root: str | None
+    deployment_pg_dump_binary: str | None
+    deployment_pg_restore_binary: str | None
+    deployment_validator: str | None
+    deployment_runtime_helper: str | None
+    deployment_health_url: str
+    deployment_timeout_seconds: int
+    deployment_retry_seconds: int
     git_timeout_seconds: int
     codex_bin: str | None
     codex_model: str | None
@@ -139,12 +152,39 @@ class AgentWorkerSettings:
         )
         deployment_target_branch = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH",
-            "qa-main",
+            "qa-main" if environment == "qa" else "production-main",
         ).strip()
         if not deployment_target_branch:
             raise AgentWorkerConfigurationError(
                 "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH must not be blank"
             )
+        deployment_database_config = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG"
+        )
+        deployment_database_owner_role = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE"
+        )
+        deployment_backup_root = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT"
+        )
+        deployment_pg_dump_binary = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY"
+        )
+        deployment_pg_restore_binary = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY"
+        )
+        deployment_validator = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR"
+        )
+        deployment_runtime_helper = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER"
+        )
+        deployment_health_url = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_HEALTH_URL",
+            "http://127.0.0.1:8001/openapi.json"
+            if environment == "qa"
+            else "http://127.0.0.1:8000/openapi.json",
+        ).strip()
         codex_bin = os.environ.get("REMIHUB_CODEX_BIN")
         codex_model = os.environ.get("REMIHUB_CODEX_MODEL")
 
@@ -190,6 +230,53 @@ class AgentWorkerSettings:
                 else None
             ),
             deployment_target_branch=deployment_target_branch,
+            deployment_database_config=(
+                deployment_database_config.strip()
+                if deployment_database_config and deployment_database_config.strip()
+                else None
+            ),
+            deployment_database_owner_role=(
+                deployment_database_owner_role.strip()
+                if deployment_database_owner_role
+                and deployment_database_owner_role.strip()
+                else None
+            ),
+            deployment_backup_root=(
+                deployment_backup_root.strip()
+                if deployment_backup_root and deployment_backup_root.strip()
+                else None
+            ),
+            deployment_pg_dump_binary=(
+                deployment_pg_dump_binary.strip()
+                if deployment_pg_dump_binary
+                and deployment_pg_dump_binary.strip()
+                else None
+            ),
+            deployment_pg_restore_binary=(
+                deployment_pg_restore_binary.strip()
+                if deployment_pg_restore_binary
+                and deployment_pg_restore_binary.strip()
+                else None
+            ),
+            deployment_validator=(
+                deployment_validator.strip()
+                if deployment_validator and deployment_validator.strip()
+                else None
+            ),
+            deployment_runtime_helper=(
+                deployment_runtime_helper.strip()
+                if deployment_runtime_helper and deployment_runtime_helper.strip()
+                else None
+            ),
+            deployment_health_url=deployment_health_url,
+            deployment_timeout_seconds=_positive_int(
+                "REMIHUB_AGENT_DEPLOYMENT_TIMEOUT_SECONDS",
+                900,
+            ),
+            deployment_retry_seconds=_positive_int(
+                "REMIHUB_AGENT_DEPLOYMENT_RETRY_SECONDS",
+                60,
+            ),
             git_timeout_seconds=_positive_int(
                 "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS",
                 120,
@@ -287,10 +374,10 @@ def build_executor(
             retry_after_seconds=settings.codex_retry_seconds,
         )
 
-    if settings.executor_name == "git-deployment-qa":
-        if settings.environment != "qa":
+    if settings.executor_name in {"git-backend-deployment", "git-deployment-qa"}:
+        if settings.executor_name == "git-deployment-qa" and settings.environment != "qa":
             raise AgentWorkerConfigurationError(
-                "The phase-one Git deployment executor is restricted to QA"
+                "The legacy git-deployment-qa executor is restricted to QA"
             )
         required_paths = {
             "REMIHUB_AGENT_REPOSITORY": settings.repository_path,
@@ -305,13 +392,51 @@ def build_executor(
             "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
                 settings.deployment_artifact_root
             ),
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": (
+                settings.deployment_database_config
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": (
+                settings.deployment_database_owner_role
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": (
+                settings.deployment_backup_root
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": (
+                settings.deployment_pg_dump_binary
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": (
+                settings.deployment_pg_restore_binary
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": settings.deployment_validator,
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": (
+                settings.deployment_runtime_helper
+            ),
         }
         missing = [name for name, value in required_paths.items() if value is None]
         if missing:
             raise AgentWorkerConfigurationError(
-                f"{missing[0]} is required for git-deployment-qa"
+                f"{missing[0]} is required for git-backend-deployment"
             )
-        deployment_manager = GitQaDeploymentManager(
+        validator = SandboxBackendValidator(
+            validation_command=settings.deployment_validator,
+            timeout_seconds=settings.deployment_timeout_seconds,
+        )
+        database = PostgresDeploymentDatabase(
+            config_path=settings.deployment_database_config,
+            backup_root=settings.deployment_backup_root,
+            owner_role=settings.deployment_database_owner_role,
+            pg_dump_binary=settings.deployment_pg_dump_binary,
+            pg_restore_binary=settings.deployment_pg_restore_binary,
+            command_timeout_seconds=settings.deployment_timeout_seconds,
+        )
+        runtime = PrivilegedDeploymentRuntime(
+            environment=settings.environment,
+            helper_path=settings.deployment_runtime_helper,
+            health_url=settings.deployment_health_url,
+            command_timeout_seconds=settings.deployment_timeout_seconds,
+        )
+        deployment_manager = GitBackendDeploymentManager(
+            environment=settings.environment,
             source_repository=settings.repository_path,
             source_worktree_root=settings.worktree_root,
             source_artifact_root=settings.artifact_root,
@@ -319,10 +444,14 @@ def build_executor(
             candidate_worktree_root=settings.deployment_worktree_root,
             deployment_artifact_root=settings.deployment_artifact_root,
             target_branch=settings.deployment_target_branch,
+            validator=validator,
+            database=database,
+            runtime=runtime,
             command_timeout_seconds=settings.git_timeout_seconds,
         )
-        return GitQaDeploymentExecutor(
+        return GitBackendDeploymentExecutor(
             deployment_manager=deployment_manager,
+            retry_after_seconds=settings.deployment_retry_seconds,
         )
 
     raise AgentWorkerConfigurationError(

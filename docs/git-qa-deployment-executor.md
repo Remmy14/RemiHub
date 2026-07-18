@@ -1,5 +1,10 @@
 # Git QA deployment executor
 
+> **Superseded:** This document describes the original documentation-only QA
+> foundation. The active consolidated backend design is documented in
+> [`backend-deployment-executor.md`](backend-deployment-executor.md). The old
+> `git-deployment-qa` executor name remains only as a QA compatibility alias.
+
 This phase-one executor proves RemiHub-controlled deployment without giving
 Codex deployment authority. It accepts only `deployment` runs and is restricted
 to `REMIHUB_AGENT_ENVIRONMENT=qa`.

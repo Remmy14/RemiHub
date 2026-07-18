@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Run the candidate FastAPI app in QA without starting background workers."""
+from backend import main
+import uvicorn
+
+main.TEST_MODE = True
+uvicorn.run(main.app, host="127.0.0.1", port=8001, log_level="info")

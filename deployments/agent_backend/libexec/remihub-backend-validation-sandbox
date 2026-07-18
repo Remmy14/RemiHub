@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+(
+  set -euo pipefail
+
+  fail() {
+    printf 'remihub-backend-validation-sandbox: %s\n' "$*" >&2
+    exit 125
+  }
+
+  [[ "$#" -eq 1 ]] || fail "expected one candidate worktree path"
+  [[ "$(id -un)" == "remihub-deployer" ]] || fail "must run as remihub-deployer"
+
+  BWRAP="/usr/local/libexec/remihub-codex-bwrap/bwrap"
+  VENV="/opt/remihub/.venv"
+  SUPPORT="/usr/local/libexec/remihub-backend-validation-support"
+  candidate="$(realpath -e -- "$1")"
+
+  case "$candidate" in
+    /opt/remihub-agent/deployment/qa/worktrees/card-*-r*|\
+    /opt/remihub-agent/deployment/production/worktrees/card-*-r*) ;;
+    *) fail "candidate is outside an approved deployment worktree root" ;;
+  esac
+  [[ -d "$candidate" && ! -L "$candidate" ]] || fail "candidate must be a real directory"
+  [[ -x "$BWRAP" && ! -L "$BWRAP" ]] || fail "dedicated Bubblewrap is unavailable"
+  [[ -x "$VENV/bin/python" ]] || fail "production Python environment is unavailable"
+  [[ -d "$SUPPORT" && ! -L "$SUPPORT" ]] || fail "validation support is unavailable"
+
+  args=(
+    "$BWRAP"
+    --die-with-parent
+    --new-session
+    --unshare-user
+    --uid "$(id -u)"
+    --gid "$(id -g)"
+    --unshare-pid
+    --unshare-ipc
+    --unshare-uts
+    --unshare-net
+    --hostname remihub-backend-validation
+    --cap-drop ALL
+    --clearenv
+    --ro-bind /usr /usr
+  )
+  for path in /bin /sbin /lib /lib64; do
+    if [[ -L "$path" ]]; then
+      args+=(--symlink "$(readlink -- "$path")" "$path")
+    elif [[ -d "$path" ]]; then
+      args+=(--ro-bind "$path" "$path")
+    fi
+  done
+  args+=(
+    --proc /proc
+    --dev /dev
+    --tmpfs /tmp
+    --tmpfs /run
+    --dir /etc
+    --dir /opt
+    --dir /opt/remihub
+    --dir /workspace
+    --dir /validator-support
+    --ro-bind "$VENV" /opt/remihub/.venv
+    --ro-bind "$candidate" /workspace
+    --ro-bind "$SUPPORT" /validator-support
+  )
+  for path in /etc/ld.so.cache /etc/localtime /etc/nsswitch.conf /etc/os-release; do
+    [[ -f "$path" ]] && args+=(--ro-bind "$path" "$path")
+  done
+  [[ -d /etc/ssl ]] && args+=(--ro-bind /etc/ssl /etc/ssl)
+  [[ -d /etc/ca-certificates ]] && args+=(--ro-bind /etc/ca-certificates /etc/ca-certificates)
+
+  # Hide all host deployment controls even though the validator has no network.
+  for path in \
+    /usr/bin/sudo \
+    /usr/bin/systemctl \
+    /usr/local/libexec/remihub-backend-deployment-control \
+    /usr/local/libexec/remihub-codex-bwrap/bwrap; do
+    [[ -e "$path" ]] && args+=(--ro-bind /usr/bin/false "$path")
+  done
+
+  args+=(
+    --setenv HOME /tmp/home
+    --setenv PATH /opt/remihub/.venv/bin:/usr/bin:/bin
+    --setenv PYTHONPATH /validator-support:/workspace
+    --setenv PYTHONPYCACHEPREFIX /tmp/pycache
+    --setenv PYTHONDONTWRITEBYTECODE 1
+    --setenv PYTHONUNBUFFERED 1
+    --setenv LANG C.UTF-8
+    --setenv LC_ALL C.UTF-8
+    --setenv GIT_CONFIG_NOSYSTEM 1
+    --setenv GIT_CONFIG_GLOBAL /dev/null
+    --setenv GIT_TERMINAL_PROMPT 0
+    --setenv REMIHUB_CONFIG_FILE /validator-support/application.ini
+    --setenv REMIHUB_DATABASE_CONFIG /validator-support/database.ini
+    --setenv REMIHUB_ENV_FILE /dev/null
+    --setenv REMIHUB_LOG_DIR /tmp/remihub-logs
+    --chdir /workspace
+    /bin/bash -c '/opt/remihub/.venv/bin/python -m compileall -q backend tests && /opt/remihub/.venv/bin/python -m unittest discover -s tests -v'
+  )
+
+  exec /usr/bin/env -i "${args[@]}"
+)

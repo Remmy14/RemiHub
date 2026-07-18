@@ -1,0 +1,504 @@
+#!/usr/bin/python3
+"""Root-owned, fixed-path control boundary for RemiHub backend deployment."""
+from __future__ import annotations
+
+import grp
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+GIT = "/usr/bin/git"
+SYSTEMCTL = "/usr/bin/systemctl"
+RUNUSER = "/usr/sbin/runuser"
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+BRANCH_RE = re.compile(
+    r"deployment/card-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/r[1-9][0-9]*"
+)
+TAG_RE = re.compile(
+    r"rollback-before-agent-card-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r[1-9][0-9]*"
+)
+
+
+@dataclass(frozen=True)
+class Environment:
+    service: str
+    target_repo: Path
+    target_branch: str
+    runtime: Path
+    runtime_branch: str
+    runtime_user: str
+
+
+ENVIRONMENTS = {
+    "qa": Environment(
+        service="remihub-backend-qa.service",
+        target_repo=Path("/opt/remihub-agent/deployment/qa/repository.git"),
+        target_branch="qa-main",
+        runtime=Path("/opt/remihub-agent/deployment/qa/application"),
+        runtime_branch="qa-runtime",
+        runtime_user="root",
+    ),
+    "production": Environment(
+        service="remihub.service",
+        target_repo=Path("/opt/remihub-agent/deployment/production/repository.git"),
+        target_branch="production-main",
+        runtime=Path("/opt/remihub"),
+        runtime_branch="main",
+        runtime_user="alex",
+    ),
+}
+SOURCE_REPO = Path("/opt/remihub-agent/repositories/remihub-implementation.git")
+PLANNING_REPO = Path("/opt/remihub-agent/repositories/remihub-planning")
+GIT_SAFE_CONFIG = Path(
+    "/opt/remihub-agent/deployment/config/git-safe-directory.ini"
+)
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"remihub-backend-deployment-control: {message}", file=sys.stderr)
+    raise SystemExit(64)
+
+
+def run(
+    command: list[str],
+    *,
+    user: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if user and user != "root":
+        command = [RUNUSER, "--user", user, "--", *command]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={
+            "HOME": "/root" if not user or user == "root" else f"/home/{user}",
+            "LANG": "C.UTF-8",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(GIT_SAFE_CONFIG),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        fail(f"command failed{suffix}")
+    return result
+
+
+def git(repo: Path, *args: str, user: str | None = None) -> str:
+    return run([GIT, "-C", str(repo), *args], user=user).stdout.strip()
+
+
+def commit(value: str) -> str:
+    if not COMMIT_RE.fullmatch(value):
+        fail("invalid commit argument")
+    return value
+
+
+def branch(value: str) -> str:
+    if not BRANCH_RE.fullmatch(value):
+        fail("invalid candidate branch argument")
+    return value
+
+
+def tag(value: str) -> str:
+    if not TAG_RE.fullmatch(value):
+        fail("invalid rollback reference argument")
+    return value
+
+
+def verify_git_safe_config() -> None:
+    try:
+        stat_result = GIT_SAFE_CONFIG.stat()
+    except OSError:
+        fail("protected Git configuration is missing")
+    if GIT_SAFE_CONFIG.is_symlink() or not GIT_SAFE_CONFIG.is_file():
+        fail("protected Git configuration path is unsafe")
+    if stat_result.st_uid != 0 or stat_result.st_mode & 0o022:
+        fail("protected Git configuration ownership or mode is unsafe")
+
+
+def verify_fixed_environment(environment_name: str) -> Environment:
+    environment = ENVIRONMENTS.get(environment_name)
+    if environment is None:
+        fail("environment must be qa or production")
+    for path in (environment.target_repo, environment.runtime):
+        if not path.is_dir() or path.is_symlink():
+            fail(f"required fixed path is missing or unsafe: {path}")
+    return environment
+
+
+def resolve(repo: Path, ref: str, *, user: str | None = None) -> str:
+    value = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", user=user)
+    return commit(value)
+
+
+def require_runtime_state(environment: Environment, expected: str) -> None:
+    if git(environment.runtime, "symbolic-ref", "--quiet", "--short", "HEAD", user=environment.runtime_user) != environment.runtime_branch:
+        fail("runtime is on an unexpected branch")
+    if resolve(environment.runtime, "HEAD", user=environment.runtime_user) != expected:
+        fail("runtime HEAD does not match the expected commit")
+    status = git(
+        environment.runtime,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=no",
+        user=environment.runtime_user,
+    )
+    if status:
+        details = "; ".join(status.splitlines())
+        fail(f"runtime has tracked modifications: {details}")
+
+
+def harden_qa_runtime(environment: Environment, expected: str) -> None:
+    if environment.target_branch != "qa-main":
+        fail("runtime hardening is QA-only")
+    if git(environment.runtime, "symbolic-ref", "--quiet", "--short", "HEAD") != environment.runtime_branch:
+        fail("QA runtime is on an unexpected branch before hardening")
+    if resolve(environment.runtime, "HEAD") != expected:
+        fail("QA runtime HEAD does not match the expected commit before hardening")
+
+    full_status = git(
+        environment.runtime,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if full_status:
+        details = "; ".join(full_status.splitlines())
+        fail(f"QA runtime is not clean before hardening: {details}")
+
+    try:
+        qa_gid = grp.getgrnam("remihub-qa-app").gr_gid
+    except KeyError:
+        fail("QA runtime group is missing")
+
+    runtime = environment.runtime
+    git_directory = runtime / ".git"
+    if not git_directory.is_dir() or git_directory.is_symlink():
+        fail("QA runtime Git directory is missing or unsafe")
+
+    index = run(
+        [GIT, "-C", str(runtime), "ls-files", "--stage", "-z"],
+    ).stdout
+    tracked: dict[Path, int] = {}
+    for record in index.split("\0"):
+        if not record:
+            continue
+        try:
+            metadata, relative_text = record.split("\t", 1)
+            mode_text = metadata.split(" ", 1)[0]
+        except ValueError:
+            fail("QA runtime index contains an invalid record")
+        if relative_text.startswith("/") or ".." in Path(relative_text).parts:
+            fail("QA runtime index contains an unsafe path")
+        if mode_text == "100644":
+            file_mode = 0o640
+        elif mode_text == "100755":
+            file_mode = 0o750
+        else:
+            fail(f"QA runtime contains unsupported tracked mode {mode_text}")
+        tracked[Path(relative_text)] = file_mode
+
+    os.chown(runtime, 0, qa_gid)
+    os.chmod(runtime, 0o2750)
+    for directory, names, files in os.walk(runtime, topdown=True, followlinks=False):
+        current = Path(directory)
+        if current == runtime:
+            names[:] = [name for name in names if name != ".git"]
+        if current != runtime:
+            if current.is_symlink():
+                fail(f"QA runtime contains an unexpected directory symlink: {current}")
+            os.chown(current, 0, qa_gid)
+            os.chmod(current, 0o2750)
+        for filename in files:
+            path = current / filename
+            if path.is_symlink():
+                fail(f"QA runtime contains an unexpected file symlink: {path}")
+
+    for relative, file_mode in tracked.items():
+        path = runtime / relative
+        if not path.is_file() or path.is_symlink():
+            fail(f"QA runtime tracked file is missing or unsafe: {relative}")
+        os.chown(path, 0, qa_gid)
+        os.chmod(path, file_mode)
+
+    for directory, _, files in os.walk(git_directory, followlinks=False):
+        current = Path(directory)
+        if current.is_symlink():
+            fail("QA runtime Git directory contains a symlink")
+        os.chown(current, 0, 0)
+        os.chmod(current, 0o700)
+        for filename in files:
+            path = current / filename
+            if path.is_symlink():
+                fail("QA runtime Git metadata contains a symlink")
+            os.chown(path, 0, 0)
+            os.chmod(path, 0o600)
+
+    require_runtime_state(environment, expected)
+
+
+def verify_runtime(environment: Environment, args: list[str]) -> None:
+    if len(args) != 1:
+        fail("verify-runtime requires the expected commit")
+    expected = commit(args[0])
+    require_runtime_state(environment, expected)
+    print(expected)
+
+
+def ensure_runtime_tag(environment: Environment, rollback_ref: str, base: str) -> None:
+    existing = run(
+        [GIT, "-C", str(environment.runtime), "rev-parse", "--verify", "--quiet", f"refs/tags/{rollback_ref}^{{commit}}"],
+        user=environment.runtime_user,
+        check=False,
+    )
+    if existing.returncode == 0:
+        if commit(existing.stdout.strip()) != base:
+            fail("runtime rollback reference points to another commit")
+        return
+    run(
+        [
+            GIT,
+            "-C",
+            str(environment.runtime),
+            "-c",
+            "user.name=RemiHub Deployment",
+            "-c",
+            "user.email=remihub-deployment@invalid.local",
+            "tag",
+            "-a",
+            rollback_ref,
+            base,
+            "-m",
+            f"Rollback before {rollback_ref}",
+        ],
+        user=environment.runtime_user,
+    )
+
+
+def promote(environment: Environment, args: list[str]) -> None:
+    if len(args) != 4:
+        fail("promote requires candidate branch, candidate commit, base commit, and rollback reference")
+    candidate_branch, candidate, base, rollback_ref = (
+        branch(args[0]),
+        commit(args[1]),
+        commit(args[2]),
+        tag(args[3]),
+    )
+    if resolve(environment.target_repo, f"refs/heads/{candidate_branch}") != candidate:
+        fail("candidate branch does not resolve to the approved commit")
+    if resolve(environment.target_repo, f"{candidate}^") != base:
+        fail("candidate parent does not match the approved base")
+    if resolve(environment.target_repo, environment.target_branch) != base:
+        fail("deployment target branch advanced before runtime promotion")
+    require_runtime_state(environment, base)
+    ensure_runtime_tag(environment, rollback_ref, base)
+
+    temporary_ref = f"refs/remotes/remihub-deployment/{candidate_branch}"
+    run(
+        [
+            GIT,
+            "-C",
+            str(environment.runtime),
+            "fetch",
+            "--no-tags",
+            str(environment.target_repo),
+            f"refs/heads/{candidate_branch}:{temporary_ref}",
+        ],
+        user=environment.runtime_user,
+    )
+    if resolve(environment.runtime, temporary_ref, user=environment.runtime_user) != candidate:
+        fail("runtime fetched an unexpected candidate commit")
+    run(
+        [GIT, "-C", str(environment.runtime), "reset", "--hard", candidate],
+        user=environment.runtime_user,
+    )
+    if environment.target_branch == "qa-main":
+        harden_qa_runtime(environment, candidate)
+    else:
+        require_runtime_state(environment, candidate)
+
+
+def restore(environment: Environment, args: list[str]) -> None:
+    if len(args) != 2:
+        fail("restore requires expected current and rollback commits")
+    expected, rollback = commit(args[0]), commit(args[1])
+    current = resolve(environment.runtime, "HEAD", user=environment.runtime_user)
+    if current == rollback:
+        require_runtime_state(environment, rollback)
+        return
+    if current != expected:
+        fail("runtime is neither the expected candidate nor rollback commit")
+    require_runtime_state(environment, expected)
+    run(
+        [GIT, "-C", str(environment.runtime), "reset", "--hard", rollback],
+        user=environment.runtime_user,
+    )
+    if environment.target_branch == "qa-main":
+        harden_qa_runtime(environment, rollback)
+    else:
+        require_runtime_state(environment, rollback)
+
+
+def require_source_state(expected: str) -> None:
+    if resolve(SOURCE_REPO, "refs/heads/main", user="remihub-agent") != expected:
+        fail("implementation source main does not match the expected commit")
+    if git(PLANNING_REPO, "symbolic-ref", "--quiet", "--short", "HEAD", user="alex") != "main":
+        fail("planning checkout is not on main")
+    if resolve(PLANNING_REPO, "HEAD", user="alex") != expected:
+        fail("planning checkout does not match the expected commit")
+    if git(PLANNING_REPO, "status", "--porcelain=v1", "--untracked-files=no", user="alex"):
+        fail("planning checkout has tracked modifications")
+
+
+def synchronize_sources(environment: Environment, args: list[str]) -> None:
+    if environment is not ENVIRONMENTS["production"]:
+        fail("source synchronization is production-only")
+    if len(args) != 4:
+        fail("synchronize-sources requires candidate branch, candidate commit, base commit, and rollback reference")
+    candidate_branch, candidate, base, rollback_ref = (
+        branch(args[0]), commit(args[1]), commit(args[2]), tag(args[3])
+    )
+    require_source_state(base)
+    if resolve(environment.target_repo, f"refs/heads/{candidate_branch}") != candidate:
+        fail("source synchronization candidate is unavailable")
+    if resolve(environment.target_repo, environment.target_branch) != candidate:
+        fail("production target branch has not advanced to the candidate")
+    require_runtime_state(environment, candidate)
+
+    temporary_ref = f"refs/remihub-deployment/{candidate_branch}"
+    try:
+        run(
+            [
+                GIT,
+                "--git-dir",
+                str(SOURCE_REPO),
+                "fetch",
+                "--no-tags",
+                str(environment.target_repo),
+                f"refs/heads/{candidate_branch}:{temporary_ref}",
+            ],
+            user="remihub-agent",
+        )
+        if resolve(SOURCE_REPO, temporary_ref, user="remihub-agent") != candidate:
+            fail("implementation source fetched an unexpected commit")
+        run(
+            [GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/heads/main", candidate, base],
+            user="remihub-agent",
+        )
+        run(
+            [
+                GIT,
+                "-C",
+                str(PLANNING_REPO),
+                "fetch",
+                "--no-tags",
+                str(environment.runtime),
+                environment.runtime_branch,
+            ],
+            user="alex",
+        )
+        run(
+            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", candidate],
+            user="alex",
+        )
+        require_source_state(candidate)
+    except BaseException:
+        run(
+            [GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/heads/main", base, candidate],
+            user="remihub-agent",
+            check=False,
+        )
+        run(
+            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", base],
+            user="alex",
+            check=False,
+        )
+        raise
+
+
+def restore_sources(environment: Environment, args: list[str]) -> None:
+    if environment is not ENVIRONMENTS["production"]:
+        fail("source restoration is production-only")
+    if len(args) != 2:
+        fail("restore-sources requires expected current and rollback commits")
+    expected, rollback = commit(args[0]), commit(args[1])
+
+    source_current = resolve(SOURCE_REPO, "refs/heads/main", user="remihub-agent")
+    if git(PLANNING_REPO, "symbolic-ref", "--quiet", "--short", "HEAD", user="alex") != "main":
+        fail("planning checkout is not on main")
+    if git(PLANNING_REPO, "status", "--porcelain=v1", "--untracked-files=no", user="alex"):
+        fail("planning checkout has tracked modifications")
+    planning_current = resolve(PLANNING_REPO, "HEAD", user="alex")
+
+    allowed = {expected, rollback}
+    if source_current not in allowed or planning_current not in allowed:
+        fail("agent sources are neither the expected candidate nor rollback commit")
+    if source_current == expected:
+        run(
+            [GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/heads/main", rollback, expected],
+            user="remihub-agent",
+        )
+    if planning_current == expected:
+        run(
+            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", rollback],
+            user="alex",
+        )
+    require_source_state(rollback)
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail("must run as root through the dedicated sudo rule")
+    os.umask(0o027)
+    if len(sys.argv) < 3:
+        fail("usage: ACTION ENVIRONMENT [validated arguments]")
+    verify_git_safe_config()
+    action = sys.argv[1]
+    environment = verify_fixed_environment(sys.argv[2])
+    args = sys.argv[3:]
+
+    if action in {"start", "stop", "status"}:
+        if args:
+            fail(f"{action} accepts no additional arguments")
+        if action == "status":
+            result = run([SYSTEMCTL, "is-active", environment.service], check=False)
+            print(result.stdout.strip() or "inactive")
+            return
+        run([SYSTEMCTL, action, environment.service])
+        return
+    if action == "harden-runtime":
+        if len(args) != 1:
+            fail("harden-runtime requires the expected commit")
+        harden_qa_runtime(environment, commit(args[0]))
+        return
+    if action == "verify-runtime":
+        verify_runtime(environment, args)
+        return
+    if action == "promote":
+        promote(environment, args)
+        return
+    if action == "restore":
+        restore(environment, args)
+        return
+    if action == "synchronize-sources":
+        synchronize_sources(environment, args)
+        return
+    if action == "restore-sources":
+        restore_sources(environment, args)
+        return
+    fail("unsupported action")
+
+
+if __name__ == "__main__":
+    main()
