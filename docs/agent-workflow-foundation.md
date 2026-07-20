@@ -38,6 +38,18 @@ Worker migration `0004_agent_worker_leases` also adds a temporary `blocked`
 state. A blocked card retains the open-card slot and records when and where its
 run should resume.
 
+Migration `0005_agent_repository_scope` adds `agent.cards.repository_scope`.
+Existing cards are backfilled to `backend`, preserving their historical
+behavior. New cards start at `auto`; a successful planning run resolves that
+scope to exactly one of:
+
+- `backend`
+- `android`
+- `backend_and_android`
+
+The resolved scope is stored on the card, in planning run metadata, and in the
+planning success audit event.
+
 ## Card lifecycle
 
 The intended successful path is:
@@ -63,6 +75,13 @@ plan revision; review feedback remains inside that authorized implementation
 phase. Deployment approval is recorded against the final revision presented
 for release.
 
+During the bootstrap dual-repository milestone, implementation and deployment
+approval remain backend-only. Cards scoped to `android` or
+`backend_and_android` can be planned and discussed, but approval returns a
+state conflict until component-specific implementation worktrees and Android
+validation are installed. Cards that still have `repository_scope = 'auto'`
+cannot enter implementation.
+
 Within one open card, a future worker may resume the same Codex thread. Once a
 deployed card is completed or closed, a new change starts as a new card and a
 fresh Codex thread against the then-current repository.
@@ -84,6 +103,10 @@ The first client message may include a `client_message_id` UUID. Follow-up
 messages may also include one; the database rejects a duplicate within the same
 card so an Android retry cannot silently enqueue the same work twice.
 
+Card creation still requires only title and description. The server assigns
+`repository_scope = 'auto'`, and list/detail responses include the current
+scope.
+
 ## Migration and rollback
 
 Migration `0003_agent_workflow_foundation` creates the schema. Apply and test it
@@ -102,3 +125,8 @@ The worker increment will claim queued runs with a lease, invoke Codex with
 phase-appropriate filesystem permissions, append agent responses, and advance
 card/run state. Build, signing, migration, service restart, validation, and
 rollback remain RemiHub-owned deployment operations behind explicit approval.
+
+The next Android increment should add component-specific implementation
+worktrees and independent Android validation. Until then, Android planning has
+visibility only; it has no build, signing, publication, or deployment
+authority.

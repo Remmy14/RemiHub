@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 
 
 logger = logging.getLogger("remihub.agent_worker")
@@ -51,6 +51,7 @@ class ClaimedRun:
     worker_id: str
     title: str
     description: str
+    repository_scope: RepositoryScope = RepositoryScope.AUTO
     base_branch: str = "main"
     feature_branch: str | None = None
     worktree_path: str | None = None
@@ -63,6 +64,7 @@ class ClaimedRun:
 class ExecutionResult:
     message: str
     card_status: CardStatus
+    repository_scope: RepositoryScope | None = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -127,6 +129,7 @@ class FakeAgentExecutor:
                     "read or modified."
                 ),
                 card_status=CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+                repository_scope=RepositoryScope.BACKEND,
                 metadata={"executor": "fake", "phase": claim.phase.value},
             )
 

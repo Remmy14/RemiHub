@@ -1,8 +1,9 @@
 # Codex planning executor
 
 The first real Codex integration is intentionally limited to planning. It can
-inspect a designated Git checkout and return a repository-informed plan. It
-cannot claim implementation or deployment runs.
+inspect either the legacy backend checkout or a dual-repository planning
+workspace and return a repository-informed plan. It cannot claim implementation
+or deployment runs.
 
 ## Thread lifecycle
 
@@ -16,14 +17,29 @@ Every thread start, resume, and turn explicitly uses:
 
 - `ApprovalMode.deny_all`;
 - `Sandbox.read_only`;
-- the designated repository as `cwd`;
+- the designated repository or common dual-repository workspace as `cwd`;
 - non-ephemeral storage under the worker's `CODEX_HOME`;
 - the restrictions in the repository `AGENTS.md`.
 
 The turn returns structured output containing Markdown for the card and a
-Boolean readiness decision. A ready plan moves to
+Boolean readiness decision. It must also resolve `repository_scope` to one of
+`backend`, `android`, or `backend_and_android`; a successful planning run never
+leaves the card at `auto`. A ready plan moves to
 `awaiting_implementation_approval`; a plan with blocking questions moves to
 `awaiting_feedback`.
+
+In the dual-repository mode, the planning workspace contains two labeled child
+Git checkouts:
+
+```text
+<planning workspace>/backend
+<planning workspace>/android
+```
+
+The planner prompt names these labels and requires explicit API/model/client
+coordination analysis before scope selection. Planning remains read-only and
+network-denied; it cannot build, sign, publish, migrate, restart, deploy, or
+access secrets.
 
 Successful run metadata records the SDK's per-turn and cumulative-thread token
 usage when available: input, cached-input, output, reasoning-output, and total
@@ -69,6 +85,21 @@ REMIHUB_AGENT_EXECUTOR=codex-planning
 REMIHUB_AGENT_REPOSITORY=/absolute/path/to/readable/clean/checkout
 ```
 
+That legacy setting remains supported for the code-first rollout window and is
+treated as a single backend planning checkout.
+
+Dual-repository planning is selected with:
+
+```text
+REMIHUB_AGENT_PLANNING_WORKSPACE=/absolute/path/to/planning-workspace
+REMIHUB_AGENT_BACKEND_REPOSITORY=/absolute/path/to/planning-workspace/backend
+REMIHUB_AGENT_ANDROID_REPOSITORY=/absolute/path/to/planning-workspace/android
+```
+
+The labeled child paths must be absolute, existing Git checkouts. The worker
+does not create the workspace or modify systemd configuration from application
+startup; those are protected operator installation steps.
+
 Optional settings:
 
 | Setting | Default | Purpose |
@@ -83,8 +114,8 @@ Optional settings:
 ## Failure behavior
 
 - Usage limits, overload, and retry-limit errors block the card temporarily.
-- Authentication, invalid output, missing repository, and configuration errors
-  fail closed and produce a system message.
+- Authentication, invalid output, unresolved `repository_scope`, missing
+  repository, and configuration errors fail closed and produce a system message.
 - A conflicting saved thread ID fails closed.
 - If the lease is lost, a stale process cannot attach a thread, complete a run,
   or overwrite the reclaimed worker's result.

@@ -23,7 +23,7 @@ from backend.core.agent_deployment import (
     RuntimeHealth,
     ValidationEvidence,
 )
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -37,6 +37,7 @@ def claimed_run(
     *,
     phase: RunPhase = RunPhase.PLANNING,
     attempt_count: int = 1,
+    repository_scope: RepositoryScope | None = None,
 ) -> ClaimedRun:
     active_status = {
         RunPhase.PLANNING: CardStatus.PLANNING,
@@ -54,6 +55,15 @@ def claimed_run(
         worker_id="qa-worker",
         title="Medication tracking",
         description="Plan a medication tracking module.",
+        repository_scope=(
+            repository_scope
+            if repository_scope is not None
+            else (
+                RepositoryScope.AUTO
+                if phase is RunPhase.PLANNING
+                else RepositoryScope.BACKEND
+            )
+        ),
         messages=(),
     )
 
@@ -793,6 +803,23 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         with self.assertRaises(AgentTemporarilyBlockedError) as raised:
             executor.execute(claim)
         self.assertEqual(raised.exception.retry_after_seconds, 90)
+
+    def test_executor_rejects_non_backend_repository_scope(self):
+        claim = self._prepare_deployment(
+            {"backend/example.py": "VALUE = 2\n"}
+        )
+        executor = GitBackendDeploymentExecutor(
+            deployment_manager=self._manager(),
+            retry_after_seconds=90,
+        )
+
+        with self.assertRaisesRegex(ValueError, "backend-scoped"):
+            executor.execute(
+                replace(
+                    claim,
+                    repository_scope=RepositoryScope.BACKEND_AND_ANDROID,
+                )
+            )
 
     def test_production_requires_production_target_branch(self):
         claim = self._prepare_deployment(

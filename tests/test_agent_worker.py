@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from backend.agent_worker import AgentWorkerSettings, build_executor
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import (
     AgentLeaseLostError,
     AgentTemporarilyBlockedError,
@@ -31,6 +31,7 @@ def claimed_run(
     *,
     phase: RunPhase = RunPhase.PLANNING,
     attempt_count: int = 1,
+    repository_scope: RepositoryScope | None = None,
 ) -> ClaimedRun:
     active_status = {
         RunPhase.PLANNING: CardStatus.PLANNING,
@@ -48,6 +49,15 @@ def claimed_run(
         worker_id="qa-worker",
         title="Medication tracking",
         description="Plan a medication tracking module.",
+        repository_scope=(
+            repository_scope
+            if repository_scope is not None
+            else (
+                RepositoryScope.AUTO
+                if phase is RunPhase.PLANNING
+                else RepositoryScope.BACKEND
+            )
+        ),
         messages=(),
     )
 
@@ -261,6 +271,11 @@ class FakeAgentExecutorTests(unittest.TestCase):
             CardStatus.COMPLETED,
         )
 
+    def test_fake_planning_resolves_backend_scope(self):
+        result = FakeAgentExecutor().execute(claimed_run())
+
+        self.assertEqual(result.repository_scope, RepositoryScope.BACKEND)
+
 
 class AgentWorkerSettingsTests(unittest.TestCase):
     def test_worker_is_disabled_by_default(self):
@@ -303,6 +318,66 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             "restricted to QA",
         ):
             build_executor(settings)
+
+    @patch("backend.agent_worker.CodexPlanningExecutor")
+    def test_planning_executor_supports_legacy_backend_repository(
+        self,
+        planning_executor,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-planning",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/backend-planning",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        queue = MagicMock()
+        result = build_executor(settings, queue=queue)
+
+        self.assertEqual(result, planning_executor.return_value)
+        planning_executor.assert_called_once_with(
+            repository_path="/srv/agent/backend-planning",
+            planning_workspace_path=None,
+            backend_repository_path=None,
+            android_repository_path=None,
+            thread_store=queue,
+            model=None,
+            retry_after_seconds=900,
+        )
+
+    @patch("backend.agent_worker.CodexPlanningExecutor")
+    def test_planning_executor_uses_dual_repository_workspace(
+        self,
+        planning_executor,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-planning",
+                "REMIHUB_AGENT_PLANNING_WORKSPACE": "/srv/agent/planning",
+                "REMIHUB_AGENT_BACKEND_REPOSITORY": "/srv/agent/planning/backend",
+                "REMIHUB_AGENT_ANDROID_REPOSITORY": "/srv/agent/planning/android",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        queue = MagicMock()
+        result = build_executor(settings, queue=queue)
+
+        self.assertEqual(result, planning_executor.return_value)
+        planning_executor.assert_called_once_with(
+            repository_path=None,
+            planning_workspace_path="/srv/agent/planning",
+            backend_repository_path="/srv/agent/planning/backend",
+            android_repository_path="/srv/agent/planning/android",
+            thread_store=queue,
+            model=None,
+            retry_after_seconds=900,
+        )
 
     @patch("backend.agent_worker.CodexImplementationExecutor")
     @patch("backend.agent_worker.GitImplementationWorkspaceManager")

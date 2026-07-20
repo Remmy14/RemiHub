@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import (
+    CardStatus,
+    RunPhase,
+    require_backend_repository_scope,
+)
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -253,6 +257,10 @@ class CodexImplementationExecutor:
             raise AgentWorkerConfigurationError(
                 "The Codex implementation executor cannot run planning or deployment"
             )
+        require_backend_repository_scope(
+            claim.repository_scope,
+            action="Implementation",
+        )
         if not claim.codex_thread_id:
             raise AgentWorkerConfigurationError(
                 "Implementation requires the persistent planning Codex thread"

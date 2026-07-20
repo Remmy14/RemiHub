@@ -6,11 +6,14 @@ from backend.core.agent_state import (
     CardStatus,
     InvalidCardTransitionError,
     InvalidRunCompletionError,
+    RepositoryScope,
     RunPhase,
     active_card_status_for_phase,
+    require_backend_repository_scope,
     follow_up_target,
     queued_card_status_for_phase,
     require_card_transition,
+    require_resolved_repository_scope,
     require_run_completion_status,
 )
 
@@ -110,6 +113,33 @@ class AgentCardStateTests(unittest.TestCase):
                 CardStatus.CLOSED,
             },
         )
+
+    def test_repository_scope_must_be_resolved_before_implementation(self):
+        self.assertEqual(
+            require_resolved_repository_scope("android"),
+            RepositoryScope.ANDROID,
+        )
+
+        with self.assertRaisesRegex(InvalidCardTransitionError, "resolved"):
+            require_resolved_repository_scope("auto")
+
+    def test_backend_scope_gate_rejects_android_work_for_this_milestone(self):
+        self.assertEqual(
+            require_backend_repository_scope(
+                "backend",
+                action="Implementation approval",
+            ),
+            RepositoryScope.BACKEND,
+        )
+
+        with self.assertRaisesRegex(
+            InvalidCardTransitionError,
+            "Android implementation validation is not installed yet",
+        ):
+            require_backend_repository_scope(
+                "backend_and_android",
+                action="Implementation approval",
+            )
 
 
 if __name__ == "__main__":

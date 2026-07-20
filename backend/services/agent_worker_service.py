@@ -5,11 +5,14 @@ from uuid import uuid4
 
 from backend.core.agent_state import (
     CardStatus,
+    RepositoryScope,
     RunPhase,
     RunStatus,
     active_card_status_for_phase,
+    coerce_repository_scope,
     queued_card_status_for_phase,
     require_card_transition,
+    require_resolved_repository_scope,
     require_run_completion_status,
 )
 from backend.core.agent_worker import (
@@ -116,6 +119,7 @@ def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
         worker_id=row["worker_id"],
         title=row["title"],
         description=row["description"],
+        repository_scope=coerce_repository_scope(row["repository_scope"]),
         base_branch=row["base_branch"],
         feature_branch=row["feature_branch"],
         worktree_path=row["worktree_path"],
@@ -197,6 +201,7 @@ def claim_next_run(
                        runs.worker_id AS previous_worker_id,
                        runs.lease_expires_at AS previous_lease_expires_at,
                        cards.status AS card_status,
+                       cards.repository_scope,
                        cards.resume_status,
                        cards.title,
                        cards.description,
@@ -375,7 +380,8 @@ def _lock_owned_run(cur, claim: ClaimedRun, *, statuses: tuple[str, ...]) -> dic
                runs.card_id,
                runs.phase,
                runs.status AS run_status,
-               cards.status AS card_status
+               cards.status AS card_status,
+               cards.repository_scope
         FROM agent.runs AS runs
         JOIN agent.cards AS cards
           ON cards.id = runs.card_id
@@ -630,7 +636,24 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         claim.phase,
         result.card_status,
     )
-    metadata = json.dumps(result.metadata or {}, sort_keys=True)
+    metadata_payload = dict(result.metadata or {})
+    completed_scope: RepositoryScope | None = None
+    if claim.phase is RunPhase.PLANNING:
+        if result.repository_scope is None:
+            raise AgentQueueStateError(
+                "Planning completion requires a resolved repository scope"
+            )
+        try:
+            completed_scope = require_resolved_repository_scope(
+                result.repository_scope
+            )
+        except ValueError as exc:
+            raise AgentQueueStateError(
+                "Planning completion requires a resolved repository scope"
+            ) from exc
+        metadata_payload["repository_scope"] = completed_scope.value
+
+    metadata = json.dumps(metadata_payload, sort_keys=True)
 
     conn = get_db_conn()
     try:
@@ -669,30 +692,41 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                     claim.id,
                 ),
             )
+            card_assignments = [
+                "status = %s",
+                "resume_status = NULL",
+                "blocked_reason = NULL",
+                "blocked_until = NULL",
+            ]
+            card_values: list[object] = [target_status.value]
+            if completed_scope is not None:
+                card_assignments.append("repository_scope = %s")
+                card_values.append(completed_scope.value)
+            card_values.append(claim.card_id)
             cur.execute(
-                """
+                f"""
                 UPDATE agent.cards
-                SET status = %s,
-                    resume_status = NULL,
-                    blocked_reason = NULL,
-                    blocked_until = NULL
+                SET {', '.join(card_assignments)}
                 WHERE id = %s
                 """,
-                (target_status.value, claim.card_id),
+                tuple(card_values),
             )
+            event_payload = {
+                "attempt_count": claim.attempt_count,
+                "result_message_id": message_id,
+                "run_id": claim.id,
+                "to_card_status": target_status.value,
+                "worker_id": claim.worker_id,
+            }
+            if completed_scope is not None:
+                event_payload["repository_scope"] = completed_scope.value
             _insert_event(
                 cur,
                 card_id=claim.card_id,
                 event_type="run.succeeded",
                 actor_type="worker",
                 actor_user_id=None,
-                payload={
-                    "attempt_count": claim.attempt_count,
-                    "result_message_id": message_id,
-                    "run_id": claim.id,
-                    "to_card_status": target_status.value,
-                    "worker_id": claim.worker_id,
-                },
+                payload=event_payload,
             )
         conn.commit()
     except Exception:

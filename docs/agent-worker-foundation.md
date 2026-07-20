@@ -7,8 +7,10 @@ work is executing.
 
 The queue and lease boundary is shared by fake QA execution, the planning-only
 Codex executor, and the separately operated implementation-only Codex executor.
-The implementation executor may create an isolated worktree, but no executor
-builds a release, restarts RemiHub, or deploys.
+The planning executor may inspect a dual-repository workspace containing
+`backend/` and `android/` child checkouts. The implementation executor may
+create an isolated backend worktree, but no executor builds an Android release,
+signs or publishes artifacts, restarts RemiHub, or deploys.
 
 ## Lease and recovery model
 
@@ -26,6 +28,7 @@ The worker records:
 - next available time;
 - temporary blocking reason;
 - result message and structured metadata.
+- resolved repository scope for successful planning runs.
 
 Claiming uses `FOR UPDATE ... SKIP LOCKED`, so two worker processes cannot claim
 the same row. PostgreSQL's existing unique active-run index remains a second
@@ -59,6 +62,13 @@ migration can grant it access. The worker receives only:
 
 It cannot create or delete cards, approvals, runs, users, notifications, or any
 other RemiHub data. It receives no access to unrelated public-schema tables.
+Migration `0005_agent_repository_scope` adds the durable scope column but does
+not grant worker privileges. The protected phase-2 control-plane installer must
+grant `UPDATE (repository_scope)` on `agent.cards` to both
+`remihub_agent_worker` and `remihub_qa_agent_worker` before restarting the new
+planning and implementation workers. That keeps application migrations within
+the automatic deployment SQL policy while still limiting the worker to the one
+extra card column it needs.
 
 At startup, the process verifies the exact PostgreSQL database, session role,
 and current role for its configured environment. A QA worker therefore refuses
@@ -113,6 +123,13 @@ database claim query, so a planning-only executor cannot claim implementation
 or deployment work. A retry after a temporary `blocked` state does not consume
 another maximum-attempt slot; the user may leave the card blocked or cancel it.
 
+Implementation approval is permitted only for cards with
+`repository_scope = 'backend'` in this bootstrap milestone. Cards scoped to
+`auto`, `android`, or `backend_and_android` are rejected with a normal state
+conflict before an implementation run is queued. Deployment approval remains
+backend-only for the same reason: Android implementation validation and
+publication are not installed yet.
+
 ## Successful fake planning probe
 
 A QA card begins as `planning_queued`. Running the worker once should produce:
@@ -123,7 +140,8 @@ run:  queued -> claimed -> running -> succeeded
 ```
 
 The result contains one agent message, claim/start/success audit events, an
-attempt count of one, and no remaining lease token or expiration.
+attempt count of one, a resolved repository scope, and no remaining lease token
+or expiration.
 
 ## Rollback
 

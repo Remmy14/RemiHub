@@ -8,9 +8,12 @@ from psycopg2 import errors
 from backend.core.agent_state import (
     CardStatus,
     InvalidCardTransitionError,
+    RepositoryScope,
     RunPhase,
     RunStatus,
+    coerce_repository_scope,
     follow_up_target,
+    require_backend_repository_scope,
     require_card_transition,
 )
 
@@ -20,6 +23,7 @@ CARD_COLUMNS = """
     title,
     description,
     status,
+    repository_scope,
     revision,
     base_branch,
     feature_branch,
@@ -134,6 +138,13 @@ def _unique_violation_error(exc: errors.UniqueViolation) -> AgentConflictError:
 def _require_transition(current: str, target: CardStatus) -> None:
     try:
         require_card_transition(current, target)
+    except InvalidCardTransitionError as exc:
+        raise AgentStateConflictError(str(exc)) from exc
+
+
+def _require_backend_scope(card: dict, *, action: str) -> None:
+    try:
+        require_backend_repository_scope(card["repository_scope"], action=action)
     except InvalidCardTransitionError as exc:
         raise AgentStateConflictError(str(exc)) from exc
 
@@ -543,6 +554,7 @@ def create_card(
                 actor_type="user",
                 actor_user_id=created_by,
                 payload={
+                    "repository_scope": RepositoryScope.AUTO.value,
                     "run_id": run_id,
                     "status": CardStatus.PLANNING_QUEUED.value,
                 },
@@ -673,6 +685,7 @@ def approve_implementation(
         with conn.cursor() as cur:
             card = _locked_card(cur, card_id)
             _require_transition(card["status"], target_status)
+            _require_backend_scope(card, action="Implementation approval")
             approval_id = _insert_approval(
                 cur,
                 card_id=card_id,
@@ -701,6 +714,9 @@ def approve_implementation(
                 actor_user_id=approved_by,
                 payload={
                     "approval_id": approval_id,
+                    "repository_scope": coerce_repository_scope(
+                        card["repository_scope"]
+                    ).value,
                     "revision": card["revision"],
                     "run_id": run_id,
                     "to_status": target_status.value,
@@ -734,6 +750,7 @@ def approve_deployment(
         with conn.cursor() as cur:
             card = _locked_card(cur, card_id)
             _require_transition(card["status"], target_status)
+            _require_backend_scope(card, action="Deployment approval")
             implementation_result = _deployment_implementation_result(
                 cur,
                 card_id=card_id,
@@ -768,6 +785,9 @@ def approve_deployment(
                 payload={
                     "approval_id": approval_id,
                     "implementation_run_id": implementation_result["id"],
+                    "repository_scope": coerce_repository_scope(
+                        card["repository_scope"]
+                    ).value,
                     "revision": card["revision"],
                     "run_id": run_id,
                     "to_status": target_status.value,

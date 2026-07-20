@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -151,6 +151,12 @@ class CodexImplementationExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentWorkerConfigurationError, "persistent"):
             self.executor(RecordingGateway()).execute(
                 replace(self.claim, codex_thread_id=None)
+            )
+
+    def test_unresolved_repository_scope_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "resolved"):
+            self.executor(RecordingGateway()).execute(
+                replace(self.claim, repository_scope=RepositoryScope.AUTO)
             )
 
     def test_non_implementation_phase_is_rejected(self):

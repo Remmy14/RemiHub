@@ -16,7 +16,11 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol, Sequence
 
 from backend.config import load_config
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import (
+    CardStatus,
+    RunPhase,
+    require_backend_repository_scope,
+)
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -2232,6 +2236,10 @@ class GitBackendDeploymentExecutor:
         self.retry_after_seconds = retry_after_seconds
 
     def execute(self, claim: ClaimedRun) -> ExecutionResult:
+        require_backend_repository_scope(
+            claim.repository_scope,
+            action="Deployment",
+        )
         try:
             candidate = self.deployment_manager.deploy(claim)
         except DeploymentRolledBackError as exc:

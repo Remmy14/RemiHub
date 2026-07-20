@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -27,6 +27,7 @@ class RecordingGateway:
         self.response = response or {
             "response_markdown": "## Plan\n\n1. Add the module.",
             "ready_for_implementation": True,
+            "repository_scope": "backend",
         }
         self.error = error
         self.calls = []
@@ -92,6 +93,8 @@ class CodexPlanningExecutorTests(unittest.TestCase):
         )
         self.assertIn("Add the module", result.message)
         self.assertEqual(result.metadata["sandbox"], "read-only")
+        self.assertEqual(result.metadata["repository_scope"], "backend")
+        self.assertEqual(result.repository_scope, RepositoryScope.BACKEND)
         self.assertEqual(result.metadata["thread_id"], "thr_new")
         self.assertEqual(
             result.metadata["usage"]["last"]["total_tokens"],
@@ -108,6 +111,7 @@ class CodexPlanningExecutorTests(unittest.TestCase):
             response={
                 "response_markdown": "I still need one answer.",
                 "ready_for_implementation": False,
+                "repository_scope": "backend_and_android",
             }
         )
         claim = claimed_run()
@@ -126,6 +130,10 @@ class CodexPlanningExecutorTests(unittest.TestCase):
         result = self.executor(gateway).execute(claim)
 
         self.assertEqual(result.card_status, CardStatus.AWAITING_FEEDBACK)
+        self.assertEqual(
+            result.repository_scope,
+            RepositoryScope.BACKEND_AND_ANDROID,
+        )
         self.assertEqual(
             gateway.calls[0]["existing_thread_id"],
             "thr_existing",
@@ -158,6 +166,59 @@ class CodexPlanningExecutorTests(unittest.TestCase):
             frozenset({RunPhase.PLANNING}),
         )
 
+    def test_dual_repository_workspace_is_used_as_cwd(self):
+        workspace = self.repository / "workspace"
+        backend = workspace / "backend"
+        android = workspace / "android"
+        backend.mkdir(parents=True)
+        android.mkdir()
+        (backend / ".git").write_text("gitdir: /tmp/backend\n")
+        (android / ".git").write_text("gitdir: /tmp/android\n")
+        gateway = RecordingGateway(response={
+            "response_markdown": "Android client-only plan.",
+            "ready_for_implementation": True,
+            "repository_scope": "android",
+        })
+        executor = CodexPlanningExecutor(
+            planning_workspace_path=workspace,
+            backend_repository_path=backend,
+            android_repository_path=android,
+            thread_store=self.thread_store,
+            gateway=gateway,
+        )
+
+        result = executor.execute(claimed_run())
+
+        self.assertEqual(gateway.calls[0]["repository_path"], workspace.resolve())
+        self.assertIn("backend/", gateway.calls[0]["prompt"])
+        self.assertIn("android/", gateway.calls[0]["prompt"])
+        self.assertEqual(result.repository_scope, RepositoryScope.ANDROID)
+        self.assertEqual(
+            result.metadata["planning_workspace"]["mode"],
+            "dual-repository",
+        )
+
+    def test_labeled_repositories_must_be_workspace_children(self):
+        workspace = self.repository / "workspace"
+        backend = self.repository / "backend"
+        android = workspace / "android"
+        for path in (workspace, backend, android):
+            path.mkdir(parents=True, exist_ok=True)
+        (backend / ".git").write_text("gitdir: /tmp/backend\n")
+        (android / ".git").write_text("gitdir: /tmp/android\n")
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "backend child",
+        ):
+            CodexPlanningExecutor(
+                planning_workspace_path=workspace,
+                backend_repository_path=backend,
+                android_repository_path=android,
+                thread_store=self.thread_store,
+                gateway=RecordingGateway(),
+            )
+
 
 class PlanningResponseTests(unittest.TestCase):
     def test_invalid_json_fails_closed(self):
@@ -167,7 +228,33 @@ class PlanningResponseTests(unittest.TestCase):
     def test_schema_requires_readiness_decision(self):
         with self.assertRaisesRegex(RuntimeError, "ready_for_implementation"):
             _parse_planning_response(
-                json.dumps({"response_markdown": "A plan"})
+                json.dumps(
+                    {
+                        "response_markdown": "A plan",
+                        "repository_scope": "backend",
+                    }
+                )
+            )
+
+    def test_schema_requires_resolved_repository_scope(self):
+        with self.assertRaisesRegex(RuntimeError, "repository_scope"):
+            _parse_planning_response(
+                json.dumps(
+                    {
+                        "response_markdown": "A plan",
+                        "ready_for_implementation": True,
+                    }
+                )
+            )
+        with self.assertRaisesRegex(RuntimeError, "repository_scope"):
+            _parse_planning_response(
+                json.dumps(
+                    {
+                        "response_markdown": "A plan",
+                        "ready_for_implementation": True,
+                        "repository_scope": "auto",
+                    }
+                )
             )
 
 
@@ -187,6 +274,7 @@ class OpenAICodexGatewayTests(unittest.TestCase):
                 {
                     "response_markdown": "Plan ready",
                     "ready_for_implementation": True,
+                    "repository_scope": "backend",
                 }
             )
             duration_ms = 50

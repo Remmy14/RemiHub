@@ -65,6 +65,9 @@ class AgentWorkerSettings:
     run_once: bool
     allow_fake_executor: bool
     repository_path: str | None
+    planning_workspace_path: str | None
+    backend_repository_path: str | None
+    android_repository_path: str | None
     worktree_root: str | None
     artifact_root: str | None
     deployment_target_repository: str | None
@@ -139,6 +142,9 @@ class AgentWorkerSettings:
             )
 
         repository_path = os.environ.get("REMIHUB_AGENT_REPOSITORY")
+        planning_workspace_path = os.environ.get("REMIHUB_AGENT_PLANNING_WORKSPACE")
+        backend_repository_path = os.environ.get("REMIHUB_AGENT_BACKEND_REPOSITORY")
+        android_repository_path = os.environ.get("REMIHUB_AGENT_ANDROID_REPOSITORY")
         worktree_root = os.environ.get("REMIHUB_AGENT_WORKTREE_ROOT")
         artifact_root = os.environ.get("REMIHUB_AGENT_ARTIFACT_ROOT")
         deployment_target_repository = os.environ.get(
@@ -201,6 +207,21 @@ class AgentWorkerSettings:
             repository_path=(
                 repository_path.strip()
                 if repository_path and repository_path.strip()
+                else None
+            ),
+            planning_workspace_path=(
+                planning_workspace_path.strip()
+                if planning_workspace_path and planning_workspace_path.strip()
+                else None
+            ),
+            backend_repository_path=(
+                backend_repository_path.strip()
+                if backend_repository_path and backend_repository_path.strip()
+                else None
+            ),
+            android_repository_path=(
+                android_repository_path.strip()
+                if android_repository_path and android_repository_path.strip()
                 else None
             ),
             worktree_root=(
@@ -324,12 +345,19 @@ def build_executor(
             raise AgentWorkerConfigurationError(
                 "The codex planning executor requires an agent queue"
             )
-        if settings.repository_path is None:
+        if (
+            settings.repository_path is None
+            and settings.planning_workspace_path is None
+        ):
             raise AgentWorkerConfigurationError(
-                "REMIHUB_AGENT_REPOSITORY is required for codex-planning"
+                "REMIHUB_AGENT_REPOSITORY or REMIHUB_AGENT_PLANNING_WORKSPACE "
+                "is required for codex-planning"
             )
         return CodexPlanningExecutor(
             repository_path=settings.repository_path,
+            planning_workspace_path=settings.planning_workspace_path,
+            backend_repository_path=settings.backend_repository_path,
+            android_repository_path=settings.android_repository_path,
             thread_store=queue,
             model=settings.codex_model,
             retry_after_seconds=settings.codex_retry_seconds,

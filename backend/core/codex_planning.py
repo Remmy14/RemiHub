@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from backend.core.agent_state import CardStatus, RunPhase
+from backend.core.agent_state import (
+    CardStatus,
+    RepositoryScope,
+    RunPhase,
+    require_resolved_repository_scope,
+)
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
     AgentWorkerConfigurationError,
@@ -31,24 +36,50 @@ PLANNING_OUTPUT_SCHEMA = {
                 "to approve implementation."
             ),
         },
+        "repository_scope": {
+            "type": "string",
+            "enum": ["backend", "android", "backend_and_android"],
+            "description": (
+                "The resolved repository scope for the card. Never return auto."
+            ),
+        },
     },
-    "required": ["response_markdown", "ready_for_implementation"],
+    "required": [
+        "response_markdown",
+        "ready_for_implementation",
+        "repository_scope",
+    ],
 }
 
 
 PLANNING_DEVELOPER_INSTRUCTIONS = """
 You are the planning agent for RemiHub. Work only in the planning phase.
-Inspect the current repository before proposing changes. Do not create, edit,
+Inspect the current repository before proposing changes. In dual-repository
+planning workspaces, inspect the `backend/` checkout and the `android/`
+checkout when needed to classify and coordinate the work. Do not create, edit,
 delete, rename, or format files. Do not run commands that change repository,
 database, service, package, network, or operating-system state. Never access
 production secrets or deployment credentials. RemiHub owns builds, migrations,
-service restarts, signing, releases, and deployment.
+service restarts, signing, publication, releases, and deployment.
 
 Produce a concrete, repository-informed plan with affected components, data or
-API changes, validation, rollback considerations, and any questions that truly
-block implementation. Set ready_for_implementation to false when user input is
-still required; otherwise set it to true. Follow the repository's AGENTS.md.
+API changes, model/client coordination, validation, rollback considerations,
+and any questions that truly block implementation. Set ready_for_implementation
+to false when user input is still required; otherwise set it to true. Set
+repository_scope to exactly one of backend, android, or backend_and_android.
+Follow the relevant repository AGENTS.md files.
 """.strip()
+
+
+@dataclass(frozen=True)
+class PlanningRepositoryPaths:
+    cwd: Path
+    backend: Path
+    android: Path | None = None
+
+    @property
+    def dual_repository(self) -> bool:
+        return self.android is not None
 
 
 class CodexThreadStore(Protocol):
@@ -168,30 +199,25 @@ class CodexPlanningExecutor:
     def __init__(
         self,
         *,
-        repository_path: str | Path,
+        repository_path: str | Path | None = None,
+        planning_workspace_path: str | Path | None = None,
+        backend_repository_path: str | Path | None = None,
+        android_repository_path: str | Path | None = None,
         thread_store: CodexThreadStore,
         model: str | None = None,
         retry_after_seconds: int = 900,
         gateway: CodexPlanningGateway | None = None,
     ):
-        configured_repository = Path(repository_path).expanduser()
-        if not configured_repository.is_absolute():
-            raise AgentWorkerConfigurationError(
-                "REMIHUB_AGENT_REPOSITORY must be an absolute path"
-            )
-        resolved_repository = configured_repository.resolve()
-        if not resolved_repository.is_dir():
-            raise AgentWorkerConfigurationError(
-                f"Agent repository does not exist: {resolved_repository}"
-            )
-        if not (resolved_repository / ".git").exists():
-            raise AgentWorkerConfigurationError(
-                f"Agent repository is not a Git checkout: {resolved_repository}"
-            )
         if retry_after_seconds < 1:
             raise ValueError("retry_after_seconds must be at least 1")
 
-        self.repository_path = resolved_repository
+        self.repository_paths = _resolve_planning_paths(
+            repository_path=repository_path,
+            planning_workspace_path=planning_workspace_path,
+            backend_repository_path=backend_repository_path,
+            android_repository_path=android_repository_path,
+        )
+        self.repository_path = self.repository_paths.cwd
         self.thread_store = thread_store
         self.model = model.strip() if model and model.strip() else None
         self.retry_after_seconds = retry_after_seconds
@@ -206,7 +232,7 @@ class CodexPlanningExecutor:
         try:
             turn = self.gateway.run_turn(
                 existing_thread_id=claim.codex_thread_id,
-                repository_path=self.repository_path,
+                repository_path=self.repository_paths.cwd,
                 prompt=_planning_prompt(claim),
                 model=self.model,
                 on_thread_created=lambda thread_id: (
@@ -222,26 +248,44 @@ class CodexPlanningExecutor:
                 retry_after_seconds=self.retry_after_seconds,
             ) from exc
 
-        response, ready = _parse_planning_response(turn.final_response)
+        response, ready, repository_scope = _parse_planning_response(
+            turn.final_response
+        )
         target_status = (
             CardStatus.AWAITING_IMPLEMENTATION_APPROVAL
             if ready
             else CardStatus.AWAITING_FEEDBACK
         )
+        metadata = {
+            "duration_ms": turn.duration_ms,
+            "executor": "codex_planning",
+            "model": self.model,
+            "phase": claim.phase.value,
+            "repository_scope": repository_scope.value,
+            "sandbox": "read-only",
+            "sdk_version": turn.sdk_version,
+            "thread_id": turn.thread_id,
+            "turn_id": turn.turn_id,
+            "usage": turn.usage,
+        }
+        if self.repository_paths.dual_repository:
+            metadata["planning_workspace"] = {
+                "android_repository": str(self.repository_paths.android),
+                "backend_repository": str(self.repository_paths.backend),
+                "cwd": str(self.repository_paths.cwd),
+                "mode": "dual-repository",
+            }
+        else:
+            metadata["planning_workspace"] = {
+                "backend_repository": str(self.repository_paths.backend),
+                "cwd": str(self.repository_paths.cwd),
+                "mode": "single-backend",
+            }
         return ExecutionResult(
             message=response,
             card_status=target_status,
-            metadata={
-                "duration_ms": turn.duration_ms,
-                "executor": "codex_planning",
-                "model": self.model,
-                "phase": claim.phase.value,
-                "sandbox": "read-only",
-                "sdk_version": turn.sdk_version,
-                "thread_id": turn.thread_id,
-                "turn_id": turn.turn_id,
-                "usage": turn.usage,
-            },
+            repository_scope=repository_scope,
+            metadata=metadata,
         )
 
 
@@ -270,13 +314,17 @@ def _planning_prompt(claim: ClaimedRun) -> str:
 Current user message:
 {request}
 
-Inspect the repository as needed, but remain read-only. Respond using the
-required structured planning schema. This is card revision
-{claim.card_revision} and run {claim.id}.
+Inspect the repository or repositories as needed, but remain read-only. If a
+dual-repository planning workspace is configured, the backend checkout is
+labeled `backend/` and the Android checkout is labeled `android/`. Explicitly
+evaluate backend API/model changes, Android client changes, and coordination
+between them before choosing repository_scope. Respond using the required
+structured planning schema. This is card revision {claim.card_revision} and
+run {claim.id}.
 """.strip()
 
 
-def _parse_planning_response(value: str) -> tuple[str, bool]:
+def _parse_planning_response(value: str) -> tuple[str, bool, RepositoryScope]:
     payload_text = value.strip()
     if payload_text.startswith("```json") and payload_text.endswith("```"):
         payload_text = payload_text[7:-3].strip()
@@ -289,16 +337,115 @@ def _parse_planning_response(value: str) -> tuple[str, bool]:
         raise RuntimeError("Codex planning output must be a JSON object")
     response = payload.get("response_markdown")
     ready = payload.get("ready_for_implementation")
+    repository_scope_value = payload.get("repository_scope")
     if not isinstance(response, str) or not response.strip():
         raise RuntimeError("Codex planning output is missing response_markdown")
     if not isinstance(ready, bool):
         raise RuntimeError(
             "Codex planning output is missing ready_for_implementation"
         )
+    if not isinstance(repository_scope_value, str):
+        raise RuntimeError("Codex planning output is missing repository_scope")
+    try:
+        repository_scope = require_resolved_repository_scope(
+            repository_scope_value
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "Codex planning output has invalid repository_scope"
+        ) from exc
     normalized_response = response.strip()
     if len(normalized_response) > 20000:
         raise RuntimeError("Codex planning response exceeds 20000 characters")
-    return normalized_response, ready
+    return normalized_response, ready, repository_scope
+
+
+def _resolve_planning_paths(
+    *,
+    repository_path: str | Path | None,
+    planning_workspace_path: str | Path | None,
+    backend_repository_path: str | Path | None,
+    android_repository_path: str | Path | None,
+) -> PlanningRepositoryPaths:
+    if planning_workspace_path is None:
+        if backend_repository_path is not None or android_repository_path is not None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_PLANNING_WORKSPACE is required when labeled "
+                "planning repositories are configured"
+            )
+        if repository_path is None:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_REPOSITORY is required for codex-planning"
+            )
+        resolved_repository = _required_git_checkout(
+            repository_path,
+            field="REMIHUB_AGENT_REPOSITORY",
+        )
+        return PlanningRepositoryPaths(
+            cwd=resolved_repository,
+            backend=resolved_repository,
+        )
+
+    if repository_path is not None:
+        raise AgentWorkerConfigurationError(
+            "Configure either REMIHUB_AGENT_REPOSITORY or "
+            "REMIHUB_AGENT_PLANNING_WORKSPACE, not both"
+        )
+    if backend_repository_path is None:
+        raise AgentWorkerConfigurationError(
+            "REMIHUB_AGENT_BACKEND_REPOSITORY is required for dual-repository "
+            "planning"
+        )
+    if android_repository_path is None:
+        raise AgentWorkerConfigurationError(
+            "REMIHUB_AGENT_ANDROID_REPOSITORY is required for dual-repository "
+            "planning"
+        )
+
+    workspace = _required_directory(
+        planning_workspace_path,
+        field="REMIHUB_AGENT_PLANNING_WORKSPACE",
+    )
+    backend = _required_git_checkout(
+        backend_repository_path,
+        field="REMIHUB_AGENT_BACKEND_REPOSITORY",
+    )
+    android = _required_git_checkout(
+        android_repository_path,
+        field="REMIHUB_AGENT_ANDROID_REPOSITORY",
+    )
+    if backend != (workspace / "backend").resolve():
+        raise AgentWorkerConfigurationError(
+            "REMIHUB_AGENT_BACKEND_REPOSITORY must be the backend child of "
+            "REMIHUB_AGENT_PLANNING_WORKSPACE"
+        )
+    if android != (workspace / "android").resolve():
+        raise AgentWorkerConfigurationError(
+            "REMIHUB_AGENT_ANDROID_REPOSITORY must be the android child of "
+            "REMIHUB_AGENT_PLANNING_WORKSPACE"
+        )
+    return PlanningRepositoryPaths(cwd=workspace, backend=backend, android=android)
+
+
+def _required_directory(value: str | Path, *, field: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise AgentWorkerConfigurationError(f"{field} must be an absolute path")
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise AgentWorkerConfigurationError(
+            f"{field} does not exist: {resolved}"
+        )
+    return resolved
+
+
+def _required_git_checkout(value: str | Path, *, field: str) -> Path:
+    resolved = _required_directory(value, field=field)
+    if not (resolved / ".git").exists():
+        raise AgentWorkerConfigurationError(
+            f"{field} is not a Git checkout: {resolved}"
+        )
+    return resolved
 
 
 def _is_temporary_sdk_error(sdk, exc: Exception) -> bool:

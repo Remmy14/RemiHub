@@ -36,6 +36,13 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class RepositoryScope(str, Enum):
+    AUTO = "auto"
+    BACKEND = "backend"
+    ANDROID = "android"
+    BACKEND_AND_ANDROID = "backend_and_android"
+
+
 class InvalidCardTransitionError(ValueError):
     pass
 
@@ -49,6 +56,14 @@ TERMINAL_CARD_STATUSES = frozenset(
         CardStatus.COMPLETED,
         CardStatus.CANCELLED,
         CardStatus.CLOSED,
+    }
+)
+
+RESOLVED_REPOSITORY_SCOPES = frozenset(
+    {
+        RepositoryScope.BACKEND,
+        RepositoryScope.ANDROID,
+        RepositoryScope.BACKEND_AND_ANDROID,
     }
 )
 
@@ -193,6 +208,43 @@ def coerce_card_status(value: CardStatus | str) -> CardStatus:
         return CardStatus(value)
     except ValueError as exc:
         raise InvalidCardTransitionError(f"Unknown card status: {value!r}") from exc
+
+
+def coerce_repository_scope(value: RepositoryScope | str) -> RepositoryScope:
+    if isinstance(value, RepositoryScope):
+        return value
+
+    try:
+        return RepositoryScope(value)
+    except ValueError as exc:
+        raise InvalidCardTransitionError(
+            f"Unknown repository scope: {value!r}"
+        ) from exc
+
+
+def require_resolved_repository_scope(
+    value: RepositoryScope | str,
+) -> RepositoryScope:
+    scope = coerce_repository_scope(value)
+    if scope not in RESOLVED_REPOSITORY_SCOPES:
+        raise InvalidCardTransitionError(
+            "Repository scope must be resolved before this workflow step"
+        )
+    return scope
+
+
+def require_backend_repository_scope(
+    value: RepositoryScope | str,
+    *,
+    action: str,
+) -> RepositoryScope:
+    scope = require_resolved_repository_scope(value)
+    if scope is not RepositoryScope.BACKEND:
+        raise InvalidCardTransitionError(
+            f"{action} is currently available only for backend-scoped cards; "
+            "Android implementation validation is not installed yet"
+        )
+    return scope
 
 
 def require_card_transition(

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from backend.core.agent_deployment import GitBackendDeploymentManager
 from backend.database.migration_runner import (
     MIGRATIONS_DIR,
     _acquire_lock,
@@ -24,6 +25,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0002", "remove_uv_alert_prototype"),
                 ("0003", "agent_workflow_foundation"),
                 ("0004", "agent_worker_leases"),
+                ("0005", "agent_repository_scope"),
             ],
         )
 
@@ -47,6 +49,20 @@ class MigrationDiscoveryTests(unittest.TestCase):
         self.assertIn("agent_runs_lease_state_check", migration)
         self.assertIn("agent_cards_blocked_state_check", migration)
         self.assertIn("WHERE status IN ('queued', 'blocked')", migration)
+
+    def test_repository_scope_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0005_agent_repository_scope.up.sql"
+        down = MIGRATIONS_DIR / "0005_agent_repository_scope.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
 
     def test_discovers_up_and_down_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:

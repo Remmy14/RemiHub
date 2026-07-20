@@ -1,10 +1,11 @@
 # Codex implementation executor
 
-The implementation executor is the second Codex boundary. It can claim only
-`implementation` runs after an explicit implementation approval or a review
-follow-up. It resumes the card's existing planning thread, writes only in a
-card-specific worktree, and stops at `review_ready`. It cannot claim planning
-or deployment work.
+The implementation executor is the second Codex boundary. In the
+dual-repository planning bootstrap milestone it remains backend-only. It can
+claim only `implementation` runs after an explicit implementation approval or a
+review follow-up for a backend-scoped card. It resumes the card's existing
+planning thread, writes only in a card-specific backend worktree, and stops at
+`review_ready`. It cannot claim planning or deployment work.
 
 ## Approval and thread boundary
 
@@ -12,9 +13,13 @@ Implementation requires both:
 
 - a durable implementation run already queued by RemiHub's approval workflow;
 - the persistent `codex_thread_id` created during planning.
+- `repository_scope = 'backend'`.
 
 A missing thread fails closed. The executor does not infer approval from a
 successful planning run and cannot queue its own implementation work.
+Android and combined cards remain at the approval boundary until
+component-specific implementation worktrees and independent Android validation
+are installed.
 
 Every resumed thread and turn explicitly uses:
 
