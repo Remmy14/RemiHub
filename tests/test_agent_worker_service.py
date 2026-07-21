@@ -118,6 +118,33 @@ class AgentClaimCandidateTests(unittest.TestCase):
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
+
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_claim_query_can_filter_repository_scope(
+        self,
+        get_db_conn,
+        put_db_conn,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        get_db_conn.return_value = connection
+
+        result = claim_next_run(
+            worker_id="android-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.IMPLEMENTATION}),
+            allowed_repository_scopes=frozenset({RepositoryScope.ANDROID}),
+        )
+
+        self.assertIsNone(result)
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("cards.repository_scope = ANY(%s)", sql)
+        self.assertEqual(parameters, (["implementation"], ["android"]))
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
     def test_claim_rejects_empty_phase_capability(self):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             claim_next_run(

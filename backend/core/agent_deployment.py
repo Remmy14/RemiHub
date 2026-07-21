@@ -18,6 +18,7 @@ from typing import Protocol, Sequence
 from backend.config import load_config
 from backend.core.agent_state import (
     CardStatus,
+    RepositoryScope,
     RunPhase,
     require_backend_repository_scope,
 )
@@ -2223,6 +2224,7 @@ class GitBackendDeploymentManager:
 
 class GitBackendDeploymentExecutor:
     allowed_phases = frozenset({RunPhase.DEPLOYMENT})
+    allowed_repository_scopes = frozenset({RepositoryScope.BACKEND})
 
     def __init__(
         self,

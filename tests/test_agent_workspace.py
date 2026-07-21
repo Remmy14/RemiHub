@@ -58,6 +58,17 @@ class GitImplementationWorkspaceManagerTests(unittest.TestCase):
         )
         self.claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
 
+    def test_base_branch_override_validates_after_source_repository_initialization(self):
+        manager = GitImplementationWorkspaceManager(
+            source_repository=self.source,
+            worktree_root=self.worktrees,
+            artifact_root=self.artifacts,
+            base_branch_override="main",
+        )
+
+        self.assertEqual(manager.source_repository, self.source.resolve())
+        self.assertEqual(manager.base_branch_override, "main")
+
     def test_creates_deterministic_workspace_and_persists_metadata(self):
         persisted = []
 

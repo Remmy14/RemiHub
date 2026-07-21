@@ -93,6 +93,19 @@ class RecordingGateway:
         self.interrupted = True
 
 
+class RecordingValidator:
+    def __init__(self):
+        self.calls = []
+
+    def validate(self, *, claim, workspace):
+        self.calls.append((claim, workspace))
+        return {
+            "success": True,
+            "validator": "trusted_android_offline_gradle",
+            "release_apk": {"signed": False},
+        }
+
+
 class CodexImplementationExecutorTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -136,6 +149,45 @@ class CodexImplementationExecutorTests(unittest.TestCase):
             gateway.calls[0]["repository_path"],
             self.manager.workspace.path,
         )
+
+
+    def test_android_scope_uses_trusted_validator(self):
+        gateway = RecordingGateway()
+        validator = RecordingValidator()
+        claim = replace(
+            self.claim,
+            repository_scope=RepositoryScope.ANDROID,
+        )
+        executor = CodexImplementationExecutor(
+            workspace_manager=self.manager,
+            workspace_store=self.store,
+            model="gpt-test",
+            retry_after_seconds=600,
+            gateway=gateway,
+            repository_scope=RepositoryScope.ANDROID,
+            validator=validator,
+        )
+
+        result = executor.execute(claim)
+
+        self.assertEqual(
+            result.metadata["repository_scope"],
+            RepositoryScope.ANDROID.value,
+        )
+        self.assertFalse(
+            result.metadata["trusted_validation"]["release_apk"]["signed"]
+        )
+        self.assertEqual(len(validator.calls), 1)
+
+    def test_android_executor_rejects_backend_claim(self):
+        executor = CodexImplementationExecutor(
+            workspace_manager=self.manager,
+            workspace_store=self.store,
+            gateway=RecordingGateway(),
+            repository_scope=RepositoryScope.ANDROID,
+        )
+        with self.assertRaisesRegex(ValueError, "requires repository_scope=android"):
+            executor.execute(self.claim)
 
     def test_temporary_codex_failure_blocks_for_retry(self):
         gateway = RecordingGateway(

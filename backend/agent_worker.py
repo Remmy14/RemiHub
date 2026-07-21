@@ -20,8 +20,12 @@ from backend.core.agent_worker import (
     FakeAgentExecutor,
 )
 from backend.core.agent_workspace import GitImplementationWorkspaceManager
-from backend.core.codex_implementation import CodexImplementationExecutor
+from backend.core.codex_implementation import (
+    CodexImplementationExecutor,
+    CommandImplementationValidator,
+)
 from backend.core.codex_planning import CodexPlanningExecutor
+from backend.core.agent_state import RepositoryScope
 from backend.services.agent_worker_service import DatabaseAgentQueue
 
 
@@ -70,6 +74,10 @@ class AgentWorkerSettings:
     android_repository_path: str | None
     worktree_root: str | None
     artifact_root: str | None
+    repository_scope: str | None
+    base_branch_override: str | None
+    implementation_validator: str | None
+    implementation_validation_timeout_seconds: int
     deployment_target_repository: str | None
     deployment_worktree_root: str | None
     deployment_artifact_root: str | None
@@ -147,6 +155,13 @@ class AgentWorkerSettings:
         android_repository_path = os.environ.get("REMIHUB_AGENT_ANDROID_REPOSITORY")
         worktree_root = os.environ.get("REMIHUB_AGENT_WORKTREE_ROOT")
         artifact_root = os.environ.get("REMIHUB_AGENT_ARTIFACT_ROOT")
+        repository_scope = os.environ.get("REMIHUB_AGENT_REPOSITORY_SCOPE")
+        base_branch_override = os.environ.get(
+            "REMIHUB_AGENT_BASE_BRANCH_OVERRIDE"
+        )
+        implementation_validator = os.environ.get(
+            "REMIHUB_AGENT_IMPLEMENTATION_VALIDATOR"
+        )
         deployment_target_repository = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY"
         )
@@ -233,6 +248,25 @@ class AgentWorkerSettings:
                 artifact_root.strip()
                 if artifact_root and artifact_root.strip()
                 else None
+            ),
+            repository_scope=(
+                repository_scope.strip().lower()
+                if repository_scope and repository_scope.strip()
+                else None
+            ),
+            base_branch_override=(
+                base_branch_override.strip()
+                if base_branch_override and base_branch_override.strip()
+                else None
+            ),
+            implementation_validator=(
+                implementation_validator.strip()
+                if implementation_validator and implementation_validator.strip()
+                else None
+            ),
+            implementation_validation_timeout_seconds=_positive_int(
+                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATION_TIMEOUT_SECONDS",
+                1200,
             ),
             deployment_target_repository=(
                 deployment_target_repository.strip()
@@ -388,19 +422,61 @@ def build_executor(
                 "configure the approved outer sandbox wrapper"
             )
 
+        configured_scope = settings.repository_scope or RepositoryScope.BACKEND.value
+        try:
+            implementation_scope = RepositoryScope(configured_scope)
+        except ValueError as exc:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_REPOSITORY_SCOPE must be backend or android "
+                "for codex-implementation"
+            ) from exc
+        if implementation_scope not in {
+            RepositoryScope.BACKEND,
+            RepositoryScope.ANDROID,
+        }:
+            raise AgentWorkerConfigurationError(
+                "codex-implementation supports only backend or android scope"
+            )
+        workspace_arguments = {
+            "source_repository": settings.repository_path,
+            "worktree_root": settings.worktree_root,
+            "artifact_root": settings.artifact_root,
+            "command_timeout_seconds": settings.git_timeout_seconds,
+        }
+        if settings.base_branch_override is not None:
+            workspace_arguments["base_branch_override"] = (
+                settings.base_branch_override
+            )
         workspace_manager = GitImplementationWorkspaceManager(
-            source_repository=settings.repository_path,
-            worktree_root=settings.worktree_root,
-            artifact_root=settings.artifact_root,
-            command_timeout_seconds=settings.git_timeout_seconds,
+            **workspace_arguments
         )
-        return CodexImplementationExecutor(
-            workspace_manager=workspace_manager,
-            workspace_store=queue,
-            codex_bin=settings.codex_bin,
-            model=settings.codex_model,
-            retry_after_seconds=settings.codex_retry_seconds,
+        validator = (
+            CommandImplementationValidator(
+                command=settings.implementation_validator,
+                timeout_seconds=(
+                    settings.implementation_validation_timeout_seconds
+                ),
+            )
+            if settings.implementation_validator is not None
+            else None
         )
+        if implementation_scope is RepositoryScope.ANDROID and validator is None:
+            raise AgentWorkerConfigurationError(
+                "Android implementation requires "
+                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATOR"
+            )
+        executor_arguments = {
+            "workspace_manager": workspace_manager,
+            "workspace_store": queue,
+            "codex_bin": settings.codex_bin,
+            "model": settings.codex_model,
+            "retry_after_seconds": settings.codex_retry_seconds,
+        }
+        if implementation_scope is not RepositoryScope.BACKEND:
+            executor_arguments["repository_scope"] = implementation_scope
+        if validator is not None:
+            executor_arguments["validator"] = validator
+        return CodexImplementationExecutor(**executor_arguments)
 
     if settings.executor_name in {"git-backend-deployment", "git-deployment-qa"}:
         if settings.executor_name == "git-deployment-qa" and settings.environment != "qa":

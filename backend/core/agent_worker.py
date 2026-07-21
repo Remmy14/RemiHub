@@ -72,6 +72,9 @@ class AgentExecutor(Protocol):
     @property
     def allowed_phases(self) -> frozenset[RunPhase]: ...
 
+    @property
+    def allowed_repository_scopes(self) -> frozenset[RepositoryScope]: ...
+
     def execute(self, claim: ClaimedRun) -> ExecutionResult: ...
 
 
@@ -82,6 +85,7 @@ class AgentQueue(Protocol):
         worker_id: str,
         lease_seconds: int,
         allowed_phases: frozenset[RunPhase],
+        allowed_repository_scopes: frozenset[RepositoryScope],
     ) -> ClaimedRun | None: ...
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None: ...
@@ -120,6 +124,7 @@ class FakeAgentExecutor:
     """Deterministic executor for QA queue validation only."""
 
     allowed_phases = frozenset(RunPhase)
+    allowed_repository_scopes = frozenset(RepositoryScope)
 
     def execute(self, claim: ClaimedRun) -> ExecutionResult:
         if claim.phase is RunPhase.PLANNING:
@@ -183,11 +188,25 @@ class AgentWorker:
         self.max_attempts = max_attempts
 
     def process_once(self) -> bool:
-        claim = self.queue.claim_next_run(
-            worker_id=self.worker_id,
-            lease_seconds=self.lease_seconds,
-            allowed_phases=self.executor.allowed_phases,
+        class_scopes = getattr(
+            type(self.executor),
+            "allowed_repository_scopes",
+            None,
         )
+        if class_scopes is None:
+            claim = self.queue.claim_next_run(
+                worker_id=self.worker_id,
+                lease_seconds=self.lease_seconds,
+                allowed_phases=self.executor.allowed_phases,
+            )
+        else:
+            claim = self.queue.claim_next_run(
+                worker_id=self.worker_id,
+                lease_seconds=self.lease_seconds,
+                allowed_phases=self.executor.allowed_phases,
+                allowed_repository_scopes=self.executor.allowed_repository_scopes,
+            )
+
 
         if claim is None:
             return False

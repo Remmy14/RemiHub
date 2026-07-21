@@ -168,6 +168,7 @@ def claim_next_run(
     worker_id: str,
     lease_seconds: int,
     allowed_phases: frozenset[RunPhase],
+    allowed_repository_scopes: frozenset[RepositoryScope] = frozenset(RepositoryScope),
 ) -> ClaimedRun | None:
     normalized_worker_id = worker_id.strip()
     if not normalized_worker_id:
@@ -186,12 +187,31 @@ def claim_next_run(
     )
     if not normalized_phases:
         raise ValueError("allowed_phases must not be empty")
+    normalized_scopes = sorted(
+        {
+            scope.value
+            if isinstance(scope, RepositoryScope)
+            else RepositoryScope(scope).value
+            for scope in allowed_repository_scopes
+        }
+    )
+    if not normalized_scopes:
+        raise ValueError("allowed_repository_scopes must not be empty")
+    all_scopes = sorted(scope.value for scope in RepositoryScope)
+    scope_predicate = (
+        ""
+        if normalized_scopes == all_scopes
+        else "AND cards.repository_scope = ANY(%s)"
+    )
+    query_parameters: list[object] = [normalized_phases]
+    if scope_predicate:
+        query_parameters.append(normalized_scopes)
 
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT runs.id,
                        runs.card_id,
                        runs.phase,
@@ -239,6 +259,7 @@ def claim_next_run(
                 ) AS implementation_run
                   ON runs.phase = 'deployment'
                 WHERE runs.phase = ANY(%s)
+                  {scope_predicate}
                   AND (
                     (
                         runs.status = 'queued'
@@ -263,7 +284,7 @@ def claim_next_run(
                 FOR UPDATE OF runs, cards SKIP LOCKED
                 LIMIT 1
                 """,
-                (normalized_phases,),
+                tuple(query_parameters),
             )
             row = _row_to_dict(cur, cur.fetchone())
 
@@ -899,11 +920,13 @@ class DatabaseAgentQueue:
         worker_id: str,
         lease_seconds: int,
         allowed_phases: frozenset[RunPhase],
+        allowed_repository_scopes: frozenset[RepositoryScope] = frozenset(RepositoryScope),
     ) -> ClaimedRun | None:
         return claim_next_run(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             allowed_phases=allowed_phases,
+            allowed_repository_scopes=allowed_repository_scopes,
         )
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None:

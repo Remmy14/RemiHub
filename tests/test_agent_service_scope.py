@@ -29,6 +29,42 @@ class AgentServiceRepositoryScopeTests(unittest.TestCase):
     @patch("backend.services.agent_service._locked_card")
     @patch("backend.services.agent_service.put_db_conn")
     @patch("backend.services.agent_service.get_db_conn")
+    def test_android_implementation_approval_is_allowed(
+        self,
+        get_db_conn,
+        put_db_conn,
+        locked_card,
+        insert_approval,
+        insert_run,
+        insert_event,
+        card_detail,
+    ):
+        connection = MagicMock()
+        get_db_conn.return_value = connection
+        locked_card.return_value = card("android")
+        insert_approval.return_value = "approval-id"
+        insert_run.return_value = "run-id"
+        card_detail.return_value = {"repository_scope": "android"}
+
+        result = approve_implementation(
+            card_id=card("android")["id"],
+            approved_by="user-id",
+        )
+
+        self.assertEqual(result["repository_scope"], "android")
+        insert_approval.assert_called_once()
+        insert_run.assert_called_once()
+        insert_event.assert_called_once()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_service._card_detail")
+    @patch("backend.services.agent_service._insert_event")
+    @patch("backend.services.agent_service._insert_run")
+    @patch("backend.services.agent_service._insert_approval")
+    @patch("backend.services.agent_service._locked_card")
+    @patch("backend.services.agent_service.put_db_conn")
+    @patch("backend.services.agent_service.get_db_conn")
     def test_backend_implementation_approval_remains_allowed(
         self,
         get_db_conn,
@@ -72,7 +108,7 @@ class AgentServiceRepositoryScopeTests(unittest.TestCase):
         connection = MagicMock()
         get_db_conn.return_value = connection
 
-        for scope in ("auto", "android", "backend_and_android"):
+        for scope in ("auto", "backend_and_android"):
             with self.subTest(scope=scope):
                 locked_card.return_value = card(scope)
                 with self.assertRaises(AgentStateConflictError):
@@ -82,7 +118,7 @@ class AgentServiceRepositoryScopeTests(unittest.TestCase):
                     )
 
         insert_approval.assert_not_called()
-        self.assertEqual(connection.rollback.call_count, 3)
+        self.assertEqual(connection.rollback.call_count, 2)
         put_db_conn.assert_called()
 
     @patch("backend.services.agent_service._deployment_implementation_result")

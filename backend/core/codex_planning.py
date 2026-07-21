@@ -195,6 +195,7 @@ class OpenAICodexPlanningGateway:
 
 class CodexPlanningExecutor:
     allowed_phases = frozenset({RunPhase.PLANNING})
+    allowed_repository_scopes = frozenset(RepositoryScope)
 
     def __init__(
         self,

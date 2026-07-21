@@ -14,6 +14,7 @@ from backend.core.agent_state import (
     coerce_repository_scope,
     follow_up_target,
     require_backend_repository_scope,
+    require_implementation_repository_scope,
     require_card_transition,
 )
 
@@ -145,6 +146,16 @@ def _require_transition(current: str, target: CardStatus) -> None:
 def _require_backend_scope(card: dict, *, action: str) -> None:
     try:
         require_backend_repository_scope(card["repository_scope"], action=action)
+    except InvalidCardTransitionError as exc:
+        raise AgentStateConflictError(str(exc)) from exc
+
+
+def _require_implementation_scope(card: dict, *, action: str) -> None:
+    try:
+        require_implementation_repository_scope(
+            card["repository_scope"],
+            action=action,
+        )
     except InvalidCardTransitionError as exc:
         raise AgentStateConflictError(str(exc)) from exc
 
@@ -685,7 +696,10 @@ def approve_implementation(
         with conn.cursor() as cur:
             card = _locked_card(cur, card_id)
             _require_transition(card["status"], target_status)
-            _require_backend_scope(card, action="Implementation approval")
+            _require_implementation_scope(
+                card,
+                action="Implementation approval",
+            )
             approval_id = _insert_approval(
                 cur,
                 card_id=card_id,

@@ -53,6 +53,7 @@ class GitImplementationWorkspaceManager:
         artifact_root: str | Path,
         git_binary: str = "git",
         command_timeout_seconds: int = 120,
+        base_branch_override: str | None = None,
     ):
         self.git_binary = git_binary.strip()
         if not self.git_binary:
@@ -64,6 +65,11 @@ class GitImplementationWorkspaceManager:
         self.source_repository = self._existing_absolute_directory(
             source_repository,
             field="REMIHUB_AGENT_REPOSITORY",
+        )
+        self.base_branch_override = (
+            self._validate_branch_name(base_branch_override, field="base branch override")
+            if base_branch_override is not None
+            else None
         )
         self.worktree_root = self._existing_absolute_directory(
             worktree_root,
@@ -171,7 +177,7 @@ class GitImplementationWorkspaceManager:
         expected_branch = self._expected_feature_branch(claim.card_id)
         expected_path = self.worktree_root / f"card-{claim.card_id}"
         base_branch = self._validate_branch_name(
-            claim.base_branch or "main",
+            self.base_branch_override or claim.base_branch or "main",
             field="base branch",
         )
 

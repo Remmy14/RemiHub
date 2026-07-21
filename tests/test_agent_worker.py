@@ -418,6 +418,84 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             retry_after_seconds=900,
         )
 
+
+    @patch("backend.agent_worker.CodexImplementationExecutor")
+    @patch("backend.agent_worker.CommandImplementationValidator")
+    @patch("backend.agent_worker.GitImplementationWorkspaceManager")
+    def test_android_implementation_executor_uses_scope_and_validator(
+        self,
+        workspace_manager,
+        implementation_validator,
+        implementation_executor,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/android.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/android-worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/android-artifacts",
+                "REMIHUB_AGENT_REPOSITORY_SCOPE": "android",
+                "REMIHUB_AGENT_BASE_BRANCH_OVERRIDE": "master",
+                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATOR": (
+                    "/srv/agent/bin/android-validator"
+                ),
+                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATION_TIMEOUT_SECONDS": (
+                    "1800"
+                ),
+                "REMIHUB_CODEX_BIN": "/srv/agent/bin/android-codex-sandbox",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        queue = MagicMock()
+        result = build_executor(settings, queue=queue)
+
+        self.assertEqual(result, implementation_executor.return_value)
+        workspace_manager.assert_called_once_with(
+            source_repository="/srv/agent/android.git",
+            worktree_root="/srv/agent/android-worktrees",
+            artifact_root="/srv/agent/android-artifacts",
+            command_timeout_seconds=120,
+            base_branch_override="master",
+        )
+        implementation_validator.assert_called_once_with(
+            command="/srv/agent/bin/android-validator",
+            timeout_seconds=1800,
+        )
+        implementation_executor.assert_called_once_with(
+            workspace_manager=workspace_manager.return_value,
+            workspace_store=queue,
+            codex_bin="/srv/agent/bin/android-codex-sandbox",
+            model=None,
+            retry_after_seconds=900,
+            repository_scope=RepositoryScope.ANDROID,
+            validator=implementation_validator.return_value,
+        )
+
+    def test_android_implementation_requires_trusted_validator(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/android.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/android-worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/android-artifacts",
+                "REMIHUB_AGENT_REPOSITORY_SCOPE": "android",
+                "REMIHUB_CODEX_BIN": "/srv/agent/bin/android-codex-sandbox",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        with patch("backend.agent_worker.GitImplementationWorkspaceManager"):
+            with self.assertRaisesRegex(
+                AgentWorkerConfigurationError,
+                "Android implementation requires",
+            ):
+                build_executor(settings, queue=MagicMock())
+
     def test_implementation_executor_rejects_missing_artifact_root(self):
         with patch.dict(
             os.environ,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,8 +11,9 @@ from typing import Callable, Protocol
 
 from backend.core.agent_state import (
     CardStatus,
+    RepositoryScope,
     RunPhase,
-    require_backend_repository_scope,
+    require_exact_repository_scope,
 )
 from backend.core.agent_worker import (
     AgentTemporarilyBlockedError,
@@ -222,8 +224,72 @@ class OpenAICodexImplementationGateway:
         )
 
 
+class ImplementationValidator(Protocol):
+    def validate(
+        self,
+        *,
+        claim: ClaimedRun,
+        workspace: ImplementationWorkspace,
+    ) -> dict: ...
+
+
+class CommandImplementationValidator:
+    def __init__(self, *, command: str | Path, timeout_seconds: int = 1200):
+        configured = Path(command).expanduser()
+        if not configured.is_absolute():
+            raise AgentWorkerConfigurationError(
+                "Implementation validator must be an absolute path"
+            )
+        resolved = configured.resolve()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise AgentWorkerConfigurationError(
+                "Implementation validator must be an executable file"
+            )
+        if timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be at least 1")
+        self.command = resolved
+        self.timeout_seconds = timeout_seconds
+
+    def validate(
+        self,
+        *,
+        claim: ClaimedRun,
+        workspace: ImplementationWorkspace,
+    ) -> dict:
+        result = subprocess.run(
+            [
+                str(self.command),
+                str(workspace.path),
+                claim.card_id,
+                claim.id,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_seconds,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                "Trusted implementation validation failed"
+                + (f": {detail[-4000:]}" if detail else "")
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Trusted implementation validator returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise RuntimeError(
+                "Trusted implementation validator did not report success"
+            )
+        return payload
+
+
 class CodexImplementationExecutor:
     allowed_phases = frozenset({RunPhase.IMPLEMENTATION})
+    allowed_repository_scopes = frozenset({RepositoryScope.BACKEND})
 
     def __init__(
         self,
@@ -234,10 +300,15 @@ class CodexImplementationExecutor:
         model: str | None = None,
         retry_after_seconds: int = 900,
         gateway: CodexImplementationGateway | None = None,
+        repository_scope: RepositoryScope = RepositoryScope.BACKEND,
+        validator: ImplementationValidator | None = None,
     ):
         if retry_after_seconds < 1:
             raise ValueError("retry_after_seconds must be at least 1")
         self.workspace_manager = workspace_manager
+        self.repository_scope = repository_scope
+        self.allowed_repository_scopes = frozenset({repository_scope})
+        self.validator = validator
         self.workspace_store = workspace_store
         self.model = model.strip() if model and model.strip() else None
         self.retry_after_seconds = retry_after_seconds
@@ -257,8 +328,9 @@ class CodexImplementationExecutor:
             raise AgentWorkerConfigurationError(
                 "The Codex implementation executor cannot run planning or deployment"
             )
-        require_backend_repository_scope(
+        require_exact_repository_scope(
             claim.repository_scope,
+            expected=self.repository_scope,
             action="Implementation",
         )
         if not claim.codex_thread_id:
@@ -296,6 +368,11 @@ class CodexImplementationExecutor:
                 self._set_turn_control(claim.id, None)
 
             response, tests = _parse_implementation_response(turn.final_response)
+            trusted_validation = (
+                self.validator.validate(claim=claim, workspace=workspace)
+                if self.validator is not None
+                else None
+            )
             snapshot = self.workspace_manager.capture_snapshot(claim, workspace)
 
         return ExecutionResult(
@@ -313,6 +390,8 @@ class CodexImplementationExecutor:
                 "turn_id": turn.turn_id,
                 "usage": turn.usage,
                 "tests": tests,
+                "repository_scope": self.repository_scope.value,
+                "trusted_validation": trusted_validation,
                 "workspace": {
                     "artifact_patch": str(snapshot.patch_path),
                     "base_branch": workspace.base_branch,

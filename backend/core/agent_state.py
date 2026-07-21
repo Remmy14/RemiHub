@@ -233,6 +233,35 @@ def require_resolved_repository_scope(
     return scope
 
 
+
+def require_implementation_repository_scope(
+    value: RepositoryScope | str,
+    *,
+    action: str,
+) -> RepositoryScope:
+    scope = require_resolved_repository_scope(value)
+    if scope not in {RepositoryScope.BACKEND, RepositoryScope.ANDROID}:
+        raise InvalidCardTransitionError(
+            f"{action} is not available for combined backend-and-Android cards; "
+            "coordinated multi-repository implementation is not installed yet"
+        )
+    return scope
+
+
+def require_exact_repository_scope(
+    value: RepositoryScope | str,
+    *,
+    expected: RepositoryScope,
+    action: str,
+) -> RepositoryScope:
+    scope = require_resolved_repository_scope(value)
+    if scope is not expected:
+        raise InvalidCardTransitionError(
+            f"{action} requires repository_scope={expected.value}; "
+            f"received {scope.value}"
+        )
+    return scope
+
 def require_backend_repository_scope(
     value: RepositoryScope | str,
     *,
