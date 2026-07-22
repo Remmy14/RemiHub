@@ -10,6 +10,7 @@ from backend.core.agent_state import (
     RunPhase,
     active_card_status_for_phase,
     require_backend_repository_scope,
+    require_deployment_repository_scope,
     follow_up_target,
     queued_card_status_for_phase,
     require_card_transition,
@@ -123,22 +124,46 @@ class AgentCardStateTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidCardTransitionError, "resolved"):
             require_resolved_repository_scope("auto")
 
-    def test_backend_scope_gate_rejects_android_work_for_this_milestone(self):
+    def test_backend_scope_gate_remains_exact(self):
         self.assertEqual(
             require_backend_repository_scope(
                 "backend",
-                action="Implementation approval",
+                action="Backend deployment",
             ),
             RepositoryScope.BACKEND,
         )
 
         with self.assertRaisesRegex(
             InvalidCardTransitionError,
-            "Android implementation validation is not installed yet",
+            "requires repository_scope=backend",
         ):
             require_backend_repository_scope(
+                "android",
+                action="Backend deployment",
+            )
+
+    def test_deployment_scope_allows_backend_and_android_only(self):
+        self.assertEqual(
+            require_deployment_repository_scope(
+                "backend",
+                action="Deployment approval",
+            ),
+            RepositoryScope.BACKEND,
+        )
+        self.assertEqual(
+            require_deployment_repository_scope(
+                "android",
+                action="Deployment approval",
+            ),
+            RepositoryScope.ANDROID,
+        )
+        with self.assertRaisesRegex(
+            InvalidCardTransitionError,
+            "combined backend-and-Android",
+        ):
+            require_deployment_repository_scope(
                 "backend_and_android",
-                action="Implementation approval",
+                action="Deployment approval",
             )
 
 

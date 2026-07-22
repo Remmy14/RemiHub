@@ -121,11 +121,89 @@ class AgentServiceRepositoryScopeTests(unittest.TestCase):
         self.assertEqual(connection.rollback.call_count, 2)
         put_db_conn.assert_called()
 
+    @patch("backend.services.agent_service._card_detail")
+    @patch("backend.services.agent_service._insert_event")
+    @patch("backend.services.agent_service._insert_run")
+    @patch("backend.services.agent_service._insert_approval")
+    @patch("backend.services.agent_service._deployment_implementation_result")
+    @patch("backend.services.agent_service._require_android_deployment_ready")
+    @patch("backend.services.agent_service._locked_card")
+    @patch("backend.services.agent_service.put_db_conn")
+    @patch("backend.services.agent_service.get_db_conn")
+    def test_android_deployment_approval_is_allowed_when_signing_is_ready(
+        self,
+        get_db_conn,
+        put_db_conn,
+        locked_card,
+        require_ready,
+        deployment_result,
+        insert_approval,
+        insert_run,
+        insert_event,
+        card_detail,
+    ):
+        connection = MagicMock()
+        get_db_conn.return_value = connection
+        deployment_card = card("android")
+        deployment_card["status"] = "review_ready"
+        locked_card.return_value = deployment_card
+        deployment_result.return_value = {"id": "implementation-run"}
+        insert_approval.return_value = "approval-id"
+        insert_run.return_value = "deployment-run"
+        card_detail.return_value = {"repository_scope": "android"}
+
+        result = approve_deployment(
+            card_id=deployment_card["id"],
+            approved_by="user-id",
+        )
+
+        self.assertEqual(result["repository_scope"], "android")
+        require_ready.assert_called_once_with()
+        deployment_result.assert_called_once()
+        self.assertEqual(
+            deployment_result.call_args.kwargs["repository_scope"].value,
+            "android",
+        )
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_service._deployment_implementation_result")
+    @patch("backend.services.agent_service._require_android_deployment_ready")
+    @patch("backend.services.agent_service._locked_card")
+    @patch("backend.services.agent_service.put_db_conn")
+    @patch("backend.services.agent_service.get_db_conn")
+    def test_android_deployment_remains_fail_closed_without_signing(
+        self,
+        get_db_conn,
+        put_db_conn,
+        locked_card,
+        require_ready,
+        deployment_result,
+    ):
+        connection = MagicMock()
+        get_db_conn.return_value = connection
+        deployment_card = card("android")
+        deployment_card["status"] = "review_ready"
+        locked_card.return_value = deployment_card
+        require_ready.side_effect = AgentStateConflictError(
+            "Android deployment signing is not provisioned"
+        )
+
+        with self.assertRaisesRegex(AgentStateConflictError, "not provisioned"):
+            approve_deployment(
+                card_id=deployment_card["id"],
+                approved_by="user-id",
+            )
+
+        deployment_result.assert_not_called()
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
     @patch("backend.services.agent_service._deployment_implementation_result")
     @patch("backend.services.agent_service._locked_card")
     @patch("backend.services.agent_service.put_db_conn")
     @patch("backend.services.agent_service.get_db_conn")
-    def test_non_backend_deployment_scopes_are_rejected(
+    def test_combined_deployment_scope_is_rejected(
         self,
         get_db_conn,
         put_db_conn,
@@ -134,24 +212,22 @@ class AgentServiceRepositoryScopeTests(unittest.TestCase):
     ):
         connection = MagicMock()
         get_db_conn.return_value = connection
-        for scope in ("android", "backend_and_android"):
-            with self.subTest(scope=scope):
-                deployment_card = card(scope)
-                deployment_card["status"] = "review_ready"
-                locked_card.return_value = deployment_card
+        deployment_card = card("backend_and_android")
+        deployment_card["status"] = "review_ready"
+        locked_card.return_value = deployment_card
 
-                with self.assertRaisesRegex(
-                    AgentStateConflictError,
-                    "backend-scoped",
-                ):
-                    approve_deployment(
-                        card_id=deployment_card["id"],
-                        approved_by="user-id",
-                    )
+        with self.assertRaisesRegex(
+            AgentStateConflictError,
+            "combined backend-and-Android",
+        ):
+            approve_deployment(
+                card_id=deployment_card["id"],
+                approved_by="user-id",
+            )
 
         deployment_result.assert_not_called()
-        self.assertEqual(connection.rollback.call_count, 2)
-        self.assertEqual(put_db_conn.call_count, 2)
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
 
 
 if __name__ == "__main__":

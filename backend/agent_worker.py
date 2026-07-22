@@ -7,6 +7,12 @@ import socket
 import threading
 from dataclasses import dataclass
 
+from backend.core.android_deployment import (
+    CommandAndroidReleaseValidator,
+    GitAndroidDeploymentExecutor,
+    GitAndroidDeploymentManager,
+    PrivilegedAndroidReleaseRuntime,
+)
 from backend.core.agent_deployment import (
     GitBackendDeploymentExecutor,
     GitBackendDeploymentManager,
@@ -477,6 +483,59 @@ def build_executor(
         if validator is not None:
             executor_arguments["validator"] = validator
         return CodexImplementationExecutor(**executor_arguments)
+
+    if settings.executor_name == "git-android-deployment":
+        if settings.environment != "production":
+            raise AgentWorkerConfigurationError(
+                "git-android-deployment is restricted to production"
+            )
+        required_paths = {
+            "REMIHUB_AGENT_REPOSITORY": settings.repository_path,
+            "REMIHUB_AGENT_WORKTREE_ROOT": settings.worktree_root,
+            "REMIHUB_AGENT_ARTIFACT_ROOT": settings.artifact_root,
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": (
+                settings.deployment_target_repository
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": (
+                settings.deployment_worktree_root
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": (
+                settings.deployment_artifact_root
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": settings.deployment_validator,
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": (
+                settings.deployment_runtime_helper
+            ),
+        }
+        missing = [name for name, value in required_paths.items() if value is None]
+        if missing:
+            raise AgentWorkerConfigurationError(
+                f"{missing[0]} is required for git-android-deployment"
+            )
+        validator = CommandAndroidReleaseValidator(
+            validation_command=settings.deployment_validator,
+            timeout_seconds=settings.deployment_timeout_seconds,
+        )
+        runtime = PrivilegedAndroidReleaseRuntime(
+            helper_path=settings.deployment_runtime_helper,
+            command_timeout_seconds=settings.deployment_timeout_seconds,
+        )
+        deployment_manager = GitAndroidDeploymentManager(
+            source_repository=settings.repository_path,
+            source_worktree_root=settings.worktree_root,
+            source_artifact_root=settings.artifact_root,
+            target_repository=settings.deployment_target_repository,
+            candidate_worktree_root=settings.deployment_worktree_root,
+            deployment_artifact_root=settings.deployment_artifact_root,
+            target_branch=settings.deployment_target_branch,
+            validator=validator,
+            runtime=runtime,
+            command_timeout_seconds=settings.git_timeout_seconds,
+        )
+        return GitAndroidDeploymentExecutor(
+            deployment_manager=deployment_manager,
+            retry_after_seconds=settings.deployment_retry_seconds,
+        )
 
     if settings.executor_name in {"git-backend-deployment", "git-deployment-qa"}:
         if settings.executor_name == "git-deployment-qa" and settings.environment != "qa":

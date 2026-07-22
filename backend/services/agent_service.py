@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from psycopg2 import errors
@@ -14,8 +15,18 @@ from backend.core.agent_state import (
     coerce_repository_scope,
     follow_up_target,
     require_backend_repository_scope,
+    require_deployment_repository_scope,
     require_implementation_repository_scope,
     require_card_transition,
+)
+
+
+ANDROID_DEPLOYMENT_READINESS_PATH = Path(
+    "/var/lib/remihub-agent/phase3b/android-signing-ready.json"
+)
+EXPECTED_ANDROID_PACKAGE_NAME = "com.alex.remihub"
+EXPECTED_ANDROID_CERTIFICATE_SHA256 = (
+    "029cc5d06bd10e1d07a56834dd45326c9762f6263c5835244bcaf4a6a6a6e03d"
 )
 
 
@@ -148,6 +159,47 @@ def _require_backend_scope(card: dict, *, action: str) -> None:
         require_backend_repository_scope(card["repository_scope"], action=action)
     except InvalidCardTransitionError as exc:
         raise AgentStateConflictError(str(exc)) from exc
+
+
+def _require_deployment_scope(card: dict, *, action: str) -> RepositoryScope:
+    try:
+        return require_deployment_repository_scope(
+            card["repository_scope"],
+            action=action,
+        )
+    except InvalidCardTransitionError as exc:
+        raise AgentStateConflictError(str(exc)) from exc
+
+
+def _require_android_deployment_ready() -> None:
+    path = ANDROID_DEPLOYMENT_READINESS_PATH
+    if path.is_symlink() or not path.is_file():
+        raise AgentStateConflictError(
+            "Android deployment signing is not provisioned"
+        )
+    try:
+        path_stat = path.stat()
+        if path_stat.st_uid != 0 or path_stat.st_mode & 0o022:
+            raise AgentStateConflictError(
+                "Android deployment signing readiness permissions are unsafe"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except AgentStateConflictError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AgentStateConflictError(
+            "Android deployment signing readiness is invalid"
+        ) from exc
+    expected = {
+        "ready": True,
+        "package_name": EXPECTED_ANDROID_PACKAGE_NAME,
+        "certificate_sha256": EXPECTED_ANDROID_CERTIFICATE_SHA256,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise AgentStateConflictError(
+                f"Android deployment signing readiness has unexpected {field}"
+            )
 
 
 def _require_implementation_scope(card: dict, *, action: str) -> None:
@@ -288,6 +340,7 @@ def _deployment_implementation_result(
     *,
     card_id: str,
     card_revision: int,
+    repository_scope: RepositoryScope,
 ) -> dict:
     cur.execute(
         """
@@ -330,6 +383,36 @@ def _deployment_implementation_result(
         raise AgentStateConflictError(
             "Implementation review evidence is incomplete for deployment"
         )
+    if metadata.get("repository_scope") != repository_scope.value:
+        raise AgentStateConflictError(
+            "Implementation review evidence has the wrong repository scope"
+        )
+    if repository_scope is RepositoryScope.ANDROID:
+        trusted_validation = metadata.get("trusted_validation")
+        if not isinstance(trusted_validation, dict):
+            raise AgentStateConflictError(
+                "Android deployment requires trusted implementation validation"
+            )
+        required_validation = {
+            "success": True,
+            "gradle_offline": True,
+            "network": "denied",
+            "protected_build_files_unchanged": True,
+        }
+        for field, expected in required_validation.items():
+            if trusted_validation.get(field) != expected:
+                raise AgentStateConflictError(
+                    f"Android implementation validation has unexpected {field}"
+                )
+        release_apk = trusted_validation.get("release_apk")
+        if (
+            not isinstance(release_apk, dict)
+            or release_apk.get("signed") is not False
+            or release_apk.get("package_name") != EXPECTED_ANDROID_PACKAGE_NAME
+        ):
+            raise AgentStateConflictError(
+                "Android implementation validation release evidence is invalid"
+            )
     return result
 
 
@@ -764,11 +847,17 @@ def approve_deployment(
         with conn.cursor() as cur:
             card = _locked_card(cur, card_id)
             _require_transition(card["status"], target_status)
-            _require_backend_scope(card, action="Deployment approval")
+            repository_scope = _require_deployment_scope(
+                card,
+                action="Deployment approval",
+            )
+            if repository_scope is RepositoryScope.ANDROID:
+                _require_android_deployment_ready()
             implementation_result = _deployment_implementation_result(
                 cur,
                 card_id=card_id,
                 card_revision=card["revision"],
+                repository_scope=repository_scope,
             )
             approval_id = _insert_approval(
                 cur,
