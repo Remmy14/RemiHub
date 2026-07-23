@@ -110,9 +110,8 @@ class CommandAndroidReleaseValidator:
         claim: ClaimedRun,
         version: AndroidReleaseVersion,
     ) -> AndroidValidationEvidence:
-        result = subprocess.run(
+        return self._execute(
             [
-                str(self.validation_command),
                 str(candidate_worktree),
                 claim.card_id,
                 claim.id,
@@ -121,6 +120,48 @@ class CommandAndroidReleaseValidator:
                 str(version.version_minor),
                 str(version.version_patch),
             ],
+            version=version,
+            context="Trusted Android release validation",
+        )
+
+    def verify_existing(
+        self,
+        *,
+        candidate_worktree: Path,
+        claim: ClaimedRun,
+        version: AndroidReleaseVersion,
+        expected: dict,
+    ) -> AndroidValidationEvidence:
+        expected_evidence = self._evidence_from_mapping(expected, version=version)
+        observed = self._execute(
+            [
+                "--verify-existing",
+                str(candidate_worktree),
+                claim.card_id,
+                claim.id,
+                str(version.version_code),
+                str(version.version_major),
+                str(version.version_minor),
+                str(version.version_patch),
+            ],
+            version=version,
+            context="Trusted Android release artifact reuse verification",
+        )
+        if observed != expected_evidence:
+            raise AgentDeploymentError(
+                "Reused Android release validation evidence changed after rollback"
+            )
+        return observed
+
+    def _execute(
+        self,
+        arguments: list[str],
+        *,
+        version: AndroidReleaseVersion,
+        context: str,
+    ) -> AndroidValidationEvidence:
+        result = subprocess.run(
+            [str(self.validation_command), *arguments],
             check=False,
             capture_output=True,
             text=True,
@@ -131,16 +172,60 @@ class CommandAndroidReleaseValidator:
         if result.returncode != 0:
             tail = (result.stderr or result.stdout)[-4000:].strip()
             raise AgentDeploymentError(
-                "Trusted Android release validation failed"
-                + (f": {tail}" if tail else "")
+                context + " failed" + (f": {tail}" if tail else "")
             )
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise AgentDeploymentError(
-                "Trusted Android release validator returned invalid JSON"
+                f"{context} returned invalid JSON"
             ) from exc
-        if payload.get("success") is not True:
+        return self._evidence_from_payload(payload, version=version)
+
+    @classmethod
+    def _evidence_from_mapping(
+        cls,
+        value: dict,
+        *,
+        version: AndroidReleaseVersion,
+    ) -> AndroidValidationEvidence:
+        if not isinstance(value, dict):
+            raise AgentDeploymentError(
+                "Rolled-back Android deployment omitted reusable validation evidence"
+            )
+        raw = value.get("raw")
+        if not isinstance(raw, dict):
+            raise AgentDeploymentError(
+                "Rolled-back Android validation raw evidence is invalid"
+            )
+        evidence = cls._evidence_from_payload(raw, version=version)
+        expected = AndroidValidationEvidence(
+            manifest_path=_required_string(value, "manifest_path"),
+            unsigned_apk_path=_required_string(value, "unsigned_apk_path"),
+            unsigned_apk_sha256=_required_sha256(value, "unsigned_apk_sha256"),
+            unsigned_apk_size_bytes=_required_positive_int(
+                value,
+                "unsigned_apk_size_bytes",
+            ),
+            package_name=_required_string(value, "package_name"),
+            version_code=_required_positive_int(value, "version_code"),
+            version_name=_required_string(value, "version_name"),
+            gradle_log=_required_string(value, "gradle_log"),
+            raw=raw,
+        )
+        if evidence != expected:
+            raise AgentDeploymentError(
+                "Rolled-back Android validation evidence is internally inconsistent"
+            )
+        return expected
+
+    @staticmethod
+    def _evidence_from_payload(
+        payload: dict,
+        *,
+        version: AndroidReleaseVersion,
+    ) -> AndroidValidationEvidence:
+        if not isinstance(payload, dict) or payload.get("success") is not True:
             raise AgentDeploymentError(
                 "Trusted Android release validator did not report success"
             )
@@ -409,11 +494,14 @@ class GitAndroidDeploymentManager(GitBackendDeploymentManager):
                 attempt = self._begin_attempt(manifest, claim)
                 self._write_manifest(manifest_path, manifest)
                 try:
-                    validation = self.release_validator.validate(
+                    validation, validation_metadata = self._validation_for_attempt(
+                        manifest=manifest,
+                        current_attempt=attempt,
                         candidate_worktree=candidate_path,
                         claim=claim,
                         version=version,
                     )
+                    attempt.update(validation_metadata)
                     attempt["stage"] = "validated"
                     attempt["validation"] = asdict(validation)
                     self._write_manifest(manifest_path, manifest)
@@ -462,6 +550,67 @@ class GitAndroidDeploymentManager(GitBackendDeploymentManager):
                     raise
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+    def _validation_for_attempt(
+        self,
+        *,
+        manifest: dict,
+        current_attempt: dict,
+        candidate_worktree: Path,
+        claim: ClaimedRun,
+        version: AndroidReleaseVersion,
+    ) -> tuple[AndroidValidationEvidence, dict]:
+        reusable_attempt = self._latest_rolled_back_attempt(
+            manifest,
+            exclude=current_attempt,
+        )
+        if reusable_attempt is None:
+            validation = self.release_validator.validate(
+                candidate_worktree=candidate_worktree,
+                claim=claim,
+                version=version,
+            )
+            return validation, {"validation_mode": "built"}
+
+        prior_validation = reusable_attempt.get("validation")
+        if not isinstance(prior_validation, dict):
+            raise AgentDeploymentError(
+                "Rolled-back Android deployment omitted reusable validation evidence"
+            )
+        prior_index = reusable_attempt.get("attempt_index")
+        if not isinstance(prior_index, int) or isinstance(prior_index, bool) or prior_index < 1:
+            raise AgentDeploymentError(
+                "Rolled-back Android deployment has an invalid attempt index"
+            )
+        validation = self.release_validator.verify_existing(
+            candidate_worktree=candidate_worktree,
+            claim=claim,
+            version=version,
+            expected=prior_validation,
+        )
+        return validation, {
+            "validation_mode": "reused",
+            "reused_validation_attempt_index": prior_index,
+            "reused_unsigned_apk_sha256": validation.unsigned_apk_sha256,
+            "reused_unsigned_apk_size_bytes": validation.unsigned_apk_size_bytes,
+        }
+
+    @staticmethod
+    def _latest_rolled_back_attempt(
+        manifest: dict,
+        *,
+        exclude: dict,
+    ) -> dict | None:
+        attempts = manifest.get("attempts")
+        if not isinstance(attempts, list):
+            raise AgentDeploymentError("Existing Android deployment attempts are invalid")
+        for attempt in reversed(attempts):
+            if attempt is exclude:
+                continue
+            if isinstance(attempt, dict) and attempt.get("status") == "rolled_back":
+                return attempt
+        return None
 
     def _validate_android_review_evidence(self, claim: ClaimedRun) -> None:
         assert claim.deployment_source is not None

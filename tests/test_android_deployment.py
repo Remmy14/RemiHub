@@ -2,12 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from backend.core.android_deployment import (
     EXPECTED_CERTIFICATE_SHA256,
     EXPECTED_PACKAGE_NAME,
     AndroidReleaseVersion,
+    AndroidValidationEvidence,
+    CommandAndroidReleaseValidator,
     GitAndroidDeploymentExecutor,
     GitAndroidDeploymentManager,
 )
@@ -21,6 +23,154 @@ class AndroidDeploymentBoundaryTests(unittest.TestCase):
         manager = object.__new__(GitAndroidDeploymentManager)
         manager.target_branch = "production-master"
         return manager
+
+
+    def validation_evidence(self):
+        raw = {
+            "success": True,
+            "validator": "trusted_android_release_offline_gradle",
+            "tasks": [
+                ":app:testDebugUnitTest",
+                ":app:lintDebug",
+                ":app:assembleDebug",
+                ":app:assembleRelease",
+            ],
+            "network": "denied",
+            "gradle_offline": True,
+            "protected_build_files_unchanged": True,
+            "workspace": "/tmp/candidate",
+            "gradle_log": "/tmp/gradle.log",
+            "manifest_path": "/tmp/validation.json",
+            "release_apk": {
+                "path": "/tmp/app-release-unsigned.apk",
+                "sha256": "c" * 64,
+                "size_bytes": 123,
+                "package_name": EXPECTED_PACKAGE_NAME,
+                "version_code": 64,
+                "version_name": "0.8.10",
+                "signed": False,
+            },
+        }
+        return AndroidValidationEvidence(
+            manifest_path=raw["manifest_path"],
+            unsigned_apk_path=raw["release_apk"]["path"],
+            unsigned_apk_sha256=raw["release_apk"]["sha256"],
+            unsigned_apk_size_bytes=raw["release_apk"]["size_bytes"],
+            package_name=EXPECTED_PACKAGE_NAME,
+            version_code=64,
+            version_name="0.8.10",
+            gradle_log=raw["gradle_log"],
+            raw=raw,
+        )
+
+    def test_first_attempt_builds_validation(self):
+        manager = self.manager_without_init()
+        manager.release_validator = MagicMock()
+        evidence = self.validation_evidence()
+        manager.release_validator.validate.return_value = evidence
+        current = {"attempt_index": 1, "status": "running"}
+        manifest = {"attempts": [current]}
+        claim = MagicMock()
+        version = AndroidReleaseVersion(64, 0, 8, 10, "0.8.10")
+
+        observed, metadata = manager._validation_for_attempt(
+            manifest=manifest,
+            current_attempt=current,
+            candidate_worktree=Path("/tmp/candidate"),
+            claim=claim,
+            version=version,
+        )
+
+        self.assertEqual(observed, evidence)
+        self.assertEqual(metadata, {"validation_mode": "built"})
+        manager.release_validator.validate.assert_called_once()
+        manager.release_validator.verify_existing.assert_not_called()
+
+    def test_retry_reuses_rolled_back_validation_without_gradle(self):
+        manager = self.manager_without_init()
+        manager.release_validator = MagicMock()
+        evidence = self.validation_evidence()
+        prior = {
+            "attempt_index": 1,
+            "status": "rolled_back",
+            "validation": evidence.__dict__,
+        }
+        current = {"attempt_index": 2, "status": "running"}
+        manifest = {"attempts": [prior, current]}
+        claim = MagicMock()
+        version = AndroidReleaseVersion(64, 0, 8, 10, "0.8.10")
+        manager.release_validator.verify_existing.return_value = evidence
+
+        observed, metadata = manager._validation_for_attempt(
+            manifest=manifest,
+            current_attempt=current,
+            candidate_worktree=Path("/tmp/candidate"),
+            claim=claim,
+            version=version,
+        )
+
+        self.assertEqual(observed, evidence)
+        self.assertEqual(metadata["validation_mode"], "reused")
+        self.assertEqual(metadata["reused_validation_attempt_index"], 1)
+        self.assertEqual(
+            metadata["reused_unsigned_apk_sha256"],
+            evidence.unsigned_apk_sha256,
+        )
+        manager.release_validator.verify_existing.assert_called_once_with(
+            candidate_worktree=Path("/tmp/candidate"),
+            claim=claim,
+            version=version,
+            expected=evidence.__dict__,
+        )
+        manager.release_validator.validate.assert_not_called()
+
+    def test_retry_fails_when_rolled_back_validation_is_missing(self):
+        manager = self.manager_without_init()
+        manager.release_validator = MagicMock()
+        prior = {"attempt_index": 1, "status": "rolled_back"}
+        current = {"attempt_index": 2, "status": "running"}
+        with self.assertRaisesRegex(AgentDeploymentError, "omitted reusable"):
+            manager._validation_for_attempt(
+                manifest={"attempts": [prior, current]},
+                current_attempt=current,
+                candidate_worktree=Path("/tmp/candidate"),
+                claim=MagicMock(),
+                version=AndroidReleaseVersion(64, 0, 8, 10, "0.8.10"),
+            )
+        manager.release_validator.validate.assert_not_called()
+        manager.release_validator.verify_existing.assert_not_called()
+
+    def test_verify_existing_invokes_non_build_validator_mode(self):
+        version = AndroidReleaseVersion(64, 0, 8, 10, "0.8.10")
+        evidence = self.validation_evidence()
+        completed = MagicMock(
+            returncode=0,
+            stdout=json.dumps(evidence.raw),
+            stderr="",
+        )
+        validator = object.__new__(CommandAndroidReleaseValidator)
+        validator.validation_command = Path("/usr/local/libexec/validator")
+        validator.timeout_seconds = 30
+        claim = MagicMock(
+            card_id="11111111-1111-4111-8111-111111111111",
+            id="22222222-2222-4222-8222-222222222222",
+        )
+
+        with patch(
+            "backend.core.android_deployment.subprocess.run",
+            return_value=completed,
+        ) as run:
+            observed = validator.verify_existing(
+                candidate_worktree=Path("/tmp/candidate"),
+                claim=claim,
+                version=version,
+                expected=evidence.__dict__,
+            )
+
+        self.assertEqual(observed, evidence)
+        command = run.call_args.args[0]
+        self.assertEqual(command[1], "--verify-existing")
+        self.assertEqual(command[2], "/tmp/candidate")
 
     def test_android_path_boundary_allows_app_source_and_docs(self):
         manager = self.manager_without_init()
