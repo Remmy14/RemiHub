@@ -106,8 +106,16 @@ app.include_router(auth.router)
 # RemiHub routes remain in transition mode.
 app.include_router(agent.router)
 
-routers = [
+# Race Day is the only family-facing API surface that remains public. Its
+# browser clients intentionally do not require individual Firebase accounts.
+public_routers = [
     race.router,
+]
+
+# Every other legacy application router participates in the authentication
+# cutover. Transition mode keeps the currently installed Android app working;
+# required mode rejects requests that do not carry a valid Firebase ID token.
+protected_routers = [
     pool.router,
     plex.router,
     fieldwatch.router,
@@ -123,7 +131,10 @@ routers = [
     spotify.router,
 ]
 
-for router in routers:
+for router in public_routers:
+    app.include_router(router)
+
+for router in protected_routers:
     app.include_router(
         router,
         dependencies=[Depends(get_current_principal)],

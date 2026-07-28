@@ -27,6 +27,15 @@ Read the nearest more-specific `AGENTS.md` if a subdirectory adds one.
 - Do not use destructive Git commands. Preserve unrelated user changes.
 - Use LF line endings for repository text files.
 
+## Authentication route policy
+
+- `/auth/*` owns strict session verification endpoints.
+- `/agent/*` is always administrator-only through `require_admin_principal`.
+- `/race/*` is the only intentionally public API surface so family Race Day clients can operate without individual Firebase accounts.
+- Every other application router must be registered through the protected router list in `backend/main.py` and uses `get_current_principal`.
+- Production normally runs `REMIHUB_AUTH_MODE=required`; `transition` is permitted only during an explicitly staged client cutover.
+- Do not restore the legacy static Android API key as an authentication mechanism.
+
 ## Validation
 
 The primary backend checks are:

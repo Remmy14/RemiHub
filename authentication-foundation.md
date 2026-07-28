@@ -18,8 +18,11 @@ The default is `transition`. Keep that setting throughout this patch. The
 `/auth/me` endpoint is intentionally strict in every mode so it can be used to
 test authentication without enforcing it across the rest of the API.
 
-Only FastAPI routers are behind the new dependency. Static web assets,
-`/favicon.ico`, and the OpenAPI documentation remain public.
+The completed cutover uses an explicit route policy. `/race/*` remains public for
+family Race Day clients. `/agent/*` remains administrator-only. Every other
+application API router requires a valid Firebase identity when
+`REMIHUB_AUTH_MODE=required`. Static web assets, `/favicon.ico`, and the
+OpenAPI documentation remain public.
 
 ## Configuration
 
@@ -104,3 +107,15 @@ the old application code, and then run:
 
 The down migration removes user associations and notification data stored by
 this phase.
+
+## Completed client cutover policy
+
+Before switching production to `required`:
+
+1. Deploy the backward-compatible route-policy source while still in `transition`.
+2. Install and verify an Android release that signs in with Firebase email/password, attaches ID tokens through the shared OkHttp client, refreshes once after a `401`, and no longer sends `X-RemiHub-Key`.
+3. Confirm `/auth/me`, application update checks/downloads, and notification registration succeed from the authenticated app.
+4. Set `REMIHUB_AUTH_MODE=required` and restart RemiHub.
+5. Verify unauthenticated non-Race API requests return `401`, `/race/*` remains usable without credentials, and `/agent/*` still requires an administrator.
+
+The legacy static API key is not a fallback after this cutover.
