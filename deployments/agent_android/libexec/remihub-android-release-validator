@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=/etc/remihub-agent/android-release-validator.conf
+BWRAP=/usr/local/libexec/remihub-codex-bwrap/bwrap
+APKSIGNER=/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/apksigner
+ZIPALIGN=/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/zipalign
+AAPT=/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/aapt2
+
+fail() { printf 'android-release-validator: %s\n' "$*" >&2; exit 125; }
+[[ -r "$CONFIG" ]] || fail "missing configuration: $CONFIG"
+# shellcheck source=/dev/null
+source "$CONFIG"
+for name in WORKTREE_ROOT SOURCE_REPOSITORY ARTIFACT_ROOT ANDROID_SDK JAVA_HOME JAVA_SECURITY_ROOT GRADLE_USER_HOME; do
+  [[ -n "${!name:-}" ]] || fail "blank configuration: $name"
+done
+mode=build
+if [[ "${1:-}" == "--verify-existing" ]]; then
+  mode=verify-existing
+  shift
+fi
+[[ "$#" == 7 ]] || fail "expected [--verify-existing] WORKTREE CARD_ID RUN_ID VERSION_CODE VERSION_MAJOR VERSION_MINOR VERSION_PATCH"
+workspace=$1; card_id=$2; run_id=$3; version_code=$4; version_major=$5; version_minor=$6; version_patch=$7
+[[ "$card_id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid card id"
+[[ "$run_id" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid run id"
+for value in "$version_code" "$version_major" "$version_minor" "$version_patch"; do
+  [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid version component"
+done
+(( version_code > 0 )) || fail "version code must be positive"
+version_name="${version_major}.${version_minor}.${version_patch}"
+[[ "$workspace" == "$WORKTREE_ROOT"/card-*-r* ]] || fail "workspace outside Android deployment worktree root"
+[[ "$(dirname -- "$workspace")" == "$WORKTREE_ROOT" ]] || fail "workspace must be a direct child"
+[[ -d "$workspace" && ! -L "$workspace" ]] || fail "workspace is not a real directory"
+[[ -f "$workspace/.git" && ! -L "$workspace/.git" ]] || fail "workspace lacks protected .git pointer"
+common_git=$(/usr/bin/git -C "$workspace" rev-parse --path-format=absolute --git-common-dir)
+[[ "$(realpath -e -- "$common_git")" == "$(realpath -e -- "$SOURCE_REPOSITORY")" ]] || fail "unexpected Git repository"
+[[ -z "$(/usr/bin/git -C "$workspace" status --porcelain=v1 --untracked-files=all)" ]] || fail "candidate worktree is not clean"
+for tool in "$BWRAP" "$APKSIGNER" "$ZIPALIGN" "$AAPT"; do [[ -x "$tool" ]] || fail "missing tool: $tool"; done
+[[ "$JAVA_HOME" == /* && -d "$JAVA_HOME" && ! -L "$JAVA_HOME" ]] || fail "invalid JAVA_HOME"
+[[ "$JAVA_SECURITY_ROOT" == /* && -d "$JAVA_SECURITY_ROOT" && ! -L "$JAVA_SECURITY_ROOT" ]] || fail "invalid JAVA_SECURITY_ROOT"
+JAVA_HOME="$(realpath -e -- "$JAVA_HOME")"
+JAVA_SECURITY_ROOT="$(realpath -e -- "$JAVA_SECURITY_ROOT")"
+java_security_file="$(realpath -e -- "$JAVA_HOME/conf/security/java.security")" || fail "cannot resolve Java security configuration"
+[[ "$java_security_file" == "$JAVA_SECURITY_ROOT/security/java.security" ]] || fail "unexpected Java security configuration"
+[[ ! -e "$workspace/local.properties" ]] || fail "candidate must not provide local.properties"
+
+artifact_dir="$ARTIFACT_ROOT/$card_id/$run_id/release-validation"
+log="$artifact_dir/gradle.log"
+unsigned_apk="$artifact_dir/app-release-unsigned.apk"
+validation_manifest="$artifact_dir/validation.json"
+
+if [[ "$mode" == "verify-existing" ]]; then
+  expected_root="$ARTIFACT_ROOT/$card_id/$run_id"
+  [[ "$artifact_dir" == "$expected_root/release-validation" ]] || fail "unexpected validation artifact directory"
+  for path in "$artifact_dir" "$log" "$unsigned_apk" "$validation_manifest"; do
+    [[ -e "$path" && ! -L "$path" ]] || fail "reusable validation artifact is unsafe or missing: $path"
+  done
+  [[ -d "$artifact_dir" ]] || fail "reusable validation directory is invalid"
+  for path in "$log" "$unsigned_apk" "$validation_manifest"; do
+    [[ -f "$path" ]] || fail "reusable validation artifact is not a regular file: $path"
+    [[ "$(stat -c %u -- "$path")" == "$(id -u)" ]] || fail "reusable validation artifact owner is unexpected: $path"
+    mode_bits=$(stat -c %a -- "$path")
+    (( (8#$mode_bits & 0022) == 0 )) || fail "reusable validation artifact is writable by group or other: $path"
+  done
+  "$ZIPALIGN" -c -p -v 4 "$unsigned_apk" >/dev/null
+  if "$APKSIGNER" verify "$unsigned_apk" >/dev/null 2>&1; then fail "reusable release candidate is unexpectedly signed"; fi
+  python3 - "$workspace" "$artifact_dir" "$unsigned_apk" "$AAPT" "$log" "$validation_manifest" "$version_code" "$version_name" <<'PY_REUSE'
+import hashlib, json, pathlib, re, subprocess, sys
+workspace=pathlib.Path(sys.argv[1]); artifact_dir=pathlib.Path(sys.argv[2]); apk=pathlib.Path(sys.argv[3]); aapt=sys.argv[4]; log=pathlib.Path(sys.argv[5]); manifest=pathlib.Path(sys.argv[6]); expected_code=int(sys.argv[7]); expected_name=sys.argv[8]
+def sha(path):
+    h=hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024), b''): h.update(chunk)
+    return h.hexdigest()
+try:
+    payload=json.loads(manifest.read_text())
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f'invalid reusable validation manifest: {exc}')
+release=payload.get('release_apk')
+if not isinstance(release,dict): raise SystemExit('reusable validation manifest lacks release evidence')
+text=subprocess.run([aapt,'dump','badging',str(apk)],check=True,capture_output=True,text=True).stdout
+first=text.splitlines()[0] if text.splitlines() else ''
+m=re.search(r"name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", first)
+if not m: raise SystemExit('cannot parse reusable APK badging')
+package, code, name=m.group(1), int(m.group(2)), m.group(3)
+expected={
+    'success': True,
+    'network': 'denied',
+    'gradle_offline': True,
+    'protected_build_files_unchanged': True,
+    'workspace': str(workspace),
+    'gradle_log': str(log),
+    'manifest_path': str(manifest),
+}
+for key,value in expected.items():
+    if payload.get(key) != value: raise SystemExit(f'reusable validation manifest mismatch: {key}')
+if package != 'com.alex.remihub' or code != expected_code or name != expected_name:
+    raise SystemExit('reusable APK identity/version mismatch')
+release_expected={
+    'path': str(apk),
+    'sha256': sha(apk),
+    'size_bytes': apk.stat().st_size,
+    'package_name': package,
+    'version_code': code,
+    'version_name': name,
+    'signed': False,
+}
+for key,value in release_expected.items():
+    if release.get(key) != value: raise SystemExit(f'reusable release evidence mismatch: {key}')
+print(json.dumps(payload,sort_keys=True))
+PY_REUSE
+  exit 0
+fi
+
+[[ -x "$workspace/gradlew" ]] || fail "gradlew is missing"
+[[ -f "$workspace/app/google-services.json" ]] || fail "tracked google-services.json is missing"
+
+protected=(gradlew gradlew.bat gradle.properties settings.gradle settings.gradle.kts build.gradle build.gradle.kts app/build.gradle app/build.gradle.kts app/google-services.json)
+protected_before=$(mktemp)
+protected_after=$(mktemp)
+cleanup() { rm -f "$workspace/local.properties" "$protected_before" "$protected_after"; }
+trap cleanup EXIT
+for path in "${protected[@]}"; do
+  if /usr/bin/git -C "$workspace" cat-file -e "HEAD:$path" 2>/dev/null; then
+    printf '%s  %s\n' "$(/usr/bin/git -C "$workspace" show "HEAD:$path" | sha256sum | awk '{print $1}')" "$path"
+  fi
+done | sort > "$protected_before"
+
+mkdir -p "$artifact_dir"
+chmod 0750 "$ARTIFACT_ROOT/$card_id" "$ARTIFACT_ROOT/$card_id/$run_id" "$artifact_dir" 2>/dev/null || true
+printf 'sdk.dir=%s\n' "$ANDROID_SDK" > "$workspace/local.properties"
+chmod 0640 "$workspace/local.properties"
+rm -rf "$workspace/app/build" "$workspace/.gradle"
+
+args=(
+  "$BWRAP" --die-with-parent --new-session
+  --unshare-user --uid "$(id -u)" --gid "$(id -g)"
+  --unshare-pid --unshare-ipc --unshare-uts --unshare-net
+  --hostname remihub-android-release-validator --cap-drop ALL --clearenv
+  --ro-bind /usr /usr
+)
+for path in /bin /sbin /lib /lib64; do
+  if [[ -L "$path" ]]; then args+=(--symlink "$(readlink -- "$path")" "$path");
+  elif [[ -d "$path" ]]; then args+=(--ro-bind "$path" "$path"); fi
+done
+args+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs /run --dir /etc --dir /opt --dir /opt/remihub-agent --dir /opt/remihub-agent/android --dir /opt/remihub-agent/android/deployment --dir /opt/remihub-agent/android/deployment/worktrees --dir /opt/remihub-android-toolchain --dir /tmp/home)
+for path in /etc/ld.so.cache /etc/localtime /etc/nsswitch.conf /etc/os-release; do [[ -f "$path" ]] && args+=(--ro-bind "$path" "$path"); done
+[[ -d /etc/ssl ]] && args+=(--ro-bind /etc/ssl /etc/ssl)
+[[ -d /etc/ca-certificates ]] && args+=(--ro-bind /etc/ca-certificates /etc/ca-certificates)
+args+=(
+  --ro-bind "$JAVA_SECURITY_ROOT" "$JAVA_SECURITY_ROOT"
+  --ro-bind "$JAVA_HOME" "$JAVA_HOME"
+  --ro-bind "$ANDROID_SDK" "$ANDROID_SDK"
+  --bind "$GRADLE_USER_HOME" "$GRADLE_USER_HOME"
+  --bind "$workspace" "$workspace"
+  --ro-bind "$workspace/.git" "$workspace/.git"
+  --setenv HOME /tmp/home --setenv USER remihub-deployer --setenv LOGNAME remihub-deployer
+  --setenv PATH "$JAVA_HOME/bin:$ANDROID_SDK/platform-tools:$ANDROID_SDK/build-tools/34.0.0:/usr/bin:/bin"
+  --setenv JAVA_HOME "$JAVA_HOME" --setenv ANDROID_HOME "$ANDROID_SDK" --setenv ANDROID_SDK_ROOT "$ANDROID_SDK"
+  --setenv GRADLE_USER_HOME "$GRADLE_USER_HOME" --setenv LANG C.UTF-8 --setenv LC_ALL C.UTF-8 --setenv TMPDIR /tmp
+  --setenv REMIHUB_ENV_FILE /dev/null --setenv GIT_CONFIG_NOSYSTEM 1 --setenv GIT_CONFIG_GLOBAL /dev/null
+  --setenv GRADLE_OPTS "-Dorg.gradle.daemon=false -Dorg.gradle.vfs.watch=false"
+  --chdir "$workspace"
+  ./gradlew --offline --no-daemon --console=plain
+  "-PRELEASE_VERSION_CODE=$version_code" "-PRELEASE_VERSION_MAJOR=$version_major" "-PRELEASE_VERSION_MINOR=$version_minor" "-PRELEASE_VERSION_PATCH=$version_patch"
+  :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease
+)
+set +e
+/usr/bin/env -i "${args[@]}" >"$log" 2>&1
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then tail -n 160 "$log" >&2 || true; exit "$status"; fi
+rm -f "$workspace/local.properties"
+[[ -z "$(/usr/bin/git -C "$workspace" status --porcelain=v1 --untracked-files=all)" ]] || fail "candidate changed during validation"
+for path in "${protected[@]}"; do
+  if /usr/bin/git -C "$workspace" cat-file -e "HEAD:$path" 2>/dev/null; then
+    printf '%s  %s\n' "$(/usr/bin/git -C "$workspace" show "HEAD:$path" | sha256sum | awk '{print $1}')" "$path"
+  fi
+done | sort > "$protected_after"
+cmp -s "$protected_before" "$protected_after" || fail "protected build files changed"
+
+release_source="$workspace/app/build/outputs/apk/release/app-release-unsigned.apk"
+[[ -f "$release_source" ]] || fail "unsigned release APK missing"
+"$ZIPALIGN" -c -p -v 4 "$release_source" >/dev/null
+if "$APKSIGNER" verify "$release_source" >/dev/null 2>&1; then fail "release candidate is unexpectedly signed"; fi
+install -m 0640 "$release_source" "$unsigned_apk"
+
+python3 - "$workspace" "$artifact_dir" "$unsigned_apk" "$AAPT" "$log" "$version_code" "$version_name" <<'PY'
+import hashlib, json, pathlib, re, subprocess, sys
+workspace=pathlib.Path(sys.argv[1]); artifact_dir=pathlib.Path(sys.argv[2]); apk=pathlib.Path(sys.argv[3]); aapt=sys.argv[4]; log=pathlib.Path(sys.argv[5]); expected_code=int(sys.argv[6]); expected_name=sys.argv[7]
+def sha(path):
+    h=hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024), b''): h.update(chunk)
+    return h.hexdigest()
+text=subprocess.run([aapt,'dump','badging',str(apk)],check=True,capture_output=True,text=True).stdout
+first=text.splitlines()[0]
+m=re.search(r"name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", first)
+if not m: raise SystemExit('cannot parse APK badging')
+package, code, name=m.group(1), int(m.group(2)), m.group(3)
+if package != 'com.alex.remihub' or code != expected_code or name != expected_name: raise SystemExit('APK identity/version mismatch')
+manifest=artifact_dir/'validation.json'
+payload={'success':True,'validator':'trusted_android_release_offline_gradle','tasks':[':app:testDebugUnitTest',':app:lintDebug',':app:assembleDebug',':app:assembleRelease'],'network':'denied','gradle_offline':True,'protected_build_files_unchanged':True,'workspace':str(workspace),'gradle_log':str(log),'manifest_path':str(manifest),'release_apk':{'path':str(apk),'sha256':sha(apk),'size_bytes':apk.stat().st_size,'package_name':package,'version_code':code,'version_name':name,'signed':False}}
+manifest.write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n'); manifest.chmod(0o640)
+print(json.dumps(payload,sort_keys=True))
+PY

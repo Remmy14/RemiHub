@@ -78,6 +78,61 @@ def _git(repository: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+class DeploymentImplementationTestEvidenceTests(unittest.TestCase):
+    def test_backend_failed_implementation_test_remains_blocking(self):
+        manager = object.__new__(GitBackendDeploymentManager)
+        metadata = {
+            "tests": [
+                {
+                    "command": "python -m unittest",
+                    "status": "failed",
+                    "details": "one test failed",
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(
+            AgentDeploymentError,
+            "contains failed implementation tests",
+        ):
+            manager._validate_implementation_tests(metadata)
+
+    def test_backend_nonfailed_implementation_tests_are_preserved(self):
+        manager = object.__new__(GitBackendDeploymentManager)
+        metadata = {
+            "tests": [
+                {
+                    "command": " git diff --check ",
+                    "status": "passed",
+                    "details": " clean ",
+                },
+                {
+                    "command": "python -m unittest",
+                    "status": "not_run",
+                    "details": "not available",
+                },
+            ]
+        }
+
+        observed = manager._validate_implementation_tests(metadata)
+
+        self.assertEqual(
+            observed,
+            (
+                {
+                    "command": "git diff --check",
+                    "status": "passed",
+                    "details": "clean",
+                },
+                {
+                    "command": "python -m unittest",
+                    "status": "not_run",
+                    "details": "not available",
+                },
+            ),
+        )
+
+
 class FakeValidator:
     def __init__(self, *, fail: bool = False):
         self.fail = fail

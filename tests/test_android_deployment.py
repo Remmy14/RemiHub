@@ -63,6 +63,58 @@ class AndroidDeploymentBoundaryTests(unittest.TestCase):
             raw=raw,
         )
 
+    def trusted_implementation_metadata(self, *, success=True):
+        return {
+            "tests": [
+                {
+                    "command": "./scripts/verify-android-baseline.sh",
+                    "status": "failed",
+                    "details": "Codex sandbox Java security path was unavailable.",
+                }
+            ],
+            "trusted_validation": {
+                "success": success,
+                "network": "denied",
+                "gradle_offline": True,
+                "protected_build_files_unchanged": True,
+                "release_apk": {
+                    "signed": False,
+                    "package_name": EXPECTED_PACKAGE_NAME,
+                },
+            },
+        }
+
+    def test_trusted_android_validation_supersedes_failed_codex_test_report(self):
+        manager = self.manager_without_init()
+        metadata = self.trusted_implementation_metadata()
+
+        observed = manager._validate_implementation_tests(metadata)
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["status"], "failed")
+        self.assertIn("Codex sandbox", observed[0]["details"])
+
+    def test_failed_codex_test_still_blocks_without_trusted_android_validation(self):
+        manager = self.manager_without_init()
+        metadata = self.trusted_implementation_metadata(success=False)
+
+        with self.assertRaisesRegex(
+            AgentDeploymentError,
+            "contains failed implementation tests",
+        ):
+            manager._validate_implementation_tests(metadata)
+
+    def test_trusted_android_validation_requires_offline_network_denied_evidence(self):
+        manager = self.manager_without_init()
+        metadata = self.trusted_implementation_metadata()
+        metadata["trusted_validation"]["network"] = "allowed"
+
+        with self.assertRaisesRegex(
+            AgentDeploymentError,
+            "contains failed implementation tests",
+        ):
+            manager._validate_implementation_tests(metadata)
+
     def test_first_attempt_builds_validation(self):
         manager = self.manager_without_init()
         manager.release_validator = MagicMock()

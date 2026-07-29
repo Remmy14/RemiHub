@@ -1,0 +1,2 @@
+[Service]
+WorkingDirectory=@ANDROID_DEPLOYMENT_RUNTIME@

@@ -1077,6 +1077,54 @@ class GitBackendDeploymentManager:
                 f"Deployment failed and was rolled back safely: {exc}"
             ) from exc
 
+    def _failed_implementation_test_is_blocking(
+        self,
+        metadata: dict,
+        test: dict,
+    ) -> bool:
+        return True
+
+    def _validate_implementation_tests(
+        self,
+        metadata: dict,
+    ) -> tuple[dict, ...]:
+        implementation_tests_value = metadata.get("tests")
+        if not isinstance(implementation_tests_value, list):
+            raise AgentDeploymentError(
+                "Implementation result is missing test evidence"
+            )
+        implementation_tests: list[dict] = []
+        for test in implementation_tests_value:
+            if not isinstance(test, dict):
+                raise AgentDeploymentError("Implementation test evidence is invalid")
+            command = test.get("command")
+            status = test.get("status")
+            details = test.get("details")
+            if (
+                not isinstance(command, str)
+                or not command.strip()
+                or status not in {"passed", "failed", "not_run"}
+                or not isinstance(details, str)
+            ):
+                raise AgentDeploymentError(
+                    "Implementation test evidence is invalid"
+                )
+            if status == "failed" and self._failed_implementation_test_is_blocking(
+                metadata,
+                test,
+            ):
+                raise AgentDeploymentError(
+                    "Deployment approval contains failed implementation tests"
+                )
+            implementation_tests.append(
+                {
+                    "command": command.strip(),
+                    "status": status,
+                    "details": details.strip(),
+                }
+            )
+        return tuple(implementation_tests)
+
     def _validate_approved_implementation(
         self,
         claim: ClaimedRun,
@@ -1136,38 +1184,7 @@ class GitBackendDeploymentManager:
                 "Implementation changed-file evidence contains duplicates"
             )
 
-        implementation_tests_value = metadata.get("tests")
-        if not isinstance(implementation_tests_value, list):
-            raise AgentDeploymentError(
-                "Implementation result is missing test evidence"
-            )
-        implementation_tests: list[dict] = []
-        for test in implementation_tests_value:
-            if not isinstance(test, dict):
-                raise AgentDeploymentError("Implementation test evidence is invalid")
-            command = test.get("command")
-            status = test.get("status")
-            details = test.get("details")
-            if (
-                not isinstance(command, str)
-                or not command.strip()
-                or status not in {"passed", "failed", "not_run"}
-                or not isinstance(details, str)
-            ):
-                raise AgentDeploymentError(
-                    "Implementation test evidence is invalid"
-                )
-            if status == "failed":
-                raise AgentDeploymentError(
-                    "Deployment approval contains failed implementation tests"
-                )
-            implementation_tests.append(
-                {
-                    "command": command.strip(),
-                    "status": status,
-                    "details": details.strip(),
-                }
-            )
+        implementation_tests = self._validate_implementation_tests(metadata)
 
         expected_branch = f"agent/card-{claim.card_id}"
         expected_worktree = self.source_worktree_root / f"card-{claim.card_id}"
@@ -1276,7 +1293,7 @@ class GitBackendDeploymentManager:
             patch_size_bytes=patch_size_bytes,
             patch_sha256=patch_sha256,
             expected_tree=expected_tree,
-            implementation_tests=tuple(implementation_tests),
+            implementation_tests=implementation_tests,
         )
 
     def _materialize_candidate(

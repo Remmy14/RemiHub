@@ -612,13 +612,8 @@ class GitAndroidDeploymentManager(GitBackendDeploymentManager):
                 return attempt
         return None
 
-    def _validate_android_review_evidence(self, claim: ClaimedRun) -> None:
-        assert claim.deployment_source is not None
-        metadata = claim.deployment_source.implementation_result_metadata
-        if metadata.get("repository_scope") != RepositoryScope.ANDROID.value:
-            raise AgentDeploymentError(
-                "Android deployment source has the wrong repository scope"
-            )
+    @staticmethod
+    def _validate_trusted_implementation_validation(metadata: dict) -> dict:
         validation = metadata.get("trusted_validation")
         if not isinstance(validation, dict) or validation.get("success") is not True:
             raise AgentDeploymentError(
@@ -643,6 +638,27 @@ class GitAndroidDeploymentManager(GitBackendDeploymentManager):
             raise AgentDeploymentError(
                 "Android implementation validation package is unexpected"
             )
+        return validation
+
+    def _validate_android_review_evidence(self, claim: ClaimedRun) -> None:
+        assert claim.deployment_source is not None
+        metadata = claim.deployment_source.implementation_result_metadata
+        if metadata.get("repository_scope") != RepositoryScope.ANDROID.value:
+            raise AgentDeploymentError(
+                "Android deployment source has the wrong repository scope"
+            )
+        self._validate_trusted_implementation_validation(metadata)
+
+    def _failed_implementation_test_is_blocking(
+        self,
+        metadata: dict,
+        test: dict,
+    ) -> bool:
+        try:
+            self._validate_trusted_implementation_validation(metadata)
+        except AgentDeploymentError:
+            return True
+        return False
 
     def _validate_approved_implementation(
         self,

@@ -1,0 +1,1488 @@
+#!/opt/remihub/.venv/bin/python
+from __future__ import annotations
+
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+EXPECTED_PACKAGE = "com.alex.remihub"
+EXPECTED_CERT = "029cc5d06bd10e1d07a56834dd45326c9762f6263c5835244bcaf4a6a6a6e03d"
+TARGET_REPO = Path("/opt/remihub-agent/android/deployment/repository.git")
+TARGET_BRANCH = "production-main"
+CANONICAL_REPO = Path("/opt/remihub-android")
+IMPLEMENTATION_REPO = Path("/opt/remihub-agent/repositories/remihub-android-implementation.git")
+ARTIFACT_ROOT = Path("/opt/remihub-agent/android/deployment/artifacts")
+RELEASE_ROOT = Path("/opt/remihub/releases/android")
+LEGACY_STAGING_ROOT = RELEASE_ROOT / ".agent-staging"
+STATE_ROOT = Path("/var/lib/remihub-agent/android-release")
+STAGING_ROOT = STATE_ROOT / "staging"
+RESERVATION_ROOT = STATE_ROOT / "reservations"
+JOURNAL_ROOT = STATE_ROOT / "journals"
+FAILPOINT_ROOT = STATE_ROOT / "failpoints"
+FAILPOINT_TRIGGER_STAGE = "after_sources_promoted_before_endpoint_verification"
+SIGNING_CONFIG = Path("/etc/remihub-agent/android-signing.json")
+READINESS = Path("/var/lib/remihub-agent/phase3b/android-signing-ready.json")
+VERSION_FILE = Path("/opt/remihub/deployments/release_version.json")
+APKSIGNER = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/apksigner")
+ZIPALIGN = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/zipalign")
+AAPT = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/aapt2")
+UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+UUID_RE = re.compile(rf"^{UUID_PATTERN}$", re.IGNORECASE)
+BRANCH_RE = re.compile(rf"^deployment/card-{UUID_PATTERN}/r[1-9][0-9]*$", re.IGNORECASE)
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+TREE_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+def run(command, *, check=True, input_text=None, env=None, timeout=300):
+    controlled_env = {
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    if env:
+        controlled_env.update(env)
+    result = subprocess.run(
+        [str(item) for item in command],
+        check=False,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=controlled_env,
+        cwd="/",
+        timeout=timeout,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout)[-4000:].strip()
+        raise ReleaseError(f"command failed: {command[0]}: {detail}")
+    return result
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, payload: dict, mode: int = 0o640):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def atomic_version(payload: dict, *, owner_uid: int, group_gid: int, mode: int):
+    atomic_json(VERSION_FILE, payload, mode)
+    os.chown(VERSION_FILE, owner_uid, group_gid)
+    os.chmod(VERSION_FILE, mode)
+
+
+def read_json(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError(f"required JSON file is unsafe or missing: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"invalid JSON file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"JSON object required: {path}")
+    return payload
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _failpoint_path(run_id: str) -> Path:
+    if not isinstance(run_id, str) or not UUID_RE.fullmatch(run_id):
+        raise ReleaseError("invalid failpoint deployment run id")
+    return FAILPOINT_ROOT / f"{run_id.lower()}.json"
+
+
+def _read_failpoint(run_id: str) -> tuple[Path, dict] | None:
+    path = _failpoint_path(run_id)
+    if not path.exists() and not path.is_symlink():
+        return None
+    if FAILPOINT_ROOT.is_symlink() or not FAILPOINT_ROOT.is_dir():
+        raise ReleaseError("Android release failpoint root is unsafe or missing")
+    root_stat = FAILPOINT_ROOT.stat()
+    if root_stat.st_uid != ROOT_UID or root_stat.st_gid != ROOT_GID or stat.S_IMODE(root_stat.st_mode) != 0o700:
+        raise ReleaseError("Android release failpoint root ownership or mode is unsafe")
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError("Android release failpoint marker is unsafe")
+    marker_stat = path.stat()
+    if marker_stat.st_uid != ROOT_UID or marker_stat.st_gid != ROOT_GID or stat.S_IMODE(marker_stat.st_mode) != 0o600:
+        raise ReleaseError("Android release failpoint marker ownership or mode is unsafe")
+    marker = read_json(path)
+    if marker.get("schema_version") != 1:
+        raise ReleaseError("Android release failpoint schema is invalid")
+    if marker.get("deployment_run_id") != run_id.lower():
+        raise ReleaseError("Android release failpoint run identity is invalid")
+    if marker.get("trigger_stage") != FAILPOINT_TRIGGER_STAGE:
+        raise ReleaseError("Android release failpoint stage is invalid")
+    return path, marker
+
+
+def _failpoint_identity(payload: dict) -> dict:
+    keys = (
+        "card_id",
+        "deployment_run_id",
+        "approval_id",
+        "implementation_run_id",
+        "card_revision",
+        "candidate_commit",
+        "base_commit",
+        "patch_sha256",
+        "expected_tree",
+        "version_code",
+        "version_major",
+        "version_minor",
+        "version_patch",
+        "version_name",
+    )
+    return {key: payload.get(key) for key in keys}
+
+
+def seal_failpoint(reservation: dict) -> dict | None:
+    run_id = reservation.get("deployment_run_id")
+    existing = _read_failpoint(str(run_id))
+    if existing is None:
+        return None
+    path, marker = existing
+    status_value = marker.get("status")
+    expected_identity = _failpoint_identity(reservation)
+    if marker.get("card_id") != reservation.get("card_id") or marker.get("card_revision") != reservation.get("card_revision"):
+        raise ReleaseError("Android release failpoint card identity differs from reservation")
+    if status_value == "armed":
+        marker.update(expected_identity)
+        marker["status"] = "sealed"
+        marker["sealed_at"] = utc_now()
+        atomic_json(path, marker, 0o600)
+        os.chown(path, ROOT_UID, ROOT_GID)
+        return marker
+    if status_value == "disarmed":
+        return marker
+    if status_value in {"sealed", "consumed"}:
+        if any(marker.get(key) != value for key, value in expected_identity.items()):
+            raise ReleaseError("Android release failpoint binding differs from reservation")
+        return marker
+    raise ReleaseError("Android release failpoint status is invalid")
+
+
+def consume_failpoint(request: dict, reservation: dict, journal_path: Path) -> dict | None:
+    existing = _read_failpoint(request["deployment_run_id"])
+    if existing is None:
+        return None
+    path, marker = existing
+    status_value = marker.get("status")
+    if status_value == "disarmed":
+        return None
+    expected_identity = _failpoint_identity(reservation)
+    if any(marker.get(key) != value for key, value in expected_identity.items()):
+        raise ReleaseError("Android release failpoint binding differs before consumption")
+    if status_value == "consumed":
+        return None
+    if status_value != "sealed":
+        raise ReleaseError("Android release failpoint was not sealed before publication")
+    marker["status"] = "consumed"
+    marker["consumed_at"] = utc_now()
+    marker["journal_path"] = str(journal_path)
+    atomic_json(path, marker, 0o600)
+    os.chown(path, ROOT_UID, ROOT_GID)
+    return {
+        "status": "consumed",
+        "deployment_run_id": marker["deployment_run_id"],
+        "trigger_stage": marker["trigger_stage"],
+        "consumed_at": marker["consumed_at"],
+    }
+
+
+def account_ids() -> tuple[int, int, int]:
+    try:
+        deployer_uid = pwd.getpwnam("remihub-deployer").pw_uid
+        alex_uid = pwd.getpwnam("alex").pw_uid
+        storage_gid = grp.getgrnam("storage").gr_gid
+    except KeyError as exc:
+        raise ReleaseError("required release identity is missing") from exc
+    return deployer_uid, alex_uid, storage_gid
+
+
+def require_owned_file(
+    path: Path,
+    *,
+    owner_uid: int,
+    root: Path,
+    field: str,
+) -> Path:
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ReleaseError(f"{field} is unsafe or missing")
+    if root.is_symlink() or not root.is_dir():
+        raise ReleaseError(f"{field} protected root is unsafe or missing")
+    root_stat = root.stat()
+    if root_stat.st_uid != owner_uid or stat.S_IMODE(root_stat.st_mode) & 0o022:
+        raise ReleaseError(f"{field} protected root ownership or mode is unsafe")
+    try:
+        lexical = path.relative_to(root)
+    except ValueError as exc:
+        raise ReleaseError(f"{field} is outside its protected root") from exc
+    if ".." in lexical.parts:
+        raise ReleaseError(f"{field} path escapes its protected root")
+    cursor = root
+    for component in lexical.parts[:-1]:
+        cursor = cursor / component
+        if cursor.is_symlink() or not cursor.is_dir():
+            raise ReleaseError(f"{field} has an unsafe ancestor")
+    resolved = path.resolve()
+    resolved_root = root.resolve()
+    if resolved_root not in resolved.parents:
+        raise ReleaseError(f"{field} is outside its protected root")
+    path_stat = resolved.stat()
+    if path_stat.st_uid != owner_uid or stat.S_IMODE(path_stat.st_mode) & 0o022:
+        raise ReleaseError(f"{field} ownership or mode is unsafe")
+    return resolved
+
+
+def validate_changed_files(values) -> tuple[str, ...]:
+    if not isinstance(values, list) or not values:
+        raise ReleaseError("release request changed files are invalid")
+    changed = []
+    for value in values:
+        if not isinstance(value, str) or not value or any(ord(character) < 32 for character in value):
+            raise ReleaseError("release request contains an invalid changed path")
+        pure = PurePosixPath(value)
+        if pure.is_absolute() or ".." in pure.parts:
+            raise ReleaseError("release request changed path escapes the repository")
+        allowed = (
+            value == "AGENTS.md"
+            or (
+                len(pure.parts) >= 2
+                and pure.parts[0] == "docs"
+                and pure.suffix.lower() == ".md"
+            )
+            or (
+                len(pure.parts) >= 3
+                and pure.parts[:2] == ("app", "src")
+            )
+        )
+        if not allowed:
+            raise ReleaseError(
+                "release request permits only app/src content, docs, and AGENTS.md"
+            )
+        changed.append(value)
+    normalized = tuple(sorted(changed))
+    if len(normalized) != len(set(normalized)):
+        raise ReleaseError("release request changed files contain duplicates")
+    return normalized
+
+
+
+
+def _path_status(path: Path) -> dict:
+    value = path.lstat()
+    return {
+        "path": str(path),
+        "uid": value.st_uid,
+        "gid": value.st_gid,
+        "mode": stat.S_IMODE(value.st_mode),
+        "device": value.st_dev,
+        "inode": value.st_ino,
+        "is_directory": stat.S_ISDIR(value.st_mode),
+        "is_regular": stat.S_ISREG(value.st_mode),
+        "is_symlink": stat.S_ISLNK(value.st_mode),
+    }
+
+
+def _identity_can_write(user: str, directory: Path) -> bool:
+    result = run(
+        ["runuser", "-u", user, "--", "/usr/bin/test", "-w", directory],
+        check=False,
+        timeout=30,
+    )
+    if result.returncode not in (0, 1):
+        raise ReleaseError(
+            f"cannot determine release-path write authority for {user}"
+        )
+    return result.returncode == 0
+
+
+def release_root_status() -> dict:
+    if len(RELEASE_ROOT.parents) < 2:
+        raise ReleaseError("Android release root is too shallow")
+    protected_chain = (
+        RELEASE_ROOT.parents[1],
+        RELEASE_ROOT.parent,
+        RELEASE_ROOT,
+    )
+    directories = []
+    for directory in protected_chain:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ReleaseError(
+                f"Android release path is unsafe or missing: {directory}"
+            )
+        directories.append(_path_status(directory))
+
+    writers = {
+        user: {
+            str(directory): _identity_can_write(user, directory)
+            for directory in protected_chain
+        }
+        for user in ("remihub-agent", "remihub-deployer")
+    }
+    if any(
+        allowed
+        for values in writers.values()
+        for allowed in values.values()
+    ):
+        raise ReleaseError(
+            "an Agent identity can write or replace the Android release path"
+        )
+    return {
+        "directories": directories,
+        "agent_write_access": writers,
+        "trusted_operator": "alex",
+        "permission_model": "mergerfs-fixed-identity",
+    }
+
+
+def staging_status() -> dict:
+    for directory in (STATE_ROOT, STAGING_ROOT):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ReleaseError(
+                f"protected Android staging path is unsafe or missing: {directory}"
+            )
+        value = directory.stat()
+        if (
+            value.st_uid != 0
+            or value.st_gid != 0
+            or stat.S_IMODE(value.st_mode) != 0o700
+        ):
+            raise ReleaseError(
+                f"protected Android staging ownership or mode is unsafe: {directory}"
+            )
+    return {
+        **_path_status(STAGING_ROOT),
+        "empty": next(STAGING_ROOT.iterdir(), None) is None,
+        "release_root": release_root_status(),
+        "legacy_staging_present": LEGACY_STAGING_ROOT.exists()
+        or LEGACY_STAGING_ROOT.is_symlink(),
+    }
+
+
+def prepare_staging_root() -> dict:
+    release_root_status()
+
+    if STATE_ROOT.is_symlink():
+        raise ReleaseError("Android release state root is a symlink")
+    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(STATE_ROOT, 0, 0, follow_symlinks=False)
+    os.chmod(STATE_ROOT, 0o700, follow_symlinks=False)
+
+    try:
+        staging_lstat = STAGING_ROOT.lstat()
+    except FileNotFoundError:
+        STAGING_ROOT.mkdir(mode=0o700)
+    else:
+        if stat.S_ISLNK(staging_lstat.st_mode) or not stat.S_ISDIR(
+            staging_lstat.st_mode
+        ):
+            raise ReleaseError(
+                "protected Android staging root is unsafe or missing"
+            )
+    os.chown(STAGING_ROOT, 0, 0, follow_symlinks=False)
+    os.chmod(STAGING_ROOT, 0o700, follow_symlinks=False)
+
+    if LEGACY_STAGING_ROOT.exists() or LEGACY_STAGING_ROOT.is_symlink():
+        legacy_lstat = LEGACY_STAGING_ROOT.lstat()
+        if stat.S_ISLNK(legacy_lstat.st_mode) or not stat.S_ISDIR(
+            legacy_lstat.st_mode
+        ):
+            raise ReleaseError("legacy Android staging path is unsafe")
+        if next(LEGACY_STAGING_ROOT.iterdir(), None) is not None:
+            raise ReleaseError("legacy Android staging path is not empty")
+        LEGACY_STAGING_ROOT.rmdir()
+
+    return staging_status()
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_staged_file(path: Path) -> tuple[str, int]:
+    if path.is_symlink() or not path.is_file():
+        raise ReleaseError("protected staged APK is unsafe or missing")
+    resolved_root = STAGING_ROOT.resolve()
+    resolved = path.resolve()
+    if resolved_root not in resolved.parents:
+        raise ReleaseError("protected staged APK is outside the staging root")
+    value = resolved.stat()
+    if value.st_uid != 0 or value.st_gid != 0:
+        raise ReleaseError("protected staged APK ownership is unsafe")
+    if stat.S_IMODE(value.st_mode) & 0o077:
+        raise ReleaseError("protected staged APK permissions are unsafe")
+    return sha256(resolved), value.st_size
+
+
+def atomic_publish_apk(
+    source: Path,
+    final: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    deployment_run_id: str,
+) -> bool:
+    prepare_staging_root()
+    source_sha, source_size = _validate_staged_file(source)
+    if source_sha != expected_sha256 or source_size != expected_size:
+        raise ReleaseError("protected staged APK changed before publication")
+    if final.parent != RELEASE_ROOT or final.name in ("", ".", ".."):
+        raise ReleaseError("final APK path is outside the Android release root")
+
+    if final.exists() or final.is_symlink():
+        if final.is_symlink() or not final.is_file():
+            raise ReleaseError("final APK path already exists unsafely")
+        if sha256(final) != expected_sha256 or final.stat().st_size != expected_size:
+            raise ReleaseError(
+                "final APK path already exists with different content"
+            )
+        return False
+
+    temporary = RELEASE_ROOT / f".agent-publish-{deployment_run_id}.apk.tmp"
+    if temporary.exists() or temporary.is_symlink():
+        if temporary.is_symlink() or not temporary.is_file():
+            raise ReleaseError("temporary publication path exists unsafely")
+        temporary.unlink()
+
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = None
+    created_stat = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        created_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(created_stat.st_mode):
+            raise ReleaseError("temporary publication path is not a file")
+        with source.open("rb") as incoming:
+            while True:
+                chunk = incoming.read(1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise ReleaseError("temporary APK write failed")
+                    view = view[written:]
+        os.fsync(descriptor)
+        copied = os.fstat(descriptor)
+        if copied.st_size != expected_size:
+            raise ReleaseError("temporary APK size differs after copy")
+        if _sha256_descriptor(descriptor) != expected_sha256:
+            raise ReleaseError("temporary APK hash differs after copy")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    temporary_stat = temporary.lstat()
+    if (
+        created_stat is None
+        or stat.S_ISLNK(temporary_stat.st_mode)
+        or not stat.S_ISREG(temporary_stat.st_mode)
+        or temporary_stat.st_dev != created_stat.st_dev
+        or temporary_stat.st_ino != created_stat.st_ino
+        or temporary_stat.st_size != expected_size
+        or sha256(temporary) != expected_sha256
+    ):
+        temporary.unlink(missing_ok=True)
+        raise ReleaseError("temporary APK identity changed before rename")
+
+    renamed = False
+    try:
+        os.replace(temporary, final)
+        renamed = True
+        _fsync_directory(RELEASE_ROOT)
+        if (
+            final.is_symlink()
+            or not final.is_file()
+            or final.stat().st_size != expected_size
+            or sha256(final) != expected_sha256
+        ):
+            raise ReleaseError("published APK differs after atomic rename")
+        release_root_status()
+        return True
+    except BaseException as exc:
+        cleanup_error = None
+        if renamed:
+            try:
+                if (
+                    final.exists()
+                    and not final.is_symlink()
+                    and final.is_file()
+                    and final.stat().st_size == expected_size
+                    and sha256(final) == expected_sha256
+                ):
+                    final.unlink()
+                    _fsync_directory(RELEASE_ROOT)
+                elif final.exists() or final.is_symlink():
+                    cleanup_error = (
+                        "published path changed before failure cleanup"
+                    )
+            except BaseException as cleanup_exc:
+                cleanup_error = (
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+        if cleanup_error is not None:
+            raise ReleaseError(
+                "atomic publication failed and final-path cleanup did not "
+                f"complete safely: {cleanup_error}"
+            ) from exc
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publication_probe() -> dict:
+    prepare_staging_root()
+    probe_directory = STAGING_ROOT / f"probe-{os.getpid()}"
+    if probe_directory.exists() or probe_directory.is_symlink():
+        shutil.rmtree(probe_directory, ignore_errors=False)
+    probe_directory.mkdir(mode=0o700)
+    os.chown(probe_directory, 0, 0)
+    os.chmod(probe_directory, 0o700)
+    source = probe_directory / "probe.bin"
+    payload = b"remihub-phase3b-atomic-publication-probe\n"
+    source.write_bytes(payload)
+    os.chown(source, 0, 0)
+    os.chmod(source, 0o600)
+    expected_hash = hashlib.sha256(payload).hexdigest()
+    final = RELEASE_ROOT / f".phase3b-publication-probe-{os.getpid()}.bin"
+    if final.exists() or final.is_symlink():
+        raise ReleaseError("publication probe final path already exists")
+    try:
+        created = atomic_publish_apk(
+            source,
+            final,
+            expected_sha256=expected_hash,
+            expected_size=len(payload),
+            deployment_run_id=f"probe-{os.getpid()}",
+        )
+        if not created:
+            raise ReleaseError("publication probe did not create its final path")
+        if final.read_bytes() != payload:
+            raise ReleaseError("publication probe content differs")
+        return {
+            "success": True,
+            "source_device": source.stat().st_dev,
+            "release_device": final.stat().st_dev,
+            "cross_filesystem_copy": source.stat().st_dev != final.stat().st_dev,
+            "atomic_same_directory_rename": True,
+            "release_root": release_root_status(),
+        }
+    finally:
+        final.unlink(missing_ok=True)
+        temporary = RELEASE_ROOT / f".agent-publish-probe-{os.getpid()}.apk.tmp"
+        temporary.unlink(missing_ok=True)
+        shutil.rmtree(probe_directory, ignore_errors=True)
+        _fsync_directory(RELEASE_ROOT)
+
+def ensure_ready() -> dict:
+    ready_stat = READINESS.stat() if READINESS.exists() else None
+    if (
+        ready_stat is None
+        or ready_stat.st_uid != 0
+        or ready_stat.st_mode & 0o022
+    ):
+        raise ReleaseError("Android signing readiness ownership or mode is unsafe")
+    ready = read_json(READINESS)
+    if ready.get("ready") is not True or ready.get("package_name") != EXPECTED_PACKAGE or ready.get("certificate_sha256") != EXPECTED_CERT:
+        raise ReleaseError("Android signing readiness is absent or invalid")
+    config_stat = SIGNING_CONFIG.stat() if SIGNING_CONFIG.exists() else None
+    if (
+        config_stat is None
+        or config_stat.st_uid != 0
+        or stat.S_IMODE(config_stat.st_mode) != 0o600
+    ):
+        raise ReleaseError("Android signing configuration ownership or mode is unsafe")
+    config = read_json(SIGNING_CONFIG)
+    required = ("keystore_path", "key_alias", "store_password", "key_password")
+    if any(not isinstance(config.get(name), str) or not config[name] for name in required):
+        raise ReleaseError("Android signing configuration is incomplete")
+    keystore = Path(config["keystore_path"])
+    if keystore.is_symlink() or not keystore.is_file():
+        raise ReleaseError("Android signing keystore is unsafe or missing")
+    keystore_stat = keystore.stat()
+    mode = stat.S_IMODE(keystore_stat.st_mode)
+    if keystore_stat.st_uid != 0 or keystore_stat.st_gid != 0 or mode != 0o600:
+        raise ReleaseError("Android signing keystore ownership or mode is unsafe")
+    if ready.get("keystore_sha256") != sha256(keystore):
+        raise ReleaseError("Android signing keystore changed after provisioning")
+    return config
+
+
+def git(repo: Path, *args: str, user: str | None = None, check=True):
+    command = ["git", "-c", f"safe.directory={repo.resolve()}", "-C", str(repo), *args]
+    command_env = None
+    if user:
+        try:
+            home = pwd.getpwnam(user).pw_dir
+        except KeyError as exc:
+            raise ReleaseError(f"required Git identity is missing: {user}") from exc
+        command = ["runuser", "-u", user, "--", *command]
+        command_env = {"HOME": home}
+    return run(command, check=check, timeout=300, env=command_env)
+
+
+def rev(repo: Path, ref: str) -> str:
+    value = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").stdout.strip().lower()
+    if not COMMIT_RE.fullmatch(value):
+        raise ReleaseError(f"invalid Git commit for {repo}: {ref}")
+    return value
+
+
+def db_action(action: str, payload: dict) -> dict:
+    program = r'''
+import json, sys
+import psycopg2
+request=json.load(sys.stdin)
+conn=psycopg2.connect(dbname='remihub')
+try:
+  with conn.cursor() as cur:
+    action=request['action']
+    if action == 'state':
+      cur.execute("SELECT id, platform, version_code, version_name, apk_filename, apk_relative_path, apk_sha256, file_size_bytes, is_active FROM app_release WHERE platform='android' ORDER BY created_at DESC, id DESC")
+      rows=cur.fetchall()
+      releases=[{'id':r[0],'platform':r[1],'version_code':r[2],'version_name':r[3],'apk_filename':r[4],'apk_relative_path':r[5],'apk_sha256':r[6],'file_size_bytes':r[7],'is_active':r[8]} for r in rows]
+      maximum=max((row['version_code'] for row in releases), default=0)
+      result={'active_rows':[row for row in releases if row['is_active']],'releases':releases,'max_version_code':maximum}
+      conn.rollback()
+    elif action == 'agent_context':
+      cur.execute("""
+        SELECT r.id::text, r.phase, r.status, r.card_revision,
+               c.id::text, c.status, c.repository_scope, c.base_branch,
+               a.id::text, i.id::text, i.result_metadata
+        FROM agent.runs r
+        JOIN agent.cards c ON c.id=r.card_id
+        LEFT JOIN LATERAL (
+          SELECT id FROM agent.approvals
+          WHERE card_id=c.id AND approval_type='deployment' AND decision='approved' AND card_revision=r.card_revision
+          ORDER BY created_at DESC,id DESC LIMIT 1
+        ) a ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT id,result_metadata FROM agent.runs
+          WHERE card_id=c.id AND phase='implementation' AND status='succeeded' AND card_revision=r.card_revision
+          ORDER BY created_at DESC,id DESC LIMIT 1
+        ) i ON TRUE
+        WHERE r.id=%s AND c.id=%s
+      """, (request['deployment_run_id'],request['card_id']))
+      row=cur.fetchone()
+      if row is None: raise RuntimeError('deployment run/card not found')
+      result={'deployment_run_id':row[0],'run_phase':row[1],'run_status':row[2],'card_revision':row[3],'card_id':row[4],'card_status':row[5],'repository_scope':row[6],'base_branch':row[7],'approval_id':row[8],'implementation_run_id':row[9],'implementation_result_metadata':row[10]}
+      conn.rollback()
+    elif action == 'activate':
+      cur.execute('LOCK TABLE app_release IN EXCLUSIVE MODE')
+      v=request['release']
+      cur.execute("SELECT id, version_name, apk_filename, apk_relative_path, apk_sha256, file_size_bytes FROM app_release WHERE platform='android' AND version_code=%s ORDER BY id", (v['version_code'],))
+      existing=cur.fetchall()
+      release_id=None
+      for row in existing:
+        if row[1:] == (v['version_name'],v['apk_filename'],v['apk_relative_path'],v['apk_sha256'],v['file_size_bytes']): release_id=row[0]
+        else: raise RuntimeError('versionCode already exists with different release evidence')
+      cur.execute("UPDATE app_release SET is_active=FALSE WHERE platform='android'")
+      if release_id is None:
+        cur.execute("INSERT INTO app_release(platform,version_code,version_name,apk_filename,apk_relative_path,apk_sha256,file_size_bytes,is_active) VALUES('android',%s,%s,%s,%s,%s,%s,TRUE) RETURNING id", (v['version_code'],v['version_name'],v['apk_filename'],v['apk_relative_path'],v['apk_sha256'],v['file_size_bytes']))
+        release_id=cur.fetchone()[0]
+      else:
+        cur.execute("UPDATE app_release SET is_active=TRUE WHERE id=%s", (release_id,))
+      conn.commit(); result={'release_id':release_id}
+    elif action == 'restore':
+      cur.execute('LOCK TABLE app_release IN EXCLUSIVE MODE')
+      cur.execute("UPDATE app_release SET is_active=FALSE WHERE platform='android'")
+      cur.execute("UPDATE app_release SET is_active=TRUE WHERE id=%s", (request['previous_release_id'],))
+      if cur.rowcount != 1: raise RuntimeError('previous release row missing')
+      conn.commit(); result={'restored':True}
+    else: raise RuntimeError('unknown action')
+  print(json.dumps(result,sort_keys=True))
+finally:
+  conn.close()
+'''
+    request = {"action": action, **payload}
+    result = run(
+        ["runuser", "-u", "postgres", "--", "/opt/remihub/.venv/bin/python", "-c", program],
+        input_text=json.dumps(request),
+        timeout=120,
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("database helper returned invalid JSON") from exc
+
+
+def active_state() -> dict:
+    state = db_action("state", {})
+    rows = state["active_rows"]
+    if len(rows) != 1:
+        raise ReleaseError(f"expected exactly one active Android release, found {len(rows)}")
+    state["active"] = rows[0]
+    return state
+
+
+
+
+def reconstruct_tree(base: str, patch_path: Path) -> str:
+    """Rebuild the reviewed tree from the immutable base and exact patch."""
+    with tempfile.TemporaryDirectory(prefix="remihub-android-release-tree-") as raw:
+        repository = Path(raw) / "repository"
+        run(["git", "init", "--quiet", str(repository)])
+        run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                (
+                    "--upload-pack=git -c "
+                    f"safe.directory={TARGET_REPO.resolve()} upload-pack"
+                ),
+                str(TARGET_REPO),
+                base,
+            ]
+        )
+        run(["git", "-C", str(repository), "checkout", "--quiet", "--detach", base])
+        run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "apply",
+                "--index",
+                "--binary",
+                "--whitespace=error-all",
+                str(patch_path),
+            ]
+        )
+        tree = run(["git", "-C", str(repository), "write-tree"]).stdout.strip().lower()
+    if not TREE_RE.fullmatch(tree):
+        raise ReleaseError("reviewed Android patch produced an invalid tree")
+    return tree
+
+def validate_agent_context(card_id: str, run_id: str, base: str, patch: str) -> dict:
+    context = db_action("agent_context", {"card_id": card_id, "deployment_run_id": run_id})
+    expected = {
+        "deployment_run_id": run_id,
+        "card_id": card_id,
+        "run_phase": "deployment",
+        "run_status": "running",
+        "card_status": "deploying",
+        "repository_scope": "android",
+        "base_branch": "master",
+    }
+    for field, value in expected.items():
+        if context.get(field) != value:
+            raise ReleaseError(f"Agent deployment context has unexpected {field}")
+    if not context.get("approval_id") or not context.get("implementation_run_id"):
+        raise ReleaseError("Agent deployment context lacks exact approval evidence")
+    metadata = context.get("implementation_result_metadata")
+    if not isinstance(metadata, dict) or metadata.get("phase") != "implementation" or metadata.get("repository_scope") != "android":
+        raise ReleaseError("Agent implementation evidence is invalid")
+    trusted = metadata.get("trusted_validation")
+    required_validation = {
+        "success": True,
+        "gradle_offline": True,
+        "network": "denied",
+        "protected_build_files_unchanged": True,
+    }
+    if not isinstance(trusted, dict) or any(
+        trusted.get(field) != expected
+        for field, expected in required_validation.items()
+    ):
+        raise ReleaseError("Agent implementation lacks trusted offline validation")
+    release_apk = trusted.get("release_apk")
+    if (
+        not isinstance(release_apk, dict)
+        or release_apk.get("signed") is not False
+        or release_apk.get("package_name") != EXPECTED_PACKAGE
+    ):
+        raise ReleaseError("Agent implementation release validation is invalid")
+    workspace = metadata.get("workspace")
+    if not isinstance(workspace, dict) or workspace.get("base_branch") != "master" or workspace.get("base_commit") != base:
+        raise ReleaseError("Agent implementation base evidence differs from release request")
+    patch_path = Path(str(workspace.get("artifact_patch", "")))
+    expected_patch = Path("/opt/remihub-agent/android/implementation/artifacts") / card_id / f"{context['implementation_run_id']}.patch"
+    if patch_path != expected_patch or patch_path.is_symlink() or not patch_path.is_file():
+        raise ReleaseError("Agent implementation patch path is invalid")
+    if sha256(patch_path) != patch:
+        raise ReleaseError("Agent implementation patch hash differs from release request")
+    patch_size = workspace.get("patch_size_bytes")
+    if not isinstance(patch_size, int) or patch_size < 1 or patch_path.stat().st_size != patch_size:
+        raise ReleaseError("Agent implementation patch size evidence is invalid")
+    changed_files = validate_changed_files(workspace.get("changed_files"))
+    context["implementation_patch_path"] = str(patch_path)
+    context["implementation_patch_size_bytes"] = patch_size
+    context["implementation_changed_files"] = changed_files
+    return context
+
+
+def validate_identity(card_id, run_id, candidate, base, patch):
+    if not UUID_RE.fullmatch(card_id) or not UUID_RE.fullmatch(run_id):
+        raise ReleaseError("invalid card or run id")
+    candidate=candidate.lower(); base=base.lower(); patch=patch.lower()
+    if not COMMIT_RE.fullmatch(candidate) or not COMMIT_RE.fullmatch(base) or not SHA_RE.fullmatch(patch):
+        raise ReleaseError("invalid candidate identity")
+    return candidate, base, patch
+
+
+def reserve(card_id, run_id, candidate, base, patch):
+    ensure_ready()
+    candidate, base, patch = validate_identity(card_id, run_id, candidate, base, patch)
+    context = validate_agent_context(card_id, run_id, base, patch)
+    if rev(TARGET_REPO, candidate) != candidate:
+        raise ReleaseError("Android candidate commit is unavailable")
+    if rev(TARGET_REPO, f"{candidate}^") != base:
+        raise ReleaseError("Android candidate parent differs from reviewed base")
+    candidate_tree = git(TARGET_REPO, "rev-parse", f"{candidate}^{{tree}}").stdout.strip().lower()
+    if not TREE_RE.fullmatch(candidate_tree):
+        raise ReleaseError("Android candidate tree is invalid")
+    expected_tree = reconstruct_tree(
+        base,
+        Path(context["implementation_patch_path"]),
+    )
+    if candidate_tree != expected_tree:
+        raise ReleaseError("Android candidate tree differs from the exact reviewed patch")
+    RESERVATION_ROOT.mkdir(parents=True, exist_ok=True)
+    path = RESERVATION_ROOT / f"{run_id}.json"
+    lock = STATE_ROOT / "release.lock"; STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if path.exists():
+            payload=read_json(path)
+            expected={"card_id":card_id,"deployment_run_id":run_id,"candidate_commit":candidate,"base_commit":base,"patch_sha256":patch,"expected_tree":expected_tree}
+            if any(payload.get(k)!=v for k,v in expected.items()): raise ReleaseError("existing version reservation conflicts")
+            seal_failpoint(payload)
+            return payload
+        state=active_state(); active=state["active"]
+        counter=read_json(VERSION_FILE)
+        if counter.get("version_code") != state["max_version_code"] or active["version_code"] != state["max_version_code"]:
+            raise ReleaseError("release counter, active release, and maximum versionCode are inconsistent")
+        major=counter.get("version_major"); minor=counter.get("version_minor"); patch_number=counter.get("version_patch")
+        if not all(isinstance(v,int) and v>=0 for v in (major,minor,patch_number)):
+            raise ReleaseError("release counter components are invalid")
+        payload={"schema_version":1,"card_id":card_id,"deployment_run_id":run_id,"approval_id":context["approval_id"],"implementation_run_id":context["implementation_run_id"],"card_revision":context["card_revision"],"candidate_commit":candidate,"base_commit":base,"patch_sha256":patch,"expected_tree":expected_tree,"version_code":state["max_version_code"]+1,"version_major":major,"version_minor":minor,"version_patch":patch_number+1}
+        payload["version_name"]=f"{major}.{minor}.{patch_number+1}"
+        atomic_json(path,payload,0o640)
+        seal_failpoint(payload)
+        return payload
+
+
+def parse_badging(apk: Path):
+    text=run([AAPT,"dump","badging",apk]).stdout
+    first=text.splitlines()[0] if text.splitlines() else ""
+    match=re.search(r"name='([^']+)' versionCode='([^']+)' versionName='([^']+)'",first)
+    if not match: raise ReleaseError("cannot parse APK badging")
+    return match.group(1),int(match.group(2)),match.group(3)
+
+
+def request_path(raw: str) -> Path:
+    deployer_uid, _, _ = account_ids()
+    return require_owned_file(
+        Path(raw),
+        owner_uid=deployer_uid,
+        root=ARTIFACT_ROOT,
+        field="release request",
+    )
+
+
+def load_request(raw: str):
+    path = request_path(raw)
+    request = read_json(path)
+    if request.get("schema_version") != 1 or request.get("mode") != "protected-android-release":
+        raise ReleaseError("unsupported release request")
+    if request.get("package_name") != EXPECTED_PACKAGE or request.get("certificate_sha256") != EXPECTED_CERT:
+        raise ReleaseError("release request identity mismatch")
+    if request.get("target_branch") != TARGET_BRANCH:
+        raise ReleaseError("release request target branch is unexpected")
+    candidate_branch = request.get("candidate_branch")
+    if not isinstance(candidate_branch, str) or not BRANCH_RE.fullmatch(candidate_branch):
+        raise ReleaseError("release request candidate branch is invalid")
+    changed_files = validate_changed_files(request.get("changed_files"))
+    request["changed_files"] = list(changed_files)
+    card = request.get("card_id")
+    run_id = request.get("deployment_run_id")
+    candidate = request.get("candidate_commit")
+    base = request.get("base_commit")
+    patch = request.get("patch_sha256")
+    candidate, base, patch = validate_identity(card, run_id, candidate, base, patch)
+    if not TREE_RE.fullmatch(str(request.get("expected_tree", ""))):
+        raise ReleaseError("release request expected tree is invalid")
+    version = request.get("version")
+    if not isinstance(version, dict):
+        raise ReleaseError("release request version is invalid")
+    reservation = read_json(RESERVATION_ROOT / f"{run_id}.json")
+    direct_fields = (
+        "card_id",
+        "deployment_run_id",
+        "approval_id",
+        "implementation_run_id",
+        "card_revision",
+        "candidate_commit",
+        "base_commit",
+        "patch_sha256",
+        "expected_tree",
+    )
+    for key in direct_fields:
+        if reservation.get(key) != request.get(key):
+            raise ReleaseError(f"release request conflicts with reservation on {key}")
+    for key in (
+        "version_code",
+        "version_major",
+        "version_minor",
+        "version_patch",
+        "version_name",
+    ):
+        if reservation.get(key) != version.get(key):
+            raise ReleaseError(f"release request conflicts with reservation on {key}")
+    context = validate_agent_context(card, run_id, base, patch)
+    for key in ("approval_id", "implementation_run_id", "card_revision"):
+        if context.get(key) != reservation.get(key):
+            raise ReleaseError(f"Agent deployment context changed on {key}")
+    if context["implementation_patch_size_bytes"] != request.get("patch_size_bytes"):
+        raise ReleaseError("release request patch size differs from reviewed evidence")
+    if context["implementation_changed_files"] != changed_files:
+        raise ReleaseError("release request changed files differ from reviewed evidence")
+    return path, request, reservation
+
+
+def validate_candidate(request):
+    candidate=request["candidate_commit"].lower(); base=request["base_commit"].lower()
+    if rev(TARGET_REPO,candidate)!=candidate: raise ReleaseError("candidate commit missing")
+    if rev(TARGET_REPO,f"{candidate}^")!=base: raise ReleaseError("candidate parent mismatch")
+    if rev(TARGET_REPO,TARGET_BRANCH)!=base: raise ReleaseError("Android deployment target advanced")
+    candidate_tree=git(TARGET_REPO,"rev-parse",f"{candidate}^{{tree}}").stdout.strip().lower()
+    if candidate_tree != request.get("expected_tree"): raise ReleaseError("candidate tree differs from reviewed tree")
+    changed=tuple(sorted(filter(None,git(TARGET_REPO,"diff-tree","--no-commit-id","--name-only","-r",candidate).stdout.splitlines())))
+    if changed!=tuple(request["changed_files"]): raise ReleaseError("candidate changed files differ from approval")
+    validate_changed_files(list(changed))
+    for relative in changed:
+        entry = git(TARGET_REPO, "ls-tree", candidate, "--", relative).stdout.strip()
+        if entry:
+            mode = entry.split(maxsplit=1)[0]
+            if mode not in {"100644", "100755"}:
+                raise ReleaseError("candidate contains a non-regular changed path")
+    worktree=Path(request["candidate_worktree"]).resolve()
+    if worktree.parent != Path("/opt/remihub-agent/android/deployment/worktrees") or rev(worktree,"HEAD")!=candidate: raise ReleaseError("candidate worktree mismatch")
+    if git(worktree,"status","--porcelain=v1","--untracked-files=all").stdout.strip(): raise ReleaseError("candidate worktree is not clean")
+
+
+def validate_unsigned(request):
+    evidence = request.get("unsigned_apk")
+    if not isinstance(evidence, dict):
+        raise ReleaseError("unsigned APK evidence is invalid")
+    deployer_uid, _, _ = account_ids()
+    apk = require_owned_file(
+        Path(str(evidence.get("path", ""))),
+        owner_uid=deployer_uid,
+        root=ARTIFACT_ROOT,
+        field="unsigned APK",
+    )
+    if sha256(apk)!=evidence.get("sha256") or apk.stat().st_size!=evidence.get("size_bytes"): raise ReleaseError("unsigned APK evidence mismatch")
+    package,code,name=parse_badging(apk); version=request["version"]
+    if (package,code,name)!=(EXPECTED_PACKAGE,version["version_code"],version["version_name"]): raise ReleaseError("unsigned APK identity mismatch")
+    run([ZIPALIGN,"-c","-p","-v","4",apk])
+    if run([APKSIGNER,"verify",apk],check=False).returncode==0: raise ReleaseError("unsigned APK is unexpectedly signed")
+    return apk
+
+
+def certificate_sha(apk: Path):
+    output=run([APKSIGNER,"verify","--verbose","--print-certs",apk]).stdout
+    if "Verified using v2 scheme (APK Signature Scheme v2): true" not in output:
+        raise ReleaseError("APK Signature Scheme v2 verification did not pass")
+    if re.search(r"Signer #2 certificate", output):
+        raise ReleaseError("published APK has more than one signer")
+    match=re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+)",output)
+    if not match: raise ReleaseError("cannot parse signing certificate")
+    return match.group(1).lower()
+
+
+def http_response(url: str, *, timeout: int = 15):
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return (
+                int(response.status),
+                {
+                    str(key).lower(): str(value)
+                    for key, value in response.headers.items()
+                },
+                response.read(),
+            )
+    except urllib.error.HTTPError as exc:
+        return (
+            int(exc.code),
+            {
+                str(key).lower(): str(value)
+                for key, value in exc.headers.items()
+            },
+            exc.read(),
+        )
+
+
+def verify_authenticated_update_boundary(release_id: int):
+    if not isinstance(release_id, int) or release_id <= 0:
+        raise ReleaseError("release id is invalid for HTTP verification")
+
+    openapi_status, _, openapi_body = http_response(
+        "http://127.0.0.1:8000/openapi.json",
+        timeout=15,
+    )
+    if openapi_status != 200:
+        raise ReleaseError(
+            f"OpenAPI health verification failed with HTTP {openapi_status}"
+        )
+    try:
+        openapi = json.loads(openapi_body.decode())
+    except Exception as exc:
+        raise ReleaseError("OpenAPI response is not valid JSON") from exc
+    paths = openapi.get("paths")
+    if not isinstance(paths, dict):
+        raise ReleaseError("OpenAPI response omitted paths")
+    for required_path in (
+        "/app-update/latest",
+        "/app-update/download/{release_id}",
+    ):
+        if required_path not in paths:
+            raise ReleaseError(
+                f"OpenAPI omitted required update path: {required_path}"
+            )
+
+    checks = (
+        (
+            "latest",
+            "http://127.0.0.1:8000/"
+            "app-update/latest?platform=android",
+        ),
+        (
+            "download",
+            "http://127.0.0.1:8000/"
+            f"app-update/download/{release_id}",
+        ),
+    )
+    result = {"openapi_status": openapi_status}
+    for label, url in checks:
+        status, headers, _ = http_response(url, timeout=15)
+        if status != 401:
+            raise ReleaseError(
+                f"unauthenticated app-update {label} route returned "
+                f"HTTP {status}; expected 401"
+            )
+        authenticate = headers.get("www-authenticate", "")
+        if "bearer" not in authenticate.lower():
+            raise ReleaseError(
+                f"unauthenticated app-update {label} route omitted "
+                "the Bearer authentication challenge"
+            )
+        result[f"{label}_unauthenticated_status"] = status
+        result[f"{label}_authentication_challenge"] = "Bearer"
+
+    return result
+
+
+def set_ref(repo: Path, ref: str, new: str, old: str | None=None, user: str | None=None):
+    args=["update-ref",ref,new]
+    if old: args.append(old)
+    git(repo,*args,user=user)
+
+
+def source_transfer_bundles(candidate_branch: str) -> tuple[Path, Path]:
+    if not BRANCH_RE.fullmatch(candidate_branch):
+        raise ReleaseError("Android candidate branch is invalid")
+    transfer_root = Path(tempfile.mkdtemp(prefix="remihub-android-source-transfer-"))
+    try:
+        # The directory is traversable but not listable. Each repository owner
+        # receives a distinct read-only bundle, so no transfer artifact is ever
+        # readable by unrelated local identities.
+        os.chmod(transfer_root, 0o711)
+        root_bundle = transfer_root / "candidate.root.bundle"
+        git(
+            TARGET_REPO,
+            "bundle",
+            "create",
+            str(root_bundle),
+            f"refs/heads/{candidate_branch}",
+        )
+        os.chown(root_bundle, 0, 0)
+        os.chmod(root_bundle, 0o600)
+
+        bundles = []
+        for filename, username in (
+            ("candidate.alex.bundle", "alex"),
+            ("candidate.agent.bundle", "remihub-agent"),
+        ):
+            account = pwd.getpwnam(username)
+            destination = transfer_root / filename
+            shutil.copyfile(root_bundle, destination)
+            os.chown(destination, account.pw_uid, account.pw_gid)
+            os.chmod(destination, 0o400)
+            if sha256(destination) != sha256(root_bundle):
+                raise ReleaseError("Android source transfer bundle copy changed")
+            bundles.append(destination)
+        root_bundle.unlink()
+        return bundles[0], bundles[1]
+    except Exception:
+        shutil.rmtree(transfer_root, ignore_errors=True)
+        raise
+
+
+def sync_sources(candidate, base, candidate_branch):
+    # The deployer-only target repository is intentionally unreadable by alex
+    # and remihub-agent. Root creates two byte-identical owner-specific bundles,
+    # lets each repository owner import only its own mode-0400 copy, and removes
+    # both before returning. Repository ACLs remain unchanged.
+    set_ref(
+        TARGET_REPO,
+        f"refs/heads/{TARGET_BRANCH}",
+        candidate,
+        base,
+        user="remihub-deployer",
+    )
+    alex_bundle, agent_bundle = source_transfer_bundles(candidate_branch)
+    transfer_root = alex_bundle.parent
+    try:
+        source_ref = f"refs/heads/{candidate_branch}"
+        git(
+            CANONICAL_REPO,
+            "fetch",
+            "--no-tags",
+            str(alex_bundle),
+            source_ref,
+            user="alex",
+        )
+        set_ref(
+            CANONICAL_REPO,
+            "refs/heads/master",
+            candidate,
+            base,
+            user="alex",
+        )
+        git(CANONICAL_REPO, "reset", "--hard", candidate, user="alex")
+        git(
+            IMPLEMENTATION_REPO,
+            "fetch",
+            "--no-tags",
+            str(agent_bundle),
+            source_ref,
+            user="remihub-agent",
+        )
+        set_ref(
+            IMPLEMENTATION_REPO,
+            "refs/heads/master",
+            candidate,
+            base,
+            user="remihub-agent",
+        )
+    finally:
+        shutil.rmtree(transfer_root, ignore_errors=True)
+    run(
+        ["systemctl", "start", "remihub-agent-planning-sync.service"],
+        timeout=180,
+    )
+    planning = Path("/opt/remihub-agent/planning/android")
+    if not planning.is_dir() or rev(planning, "HEAD") != candidate:
+        raise ReleaseError("Android planning checkout did not synchronize")
+
+
+def restore_sources(base, candidate):
+    if rev(TARGET_REPO, TARGET_BRANCH) == candidate:
+        set_ref(
+            TARGET_REPO,
+            f"refs/heads/{TARGET_BRANCH}",
+            base,
+            candidate,
+            user="remihub-deployer",
+        )
+    if rev(CANONICAL_REPO, "master") == candidate:
+        set_ref(
+            CANONICAL_REPO,
+            "refs/heads/master",
+            base,
+            candidate,
+            user="alex",
+        )
+        git(CANONICAL_REPO, "reset", "--hard", base, user="alex")
+    if rev(IMPLEMENTATION_REPO, "master") == candidate:
+        set_ref(
+            IMPLEMENTATION_REPO,
+            "refs/heads/master",
+            base,
+            candidate,
+            user="remihub-agent",
+        )
+    run(
+        ["systemctl", "start", "remihub-agent-planning-sync.service"],
+        timeout=180,
+    )
+    planning = Path("/opt/remihub-agent/planning/android")
+    if not planning.is_dir() or rev(planning, "HEAD") != base:
+        raise ReleaseError("Android planning checkout did not restore")
+
+
+def evidence(journal):
+    release=journal["release"]
+    return {"status":"succeeded","release_id":journal["release_id"],"apk_filename":release["apk_filename"],"apk_relative_path":release["apk_relative_path"],"apk_sha256":release["apk_sha256"],"file_size_bytes":release["file_size_bytes"],"package_name":EXPECTED_PACKAGE,"version_code":release["version_code"],"version_name":release["version_name"],"certificate_sha256":EXPECTED_CERT,"candidate_commit":journal["candidate_commit"],"previous_commit":journal["base_commit"],"journal_path":journal["journal_path"]}
+
+
+def verify_publish(request_path_raw):
+    _, request, _ = load_request(request_path_raw)
+    journal = read_json(JOURNAL_ROOT / f"{request['deployment_run_id']}.json")
+    if journal.get("status") != "succeeded":
+        raise ReleaseError("release journal is not successful")
+    release = journal.get("release")
+    if not isinstance(release, dict):
+        raise ReleaseError("release journal evidence is invalid")
+    final = RELEASE_ROOT / str(release.get("apk_filename", ""))
+    if final.is_symlink() or not final.is_file():
+        raise ReleaseError("published APK is unsafe or missing")
+    if sha256(final) != release.get("apk_sha256") or final.stat().st_size != release.get("file_size_bytes"):
+        raise ReleaseError("published APK no longer matches journal")
+    run([ZIPALIGN, "-c", "-p", "-v", "4", final])
+    certificate = certificate_sha(final)
+    package, version_code, version_name = parse_badging(final)
+    if (
+        certificate != EXPECTED_CERT
+        or package != EXPECTED_PACKAGE
+        or version_code != release.get("version_code")
+        or version_name != release.get("version_name")
+    ):
+        raise ReleaseError("published APK identity no longer matches journal")
+    candidate = request["candidate_commit"]
+    if (
+        rev(TARGET_REPO, TARGET_BRANCH) != candidate
+        or rev(CANONICAL_REPO, "master") != candidate
+        or rev(IMPLEMENTATION_REPO, "master") != candidate
+    ):
+        raise ReleaseError("published source refs no longer match")
+    planning = Path("/opt/remihub-agent/planning/android")
+    if not planning.is_dir() or rev(planning, "HEAD") != candidate:
+        raise ReleaseError("published planning source no longer matches")
+    state = active_state()
+    active = state["active"]
+    if (
+        active.get("id") != journal.get("release_id")
+        or active.get("version_code") != release.get("version_code")
+        or active.get("apk_sha256") != release.get("apk_sha256")
+        or active.get("file_size_bytes") != release.get("file_size_bytes")
+    ):
+        raise ReleaseError("active release database row no longer matches journal")
+    verify_authenticated_update_boundary(journal.get("release_id"))
+    return evidence(journal)
+
+
+def publish(request_path_raw):
+    config=ensure_ready(); path,request,reservation=load_request(request_path_raw)
+    JOURNAL_ROOT.mkdir(parents=True,exist_ok=True); journal_path=JOURNAL_ROOT/f"{request['deployment_run_id']}.json"
+    lock=STATE_ROOT/"release.lock"; STATE_ROOT.mkdir(parents=True,exist_ok=True)
+    with lock.open("a+") as handle:
+      fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
+      if journal_path.exists() and read_json(journal_path).get("status")=="succeeded": return verify_publish(str(path))
+      validate_candidate(request); unsigned=validate_unsigned(request); state=active_state(); previous=state["active"]
+      if state["max_version_code"] > reservation["version_code"]:
+        raise ReleaseError("reserved versionCode is no longer monotonic")
+      if state["max_version_code"] == reservation["version_code"]:
+        existing=[r for r in state["releases"] if r["version_code"]==reservation["version_code"]]
+        if not existing: raise ReleaseError("reserved versionCode evidence is missing")
+      RELEASE_ROOT.mkdir(parents=True,exist_ok=True)
+      prepare_staging_root()
+      staging=STAGING_ROOT/request["deployment_run_id"]
+      if staging.exists() or staging.is_symlink():
+        shutil.rmtree(staging, ignore_errors=False)
+      staging.mkdir(mode=0o700)
+      signed=staging/"signed.apk"; final_name=f"remihub-v{reservation['version_code']}-{reservation['version_name']}.apk"; final=RELEASE_ROOT/final_name
+      env={"KS_PASS":config["store_password"],"KEY_PASS":config["key_password"]}
+      try:
+        run([APKSIGNER,"sign","--ks",config["keystore_path"],"--ks-key-alias",config["key_alias"],"--ks-pass","env:KS_PASS","--key-pass","env:KEY_PASS","--out",signed,unsigned],env=env,timeout=300)
+        os.chown(signed,0,0); os.chmod(signed,0o600)
+        run([ZIPALIGN,"-c","-p","-v","4",signed]); cert=certificate_sha(signed)
+        package,code,name=parse_badging(signed)
+        if cert!=EXPECTED_CERT or (package,code,name)!=(EXPECTED_PACKAGE,reservation["version_code"],reservation["version_name"]): raise ReleaseError("signed APK verification failed")
+        signed_hash=sha256(signed); signed_size=signed.stat().st_size
+      except Exception:
+        shutil.rmtree(staging,ignore_errors=True)
+        raise
+      release={"version_code":code,"version_name":name,"apk_filename":final_name,"apk_relative_path":f"releases/android/{final_name}","apk_sha256":signed_hash,"file_size_bytes":signed_size}
+      old_counter=read_json(VERSION_FILE)
+      version_stat=VERSION_FILE.stat()
+      journal={"schema_version":1,"status":"running","journal_path":str(journal_path),"request_path":str(path),"candidate_commit":request["candidate_commit"],"base_commit":request["base_commit"],"previous_release":previous,"previous_counter":old_counter,"release":release,"final_created":False,"database_activated":False,"sources_promoted":False}
+      atomic_json(journal_path,journal,0o600)
+      try:
+        journal["final_created"] = atomic_publish_apk(
+          signed,
+          final,
+          expected_sha256=signed_hash,
+          expected_size=signed_size,
+          deployment_run_id=request["deployment_run_id"],
+        )
+        atomic_json(journal_path,journal,0o600)
+        result=db_action("activate",{"release":release}); journal["release_id"]=result["release_id"]; journal["database_activated"]=True; atomic_json(journal_path,journal,0o600)
+        atomic_version({"version_code":code,"version_major":reservation["version_major"],"version_minor":reservation["version_minor"],"version_patch":reservation["version_patch"]}, owner_uid=version_stat.st_uid, group_gid=version_stat.st_gid, mode=stat.S_IMODE(version_stat.st_mode))
+        sync_sources(request["candidate_commit"],request["base_commit"],request["candidate_branch"]); journal["sources_promoted"]=True; atomic_json(journal_path,journal,0o600)
+        controlled_failpoint = consume_failpoint(request, reservation, journal_path)
+        if controlled_failpoint is not None:
+          journal["controlled_failpoint"] = controlled_failpoint
+          atomic_json(journal_path,journal,0o600)
+          raise ReleaseError(
+            "controlled Android release failpoint triggered after source promotion before endpoint verification"
+          )
+        activated=active_state()["active"]
+        endpoint_expected={
+          "id":journal["release_id"],
+          "platform":"android",
+          "version_code":code,
+          "version_name":name,
+          "apk_filename":final_name,
+          "apk_relative_path":release["apk_relative_path"],
+          "apk_sha256":signed_hash,
+          "file_size_bytes":signed_size,
+          "is_active":True,
+        }
+        if any(activated.get(key)!=value for key,value in endpoint_expected.items()):
+          raise ReleaseError("active release database verification failed")
+        if final.is_symlink() or not final.is_file():
+          raise ReleaseError("published APK is unsafe or missing")
+        if sha256(final)!=signed_hash or final.stat().st_size!=signed_size:
+          raise ReleaseError("published APK no longer matches signed release")
+        run([ZIPALIGN,"-c","-p","-v","4",final])
+        if certificate_sha(final)!=EXPECTED_CERT:
+          raise ReleaseError("published APK certificate verification failed")
+        package_check,code_check,name_check=parse_badging(final)
+        if (package_check,code_check,name_check)!=(EXPECTED_PACKAGE,code,name):
+          raise ReleaseError("published APK identity verification failed")
+        journal["http_verification"]=verify_authenticated_update_boundary(
+          journal["release_id"]
+        )
+        journal["status"]="succeeded"; atomic_json(journal_path,journal,0o600); shutil.rmtree(staging,ignore_errors=True); return evidence(journal)
+      except Exception as exc:
+        errors=[]
+        try: restore_sources(request["base_commit"],request["candidate_commit"])
+        except Exception as rollback: errors.append(f"sources: {rollback}")
+        if journal.get("database_activated"):
+          try: db_action("restore",{"previous_release_id":previous["id"]})
+          except Exception as rollback: errors.append(f"database: {rollback}")
+        try:
+          atomic_version(
+            old_counter,
+            owner_uid=version_stat.st_uid,
+            group_gid=version_stat.st_gid,
+            mode=stat.S_IMODE(version_stat.st_mode),
+          )
+        except Exception as rollback: errors.append(f"counter: {rollback}")
+        if journal.get("final_created"):
+          try: final.unlink(missing_ok=True)
+          except Exception as rollback: errors.append(f"apk: {rollback}")
+        journal["status"]="rollback_failed" if errors else "rolled_back"; journal["message"]=f"Android release failed and was rolled back: {exc}"; journal["rollback_errors"]=errors; atomic_json(journal_path,journal,0o600)
+        shutil.rmtree(staging,ignore_errors=True)
+        print(json.dumps({"status":journal["status"],"message":journal["message"],"journal_path":str(journal_path)},sort_keys=True))
+        raise SystemExit(2 if not errors else 3)
+
+
+def main():
+    if os.geteuid()!=0: raise ReleaseError("must run as root")
+    if len(sys.argv)<2: raise ReleaseError("operation required")
+    operation=sys.argv[1]
+    if operation=="reserve" and len(sys.argv)==7: result=reserve(*sys.argv[2:])
+    elif operation=="publish" and len(sys.argv)==3: result=publish(sys.argv[2])
+    elif operation=="verify" and len(sys.argv)==3: result=verify_publish(sys.argv[2])
+    elif operation=="prepare-staging" and len(sys.argv)==2: result=prepare_staging_root()
+    elif operation=="staging-status" and len(sys.argv)==2: result=staging_status()
+    elif operation=="release-root-status" and len(sys.argv)==2: result=release_root_status()
+    elif operation=="publication-probe" and len(sys.argv)==2: result=publication_probe()
+    else: raise ReleaseError("invalid operation or arguments")
+    print(json.dumps(result,sort_keys=True))
+
+
+if __name__=="__main__":
+    try:
+        main()
+    except ReleaseError as exc:
+        print(json.dumps({"status":"failed","message":str(exc)},sort_keys=True))
+        raise SystemExit(1)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "message": f"unexpected protected release failure: {type(exc).__name__}",
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)

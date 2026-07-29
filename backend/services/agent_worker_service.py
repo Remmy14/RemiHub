@@ -723,6 +723,9 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
             if completed_scope is not None:
                 card_assignments.append("repository_scope = %s")
                 card_values.append(completed_scope.value)
+                if completed_scope is RepositoryScope.ANDROID:
+                    card_assignments.append("base_branch = %s")
+                    card_values.append("master")
             card_values.append(claim.card_id)
             cur.execute(
                 f"""
@@ -741,6 +744,8 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
             }
             if completed_scope is not None:
                 event_payload["repository_scope"] = completed_scope.value
+                if completed_scope is RepositoryScope.ANDROID:
+                    event_payload["base_branch"] = "master"
             _insert_event(
                 cur,
                 card_id=claim.card_id,

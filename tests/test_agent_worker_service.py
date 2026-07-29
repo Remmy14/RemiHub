@@ -403,6 +403,64 @@ class RunCompletionTests(unittest.TestCase):
         connection.commit.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_android_planning_success_sets_master_base_branch_atomically(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        lock_owned_run.return_value = {
+            "card_status": "planning",
+            "phase": "planning",
+            "repository_scope": "auto",
+        }
+        insert_message.return_value = "message-id"
+        claim = claimed_run()
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="Android plan ready",
+                card_status=CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+                repository_scope=RepositoryScope.ANDROID,
+                metadata={"executor": "codex_planning"},
+            ),
+        )
+
+        card_update_sql, card_update_parameters = cursor.execute.call_args_list[1].args
+        self.assertIn("repository_scope = %s", card_update_sql)
+        self.assertIn("base_branch = %s", card_update_sql)
+        self.assertEqual(
+            card_update_parameters,
+            (
+                "awaiting_implementation_approval",
+                "android",
+                "master",
+                claim.card_id,
+            ),
+        )
+        insert_event.assert_called_once()
+        self.assertEqual(
+            insert_event.call_args.kwargs["payload"]["repository_scope"],
+            "android",
+        )
+        self.assertEqual(
+            insert_event.call_args.kwargs["payload"]["base_branch"],
+            "master",
+        )
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
     def test_planning_success_rejects_unresolved_repository_scope(self):
         with self.assertRaisesRegex(AgentQueueStateError, "resolved"):
             complete_run(

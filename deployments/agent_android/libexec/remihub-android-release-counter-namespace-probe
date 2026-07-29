@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+
+COUNTER = Path("/opt/remihub/deployments/release_version.json")
+
+
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def probe(counter: Path) -> None:
+    if os.geteuid() != 0:
+        raise RuntimeError("release-counter namespace probe must run as root")
+    if counter.is_symlink() or not counter.is_file():
+        raise RuntimeError(f"counter is missing, unsafe, or not regular: {counter}")
+
+    counter_stat = counter.stat()
+    if not stat.S_ISREG(counter_stat.st_mode):
+        raise RuntimeError("counter is not a regular file")
+
+    parent = counter.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise RuntimeError(f"counter parent is unsafe: {parent}")
+
+    before = digest(counter)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=parent,
+            prefix=".release-counter-namespace-probe.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(b"remihub release counter namespace probe\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        with temporary.open("rb") as source:
+            if source.read() != b"remihub release counter namespace probe\n":
+                raise RuntimeError("probe readback mismatch")
+        temporary.unlink()
+        temporary = None
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    after = digest(counter)
+    if after != before:
+        raise RuntimeError("release counter changed during namespace probe")
+    print("release_counter_namespace_probe=passed")
+    print(f"release_counter_sha256={after}")
+
+
+def self_test() -> int:
+    import tempfile as temporary_module
+
+    if os.geteuid() == 0:
+        # The normal package self-test does not need root. A root process may
+        # still exercise the logic against a temporary path.
+        pass
+
+    with temporary_module.TemporaryDirectory(
+        prefix="remihub-counter-probe-self-test-"
+    ) as raw:
+        root = Path(raw)
+        counter = root / "release_version.json"
+        counter.write_text(
+            '{"version_code":64,"version_major":0,'
+            '"version_minor":8,"version_patch":10}\n',
+            encoding="utf-8",
+        )
+        before = digest(counter)
+
+        # Reproduce the write lifecycle without the production root guard.
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=root,
+                prefix=".release-counter-namespace-probe.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(b"probe\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.unlink()
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+        if digest(counter) != before:
+            raise RuntimeError("self-test counter changed")
+        leftovers = list(root.glob(".release-counter-namespace-probe.*"))
+        if leftovers:
+            raise RuntimeError(f"self-test left temporary files: {leftovers!r}")
+
+    print("release_counter_probe_self_test=passed")
+    return 0
+
+
+def main() -> int:
+    if "--help" in sys.argv:
+        print(
+            "Usage: remihub-android-release-counter-namespace-probe "
+            "[--self-test]"
+        )
+        return 0
+    if "--self-test" in sys.argv:
+        return self_test()
+    probe(COUNTER)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
