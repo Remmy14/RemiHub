@@ -2197,7 +2197,7 @@ class GitBackendDeploymentManager:
             environment.update(environment_overrides)
         try:
             result = subprocess.run(
-                [self.git_binary, "-C", str(repository), *arguments],
+                _exact_git_command(self.git_binary, repository, arguments),
                 check=False,
                 capture_output=True,
                 encoding="utf-8",
@@ -2226,7 +2226,7 @@ class GitBackendDeploymentManager:
     ) -> subprocess.CompletedProcess[bytes]:
         try:
             result = subprocess.run(
-                [self.git_binary, "-C", str(repository), *arguments],
+                _exact_git_command(self.git_binary, repository, arguments),
                 check=False,
                 capture_output=True,
                 env=self._git_environment(),
@@ -2237,6 +2237,22 @@ class GitBackendDeploymentManager:
         if result.returncode not in allowed_return_codes:
             raise AgentDeploymentError(error_context)
         return result
+
+
+def _exact_git_command(
+    git_binary: str,
+    repository: Path,
+    arguments: Sequence[str],
+) -> list[str]:
+    resolved_repository = repository.resolve()
+    return [
+        git_binary,
+        "-c",
+        f"safe.directory={resolved_repository}",
+        "-C",
+        str(resolved_repository),
+        *arguments,
+    ]
 
 
 class GitBackendDeploymentExecutor:

@@ -1,0 +1,13 @@
+[Unit]
+Description=RemiHub Android Deployment Queue Fallback Trigger
+Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=remihub-agent-android-deployment.service
+
+[Install]
+WantedBy=timers.target

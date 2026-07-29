@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from psycopg2 import errors
 
+from backend.core.agent_deployment_trigger import (
+    AgentDeploymentTriggerError,
+    trigger_deployment_worker,
+)
 from backend.core.agent_state import (
     ALLOWED_CARD_TRANSITIONS,
     CardStatus,
@@ -27,6 +32,9 @@ ANDROID_DEPLOYMENT_READINESS_PATH = Path(
     "/var/lib/remihub-agent/phase3b/android-signing-ready.json"
 )
 EXPECTED_ANDROID_PACKAGE_NAME = "com.alex.remihub"
+logger = logging.getLogger("remihub.agent_service")
+
+
 EXPECTED_ANDROID_CERTIFICATE_SHA256 = (
     "029cc5d06bd10e1d07a56834dd45326c9762f6263c5835244bcaf4a6a6a6e03d"
 )
@@ -177,6 +185,19 @@ def _decorate_card(card: dict, *, latest_run: dict | None = None) -> dict:
     result["latest_run"] = _latest_run_summary(latest_run)
     result["allowed_actions"] = _allowed_actions(result)
     return result
+
+
+def _request_deployment_worker(scope: RepositoryScope) -> None:
+    try:
+        trigger_deployment_worker(scope)
+    except AgentDeploymentTriggerError:
+        # Approval/retry has already committed. Keep the run queued so the
+        # systemd fallback timer can claim it, while retaining an actionable
+        # server-side error for operators.
+        logger.exception(
+            "Deployment worker immediate trigger failed; fallback timer will retry: scope=%s",
+            scope.value,
+        )
 
 def _required_text(value: str, *, field: str, maximum: int) -> str:
     normalized = value.strip()
@@ -996,7 +1017,6 @@ def approve_deployment(
 
         result = _card_detail(conn, card_id)
         conn.commit()
-        return result
     except errors.UniqueViolation as exc:
         conn.rollback()
         raise _unique_violation_error(exc) from exc
@@ -1005,6 +1025,9 @@ def approve_deployment(
         raise
     finally:
         put_db_conn(conn)
+
+    _request_deployment_worker(repository_scope)
+    return result
 
 
 def retry_card(
@@ -1015,6 +1038,7 @@ def retry_card(
 ) -> dict:
     notes = _optional_text(notes, field="notes", maximum=2000)
 
+    deployment_trigger_scope: RepositoryScope | None = None
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1093,6 +1117,7 @@ def retry_card(
                     raise AgentStateConflictError(
                         "Deployment retry requires an existing approval for this revision"
                     )
+                deployment_trigger_scope = repository_scope
 
             run_id = _insert_run(
                 cur,
@@ -1129,7 +1154,6 @@ def retry_card(
 
         result = _card_detail(conn, card_id)
         conn.commit()
-        return result
     except errors.UniqueViolation as exc:
         conn.rollback()
         raise _unique_violation_error(exc) from exc
@@ -1138,6 +1162,10 @@ def retry_card(
         raise
     finally:
         put_db_conn(conn)
+
+    if deployment_trigger_scope is not None:
+        _request_deployment_worker(deployment_trigger_scope)
+    return result
 
 
 def cancel_card(

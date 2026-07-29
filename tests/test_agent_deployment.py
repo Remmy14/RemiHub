@@ -549,6 +549,38 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             "/opt/remihub-agent/deployment/config/git-safe-directory.ini",
         )
 
+    def test_git_commands_add_exact_dynamic_repository_safe_directory(self):
+        from backend.core.agent_deployment import _exact_git_command
+
+        repository = self.source_worktrees / "card-dynamic-worktree"
+        repository.mkdir()
+        resolved = repository.resolve()
+        command = _exact_git_command(
+            "git", repository, ("status", "--porcelain=v1")
+        )
+
+        self.assertEqual(
+            command[:5],
+            ["git", "-c", f"safe.directory={resolved}", "-C", str(resolved)],
+        )
+        self.assertNotIn("safe.directory=*", command)
+
+    def test_git_byte_commands_add_exact_dynamic_repository_safe_directory(self):
+        from backend.core.agent_deployment import _exact_git_command
+
+        repository = self.source_worktrees / "card-dynamic-byte-worktree"
+        repository.mkdir()
+        resolved = repository.resolve()
+        command = _exact_git_command(
+            "git", repository, ("show", "HEAD:file.bin")
+        )
+
+        self.assertEqual(
+            command[:5],
+            ["git", "-c", f"safe.directory={resolved}", "-C", str(resolved)],
+        )
+        self.assertNotIn("safe.directory=*", command)
+
     def test_backend_candidate_runs_validation_and_promotes_exact_commit(self):
         claim = self._prepare_deployment(
             {"backend/example.py": "VALUE = 2\n"}

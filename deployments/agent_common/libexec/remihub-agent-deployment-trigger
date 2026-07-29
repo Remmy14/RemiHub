@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+
+UNITS = {
+    "backend": "remihub-agent-deployment-production.service",
+    "android": "remihub-agent-android-deployment.service",
+}
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("deployment trigger must run as root", file=sys.stderr)
+        return 77
+    if len(sys.argv) != 2 or sys.argv[1] not in UNITS:
+        print("usage: remihub-agent-deployment-trigger {backend|android}", file=sys.stderr)
+        return 64
+
+    scope = sys.argv[1]
+    unit = UNITS[scope]
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "--no-block", "start", unit],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={
+            "HOME": "/root",
+            "LANG": "C.UTF-8",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        },
+        timeout=15,
+    )
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+
+    print(f"deployment_trigger_scope={scope}")
+    print(f"deployment_trigger_unit={unit}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

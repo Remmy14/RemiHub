@@ -1,0 +1,13 @@
+[Unit]
+Description=RemiHub Backend Deployment Queue Fallback Trigger
+Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=remihub-agent-deployment-production.service
+
+[Install]
+WantedBy=timers.target
