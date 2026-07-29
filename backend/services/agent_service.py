@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from psycopg2 import errors
 
 from backend.core.agent_state import (
+    ALLOWED_CARD_TRANSITIONS,
     CardStatus,
     InvalidCardTransitionError,
     RepositoryScope,
@@ -14,6 +15,7 @@ from backend.core.agent_state import (
     RunStatus,
     coerce_repository_scope,
     follow_up_target,
+    queued_card_status_for_phase,
     require_backend_repository_scope,
     require_deployment_repository_scope,
     require_implementation_repository_scope,
@@ -112,6 +114,69 @@ def _row_to_dict(cur, row) -> dict | None:
 
     return _rows_to_dicts(cur, [row])[0]
 
+
+
+
+def _latest_run_summary(run: dict | None) -> dict | None:
+    if run is None:
+        return None
+    return {
+        key: run.get(key)
+        for key in (
+            "id",
+            "phase",
+            "status",
+            "card_revision",
+            "attempt_count",
+            "blocked_reason",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+    }
+
+
+def _allowed_actions(card: dict) -> list[str]:
+    status = CardStatus(card["status"])
+    scope = coerce_repository_scope(card["repository_scope"])
+    actions: list[str] = []
+
+    if status in {
+        CardStatus.AWAITING_FEEDBACK,
+        CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
+        CardStatus.REVIEW_READY,
+    }:
+        actions.append("add_follow_up")
+
+    if (
+        status is CardStatus.AWAITING_IMPLEMENTATION_APPROVAL
+        and scope in {RepositoryScope.BACKEND, RepositoryScope.ANDROID}
+    ):
+        actions.append("approve_implementation")
+
+    if (
+        status is CardStatus.REVIEW_READY
+        and scope in {RepositoryScope.BACKEND, RepositoryScope.ANDROID}
+    ):
+        actions.append("approve_deployment")
+
+    if status is CardStatus.FAILED:
+        actions.append("retry")
+
+    if CardStatus.CANCELLED in ALLOWED_CARD_TRANSITIONS[status]:
+        actions.append("cancel")
+
+    if CardStatus.CLOSED in ALLOWED_CARD_TRANSITIONS[status]:
+        actions.append("close")
+
+    return actions
+
+
+def _decorate_card(card: dict, *, latest_run: dict | None = None) -> dict:
+    result = dict(card)
+    result["latest_run"] = _latest_run_summary(latest_run)
+    result["allowed_actions"] = _allowed_actions(result)
+    return result
 
 def _required_text(value: str, *, field: str, maximum: int) -> str:
     normalized = value.strip()
@@ -585,7 +650,8 @@ def _card_detail(conn, card_id: str) -> dict:
         )
         card["events"] = _rows_to_dicts(cur, cur.fetchall())
 
-    return card
+    latest_run = card["runs"][-1] if card["runs"] else None
+    return _decorate_card(card, latest_run=latest_run)
 
 
 def create_card(
@@ -680,7 +746,38 @@ def list_cards(*, include_closed: bool = False) -> list[dict]:
                 ORDER BY created_at DESC, id DESC
                 """
             )
-            return _rows_to_dicts(cur, cur.fetchall())
+            cards = _rows_to_dicts(cur, cur.fetchall())
+            if not cards:
+                return []
+
+            card_ids = [card["id"] for card in cards]
+            cur.execute(
+                """
+                SELECT DISTINCT ON (card_id)
+                       id,
+                       card_id,
+                       phase,
+                       status,
+                       card_revision,
+                       attempt_count,
+                       blocked_reason,
+                       error_message,
+                       created_at,
+                       updated_at
+                FROM agent.runs
+                WHERE card_id = ANY(%s::uuid[])
+                ORDER BY card_id, created_at DESC, id DESC
+                """,
+                (card_ids,),
+            )
+            latest_runs = {
+                run["card_id"]: run
+                for run in _rows_to_dicts(cur, cur.fetchall())
+            }
+            return [
+                _decorate_card(card, latest_run=latest_runs.get(card["id"]))
+                for card in cards
+            ]
     finally:
         conn.rollback()
         put_db_conn(conn)
@@ -892,6 +989,139 @@ def approve_deployment(
                         card["repository_scope"]
                     ).value,
                     "revision": card["revision"],
+                    "run_id": run_id,
+                    "to_status": target_status.value,
+                },
+            )
+
+        result = _card_detail(conn, card_id)
+        conn.commit()
+        return result
+    except errors.UniqueViolation as exc:
+        conn.rollback()
+        raise _unique_violation_error(exc) from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def retry_card(
+    *,
+    card_id: str,
+    requested_by: str,
+    notes: str | None = None,
+) -> dict:
+    notes = _optional_text(notes, field="notes", maximum=2000)
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+            if CardStatus(card["status"]) is not CardStatus.FAILED:
+                raise AgentStateConflictError(
+                    "Retry is available only when the card status is failed"
+                )
+
+            cur.execute(
+                """
+                SELECT id, phase, card_revision, input_message_id
+                FROM agent.runs
+                WHERE card_id = %s
+                  AND status = 'failed'
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (card_id,),
+            )
+            failed_run = _row_to_dict(cur, cur.fetchone())
+            if failed_run is None:
+                raise AgentStateConflictError(
+                    "The failed card has no failed run to retry"
+                )
+
+            phase = RunPhase(failed_run["phase"])
+            target_status = queued_card_status_for_phase(phase)
+            _require_transition(card["status"], target_status)
+
+            if phase is RunPhase.IMPLEMENTATION:
+                _require_implementation_scope(card, action="Implementation retry")
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM agent.approvals
+                    WHERE card_id = %s
+                      AND approval_type = 'implementation'
+                      AND decision = 'approved'
+                      AND card_revision = %s
+                    LIMIT 1
+                    """,
+                    (card_id, failed_run["card_revision"]),
+                )
+                if cur.fetchone() is None:
+                    raise AgentStateConflictError(
+                        "Implementation retry requires an existing approval for this revision"
+                    )
+
+            if phase is RunPhase.DEPLOYMENT:
+                repository_scope = _require_deployment_scope(
+                    card, action="Deployment retry"
+                )
+                if repository_scope is RepositoryScope.ANDROID:
+                    _require_android_deployment_ready()
+                _deployment_implementation_result(
+                    cur,
+                    card_id=card_id,
+                    card_revision=failed_run["card_revision"],
+                    repository_scope=repository_scope,
+                )
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM agent.approvals
+                    WHERE card_id = %s
+                      AND approval_type = 'deployment'
+                      AND decision = 'approved'
+                      AND card_revision = %s
+                    LIMIT 1
+                    """,
+                    (card_id, failed_run["card_revision"]),
+                )
+                if cur.fetchone() is None:
+                    raise AgentStateConflictError(
+                        "Deployment retry requires an existing approval for this revision"
+                    )
+
+            run_id = _insert_run(
+                cur,
+                card_id=card_id,
+                phase=phase,
+                card_revision=failed_run["card_revision"],
+                requested_by=requested_by,
+                input_message_id=(
+                    failed_run["input_message_id"]
+                    if phase is RunPhase.PLANNING
+                    else None
+                ),
+            )
+            _update_card_status(
+                cur,
+                card_id=card_id,
+                status=target_status,
+            )
+            _insert_event(
+                cur,
+                card_id=card_id,
+                event_type="card.retry_requested",
+                actor_type="user",
+                actor_user_id=requested_by,
+                payload={
+                    "failed_run_id": failed_run["id"],
+                    "notes": notes,
+                    "phase": phase.value,
+                    "revision": failed_run["card_revision"],
                     "run_id": run_id,
                     "to_status": target_status.value,
                 },

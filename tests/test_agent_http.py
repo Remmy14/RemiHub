@@ -15,6 +15,7 @@ from backend.services.agent_service import (
 
 CARD_ID = "3d8549c4-a965-4d2e-aacf-9df7e6ccdbb4"
 USER_ID = "c346f3f4-3867-4ddb-83ea-7d24db8817bc"
+NOW = "2026-07-29T15:00:00+00:00"
 ADMIN = AuthenticatedPrincipal(
     id=USER_ID,
     firebase_uid="firebase-user-1",
@@ -22,6 +23,34 @@ ADMIN = AuthenticatedPrincipal(
     display_name="Alex",
     role="admin",
 )
+
+
+def card_detail(*, status="planning_queued", allowed_actions=None):
+    return {
+        "id": CARD_ID,
+        "title": "Medication tracking",
+        "description": "Plan a medication tracking module.",
+        "status": status,
+        "repository_scope": "backend",
+        "revision": 1,
+        "base_branch": "main",
+        "feature_branch": None,
+        "worktree_path": None,
+        "codex_thread_id": None,
+        "resume_status": None,
+        "blocked_reason": None,
+        "blocked_until": None,
+        "created_by": USER_ID,
+        "closed_at": None,
+        "created_at": NOW,
+        "updated_at": NOW,
+        "latest_run": None,
+        "allowed_actions": allowed_actions or [],
+        "messages": [],
+        "runs": [],
+        "approvals": [],
+        "events": [],
+    }
 
 
 strict_app = FastAPI()
@@ -44,10 +73,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
 
     @patch("backend.routers.agent.agent_service.create_card")
     def test_create_card_uses_authenticated_administrator(self, create_card):
-        create_card.return_value = {
-            "id": CARD_ID,
-            "status": "planning_queued",
-        }
+        create_card.return_value = card_detail()
 
         response = admin_client.post(
             "/agent/cards",
@@ -104,10 +130,10 @@ class AgentHttpBoundaryTests(unittest.TestCase):
 
     @patch("backend.routers.agent.agent_service.add_follow_up")
     def test_follow_up_is_attributed_to_administrator(self, add_follow_up):
-        add_follow_up.return_value = {
-            "id": CARD_ID,
-            "status": "implementation_queued",
-        }
+        add_follow_up.return_value = card_detail(
+            status="implementation_queued",
+            allowed_actions=["cancel"],
+        )
 
         response = admin_client.post(
             f"/agent/cards/{CARD_ID}/messages",
@@ -124,10 +150,10 @@ class AgentHttpBoundaryTests(unittest.TestCase):
 
     @patch("backend.routers.agent.agent_service.approve_implementation")
     def test_implementation_approval_is_explicit(self, approve_implementation):
-        approve_implementation.return_value = {
-            "id": CARD_ID,
-            "status": "implementation_queued",
-        }
+        approve_implementation.return_value = card_detail(
+            status="implementation_queued",
+            allowed_actions=["cancel"],
+        )
 
         response = admin_client.post(
             f"/agent/cards/{CARD_ID}/approve-implementation",
@@ -141,6 +167,25 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             notes="Plan approved",
         )
 
+    @patch("backend.routers.agent.agent_service.retry_card")
+    def test_failed_card_retry_is_explicit(self, retry_card):
+        retry_card.return_value = card_detail(
+            status="deployment_queued",
+            allowed_actions=["cancel"],
+        )
+
+        response = admin_client.post(
+            f"/agent/cards/{CARD_ID}/retry",
+            json={"notes": "Retry the approved candidate"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        retry_card.assert_called_once_with(
+            card_id=CARD_ID,
+            requested_by=USER_ID,
+            notes="Retry the approved candidate",
+        )
+
     def test_blank_card_description_is_rejected(self):
         response = admin_client.post(
             "/agent/cards",
@@ -148,6 +193,30 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_openapi_has_typed_success_and_error_contracts(self):
+        schema = admin_app.openapi()
+        paths = schema["paths"]
+
+        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 8)
+        self.assertEqual(
+            paths["/agent/cards"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AgentCardListResponse",
+        )
+        self.assertEqual(
+            paths["/agent/cards/{card_id}"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AgentCardResponse",
+        )
+        retry = paths["/agent/cards/{card_id}/retry"]["post"]
+        self.assertEqual(
+            retry["responses"]["409"]["content"]["application/json"]
+            ["schema"]["$ref"],
+            "#/components/schemas/AgentErrorResponse",
+        )
+        self.assertIn("AgentCardDetail", schema["components"]["schemas"])
+        self.assertIn("AgentCardAction", schema["components"]["schemas"])
 
 
 if __name__ == "__main__":
