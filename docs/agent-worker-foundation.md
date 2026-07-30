@@ -63,12 +63,13 @@ migration can grant it access. The worker receives only:
 It cannot create or delete cards, approvals, runs, users, notifications, or any
 other RemiHub data. It receives no access to unrelated public-schema tables.
 Migration `0005_agent_repository_scope` adds the durable scope column but does
-not grant worker privileges. The protected phase-2 control-plane installer must
-grant `UPDATE (repository_scope)` on `agent.cards` to both
-`remihub_agent_worker` and `remihub_qa_agent_worker` before restarting the new
-planning and implementation workers. That keeps application migrations within
-the automatic deployment SQL policy while still limiting the worker to the one
-extra card column it needs.
+not grant worker privileges. Successful Android planning completion also
+normalizes `base_branch` to `master`. The protected control-plane hardening
+asset therefore grants `UPDATE (repository_scope, base_branch)` on
+`agent.cards` to both `remihub_agent_worker` and
+`remihub_qa_agent_worker`. These grants remain outside application migrations,
+keeping the automatic deployment SQL policy narrow while limiting the worker to
+the two additional card columns required by planning completion.
 
 At startup, the process verifies the exact PostgreSQL database, session role,
 and current role for its configured environment. A QA worker therefore refuses
@@ -148,3 +149,15 @@ or expiration.
 The `0004` down migration first marks claimed, running, or blocked work as
 failed, then removes lease metadata and the `blocked` card state. Stop the
 worker before downgrade. A rollback cannot resume an interrupted attempt.
+
+
+## Deployment worker wakeups
+
+Deployment approval and deployment retry commit queue state before requesting a
+worker wakeup. The API writes a fixed marker under
+`/run/remihub-agent/deployment-trigger`; it does not call `sudo`.
+
+Root-owned systemd path units consume those markers and invoke the exact
+allowlisted deployment-trigger helper. Independent calendar timers poll both
+deployment queues every minute as the durability fallback. See
+`deployments/agent_common/hardening/deployment-worker-trigger.md`.

@@ -1,10 +1,9 @@
 [Unit]
-Description=RemiHub Android Deployment Queue Fallback Trigger
+Description=RemiHub Android Deployment Queue Fallback Poll
 Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
 
 [Timer]
-OnBootSec=1min
-OnUnitInactiveSec=1min
+OnCalendar=*-*-* *:*:00
 AccuracySec=5s
 Persistent=true
 Unit=remihub-agent-android-deployment.service

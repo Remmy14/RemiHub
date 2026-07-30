@@ -1,3 +1,0 @@
-Defaults:alex env_reset
-alex ALL=(root) NOPASSWD: /usr/local/libexec/remihub-agent-deployment-trigger backend
-alex ALL=(root) NOPASSWD: /usr/local/libexec/remihub-agent-deployment-trigger android

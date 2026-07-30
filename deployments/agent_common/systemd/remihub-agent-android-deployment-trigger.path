@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for approved Android deployment wake requests
+Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
+
+[Path]
+PathExists=/run/remihub-agent/deployment-trigger/android.request
+Unit=remihub-agent-android-deployment-trigger.service
+
+[Install]
+WantedBy=multi-user.target

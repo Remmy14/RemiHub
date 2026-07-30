@@ -1,0 +1,25 @@
+[Unit]
+Description=Wake the protected backend deployment worker
+Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
+ConditionPathIsDirectory=/run/remihub-agent/deployment-trigger
+ConditionFileIsExecutable=/usr/local/libexec/remihub-agent-deployment-trigger
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStartPre=/usr/bin/rm -f /run/remihub-agent/deployment-trigger/backend.request
+ExecStart=/usr/local/libexec/remihub-agent-deployment-trigger backend
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/remihub-agent/deployment-trigger
