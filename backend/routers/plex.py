@@ -15,7 +15,10 @@ def add_download(req: plex_service.DownloadRequest):
     if req.category not in plex_service.CATEGORY_PATHS:
         raise HTTPException(status_code=400, detail="Invalid category")
 
-    plex_service.create_crawljob_file(req)
+    try:
+        plex_service.create_crawljob_files(req)
+    except plex_service.EmptyDownloadUrlError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return JSONResponse(
         content={"success": True, "message": "Download job added."},
@@ -33,5 +36,4 @@ def getRecentRequests():
             content={"success": False, "message": str(e)},
             media_type="application/json"
         )
-
 
