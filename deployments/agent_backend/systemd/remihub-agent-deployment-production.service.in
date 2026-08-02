@@ -70,6 +70,8 @@ NoNewPrivileges=false
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+# Shared root-owned lock serializes backend promotion with Android release publication.
+ReadWritePaths=/var/lib/remihub-agent/android-release
 ProtectHome=true
 ProtectKernelTunables=false
 ProtectKernelModules=true

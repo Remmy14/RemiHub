@@ -75,6 +75,13 @@ The queue worker receives migration credentials and the narrow sudo capability,
 but it never imports candidate Python. It reads validated SQL as data and uses
 the trusted migration runner from its immutable release.
 
+Backend QA and production workers use `ProtectSystem=strict`. Both expose only
+`/var/lib/remihub-agent/android-release` as writable under `/var/lib` so the
+fixed root deployment helper can acquire the same root-owned release lock used
+by Android publication. This serializes preservation of
+`deployments/release_version.json` without granting the unprivileged worker
+broader filesystem access.
+
 ## Database handling
 
 The collected production roles show that `remihub_migrator` and
