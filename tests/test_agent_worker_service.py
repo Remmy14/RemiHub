@@ -78,6 +78,19 @@ class AgentClaimCandidateTests(unittest.TestCase):
                 )
             )
 
+
+    def test_deployment_candidate_rejects_missing_binding(self):
+        with self.assertRaisesRegex(AgentQueueStateError, "context is missing"):
+            _validate_candidate(
+                candidate(
+                    phase="deployment",
+                    card_status="deployment_queued",
+                    deployment_approval_id=None,
+                    implementation_run_id=None,
+                    implementation_result_metadata=None,
+                )
+            )
+
     def test_deployment_candidate_accepts_bound_implementation_evidence(self):
         phase, previous, active = _validate_candidate(
             candidate(
@@ -114,6 +127,9 @@ class AgentClaimCandidateTests(unittest.TestCase):
         self.assertIsNone(result)
         sql, parameters = cursor.execute.call_args.args
         self.assertIn("runs.phase = ANY(%s)", sql)
+        self.assertIn("card.deployment_retry_bound", sql)
+        self.assertIn("events.payload ->> 'run_id' = runs.id::text", sql)
+        self.assertNotIn("ORDER BY prior_runs.created_at DESC", sql)
         self.assertEqual(parameters, (["planning"],))
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)

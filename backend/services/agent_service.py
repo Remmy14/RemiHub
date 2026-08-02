@@ -421,27 +421,11 @@ def _insert_approval(
     return approval_id
 
 
-def _deployment_implementation_result(
-    cur,
+def _validate_deployment_implementation_result(
+    result: dict | None,
     *,
-    card_id: str,
-    card_revision: int,
     repository_scope: RepositoryScope,
 ) -> dict:
-    cur.execute(
-        """
-        SELECT id, result_metadata
-        FROM agent.runs
-        WHERE card_id = %s
-          AND phase = 'implementation'
-          AND status = 'succeeded'
-          AND card_revision = %s
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        """,
-        (card_id, card_revision),
-    )
-    result = _row_to_dict(cur, cur.fetchone())
     if result is None:
         raise AgentStateConflictError(
             "Deployment requires a successful implementation run for this revision"
@@ -500,6 +484,128 @@ def _deployment_implementation_result(
                 "Android implementation validation release evidence is invalid"
             )
     return result
+
+
+def _deployment_implementation_result(
+    cur,
+    *,
+    card_id: str,
+    card_revision: int,
+    repository_scope: RepositoryScope,
+) -> dict:
+    cur.execute(
+        """
+        SELECT id, result_metadata
+        FROM agent.runs
+        WHERE card_id = %s
+          AND phase = 'implementation'
+          AND status = 'succeeded'
+          AND card_revision = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (card_id, card_revision),
+    )
+    return _validate_deployment_implementation_result(
+        _row_to_dict(cur, cur.fetchone()),
+        repository_scope=repository_scope,
+    )
+
+
+def _deployment_implementation_result_by_id(
+    cur,
+    *,
+    card_id: str,
+    card_revision: int,
+    repository_scope: RepositoryScope,
+    implementation_run_id: str,
+) -> dict:
+    cur.execute(
+        """
+        SELECT id, result_metadata
+        FROM agent.runs
+        WHERE id::text = %s
+          AND card_id = %s
+          AND phase = 'implementation'
+          AND status = 'succeeded'
+          AND card_revision = %s
+        LIMIT 1
+        """,
+        (implementation_run_id, card_id, card_revision),
+    )
+    return _validate_deployment_implementation_result(
+        _row_to_dict(cur, cur.fetchone()),
+        repository_scope=repository_scope,
+    )
+
+
+def _deployment_retry_binding(
+    cur,
+    *,
+    card_id: str,
+    card_revision: int,
+    failed_deployment_run_id: str,
+    repository_scope: RepositoryScope,
+) -> tuple[str, dict]:
+    cur.execute(
+        """
+        SELECT payload
+        FROM agent.events
+        WHERE card_id = %s
+          AND event_type IN (
+              'card.deployment_approved',
+              'card.deployment_retry_bound'
+          )
+          AND payload ->> 'run_id' = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (card_id, failed_deployment_run_id),
+    )
+    binding_row = _row_to_dict(cur, cur.fetchone())
+    payload = binding_row.get("payload") if binding_row is not None else None
+    if not isinstance(payload, dict):
+        raise AgentStateConflictError(
+            "Deployment retry is missing its exact approval binding"
+        )
+    approval_id = payload.get("approval_id")
+    implementation_run_id = payload.get("implementation_run_id")
+    if (
+        not isinstance(approval_id, str)
+        or not approval_id.strip()
+        or not isinstance(implementation_run_id, str)
+        or not implementation_run_id.strip()
+    ):
+        raise AgentStateConflictError(
+            "Deployment retry has an invalid approval binding"
+        )
+
+    cur.execute(
+        """
+        SELECT 1
+        FROM agent.approvals
+        WHERE id::text = %s
+          AND card_id = %s
+          AND approval_type = 'deployment'
+          AND decision = 'approved'
+          AND card_revision = %s
+        LIMIT 1
+        """,
+        (approval_id, card_id, card_revision),
+    )
+    if cur.fetchone() is None:
+        raise AgentStateConflictError(
+            "Deployment retry requires its existing exact approval"
+        )
+
+    implementation_result = _deployment_implementation_result_by_id(
+        cur,
+        card_id=card_id,
+        card_revision=card_revision,
+        repository_scope=repository_scope,
+        implementation_run_id=implementation_run_id,
+    )
+    return approval_id, implementation_result
 
 
 def _insert_event(
@@ -1039,6 +1145,8 @@ def retry_card(
     notes = _optional_text(notes, field="notes", maximum=2000)
 
     deployment_trigger_scope: RepositoryScope | None = None
+    deployment_approval_id: str | None = None
+    deployment_implementation_run_id: str | None = None
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1095,28 +1203,19 @@ def retry_card(
                 )
                 if repository_scope is RepositoryScope.ANDROID:
                     _require_android_deployment_ready()
-                _deployment_implementation_result(
+                (
+                    deployment_approval_id,
+                    deployment_implementation_result,
+                ) = _deployment_retry_binding(
                     cur,
                     card_id=card_id,
                     card_revision=failed_run["card_revision"],
+                    failed_deployment_run_id=failed_run["id"],
                     repository_scope=repository_scope,
                 )
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM agent.approvals
-                    WHERE card_id = %s
-                      AND approval_type = 'deployment'
-                      AND decision = 'approved'
-                      AND card_revision = %s
-                    LIMIT 1
-                    """,
-                    (card_id, failed_run["card_revision"]),
+                deployment_implementation_run_id = (
+                    deployment_implementation_result["id"]
                 )
-                if cur.fetchone() is None:
-                    raise AgentStateConflictError(
-                        "Deployment retry requires an existing approval for this revision"
-                    )
                 deployment_trigger_scope = repository_scope
 
             run_id = _insert_run(
@@ -1136,6 +1235,25 @@ def retry_card(
                 card_id=card_id,
                 status=target_status,
             )
+            if phase is RunPhase.DEPLOYMENT:
+                assert deployment_approval_id is not None
+                assert deployment_implementation_run_id is not None
+                _insert_event(
+                    cur,
+                    card_id=card_id,
+                    event_type="card.deployment_retry_bound",
+                    actor_type="user",
+                    actor_user_id=requested_by,
+                    payload={
+                        "approval_id": deployment_approval_id,
+                        "implementation_run_id": (
+                            deployment_implementation_run_id
+                        ),
+                        "prior_deployment_run_id": failed_run["id"],
+                        "revision": failed_run["card_revision"],
+                        "run_id": run_id,
+                    },
+                )
             _insert_event(
                 cur,
                 card_id=card_id,

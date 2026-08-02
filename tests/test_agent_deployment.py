@@ -79,7 +79,7 @@ def _git(repository: Path, *arguments: str) -> str:
 
 
 class DeploymentImplementationTestEvidenceTests(unittest.TestCase):
-    def test_backend_failed_implementation_test_remains_blocking(self):
+    def test_backend_failed_codex_test_is_preserved_as_advisory_evidence(self):
         manager = object.__new__(GitBackendDeploymentManager)
         metadata = {
             "tests": [
@@ -91,11 +91,18 @@ class DeploymentImplementationTestEvidenceTests(unittest.TestCase):
             ]
         }
 
-        with self.assertRaisesRegex(
-            AgentDeploymentError,
-            "contains failed implementation tests",
-        ):
-            manager._validate_implementation_tests(metadata)
+        observed = manager._validate_implementation_tests(metadata)
+
+        self.assertEqual(
+            observed,
+            (
+                {
+                    "command": "python -m unittest",
+                    "status": "failed",
+                    "details": "one test failed",
+                },
+            ),
+        )
 
     def test_backend_nonfailed_implementation_tests_are_preserved(self):
         manager = object.__new__(GitBackendDeploymentManager)
@@ -716,7 +723,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentDeploymentError, "protected control-plane"):
             self._manager().deploy(claim)
 
-    def test_failed_implementation_test_evidence_is_rejected(self):
+    def test_failed_codex_test_evidence_runs_authoritative_validation(self):
         claim = self._prepare_deployment(
             {"backend/example.py": "VALUE = 2\n"},
             tests=[
@@ -727,8 +734,26 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                 }
             ],
         )
-        with self.assertRaisesRegex(AgentDeploymentError, "failed implementation"):
-            self._manager().deploy(claim)
+
+        candidate = self._manager().deploy(claim)
+
+        self.assertEqual(len(self.validator.calls), 1)
+        self.assertEqual(
+            _git(self.target, "rev-parse", "qa-main"),
+            candidate.candidate_commit,
+        )
+        manifest = json.loads(Path(candidate.manifest_path).read_text())
+        self.assertEqual(
+            manifest["implementation_tests"],
+            [
+                {
+                    "command": "python -m unittest",
+                    "status": "failed",
+                    "details": "one failed",
+                }
+            ],
+        )
+        self.assertEqual(manifest["attempts"][-1]["status"], "succeeded")
 
     def test_validation_failure_does_not_stop_service_or_advance_target(self):
         claim = self._prepare_deployment(

@@ -155,7 +155,10 @@ def _validate_candidate(row: dict) -> tuple[RunPhase, CardStatus, CardStatus]:
         )
 
     if phase is RunPhase.DEPLOYMENT:
-        _deployment_source_from_row(row)
+        if _deployment_source_from_row(row) is None:
+            raise AgentQueueStateError(
+                f"Deployment context is missing for run {row['id']}"
+            )
 
     if current_card_status is not active_card_status:
         require_card_transition(current_card_status, active_card_status)
@@ -237,27 +240,34 @@ def claim_next_run(
                 JOIN agent.cards AS cards
                   ON cards.id = runs.card_id
                 LEFT JOIN LATERAL (
-                    SELECT approvals.id
-                    FROM agent.approvals AS approvals
-                    WHERE approvals.card_id = runs.card_id
-                      AND approvals.approval_type = 'deployment'
-                      AND approvals.decision = 'approved'
-                      AND approvals.card_revision = runs.card_revision
-                    ORDER BY approvals.created_at DESC, approvals.id DESC
+                    SELECT events.payload
+                    FROM agent.events AS events
+                    WHERE events.card_id = runs.card_id
+                      AND events.event_type IN (
+                          'card.deployment_approved',
+                          'card.deployment_retry_bound'
+                      )
+                      AND events.payload ->> 'run_id' = runs.id::text
+                    ORDER BY events.created_at DESC, events.id DESC
                     LIMIT 1
-                ) AS deployment_approval
+                ) AS deployment_binding
                   ON runs.phase = 'deployment'
-                LEFT JOIN LATERAL (
-                    SELECT prior_runs.id, prior_runs.result_metadata
-                    FROM agent.runs AS prior_runs
-                    WHERE prior_runs.card_id = runs.card_id
-                      AND prior_runs.phase = 'implementation'
-                      AND prior_runs.status = 'succeeded'
-                      AND prior_runs.card_revision = runs.card_revision
-                    ORDER BY prior_runs.created_at DESC, prior_runs.id DESC
-                    LIMIT 1
-                ) AS implementation_run
+                LEFT JOIN agent.approvals AS deployment_approval
                   ON runs.phase = 'deployment'
+                 AND deployment_approval.id::text =
+                     deployment_binding.payload ->> 'approval_id'
+                 AND deployment_approval.card_id = runs.card_id
+                 AND deployment_approval.approval_type = 'deployment'
+                 AND deployment_approval.decision = 'approved'
+                 AND deployment_approval.card_revision = runs.card_revision
+                LEFT JOIN agent.runs AS implementation_run
+                  ON runs.phase = 'deployment'
+                 AND implementation_run.id::text =
+                     deployment_binding.payload ->> 'implementation_run_id'
+                 AND implementation_run.card_id = runs.card_id
+                 AND implementation_run.phase = 'implementation'
+                 AND implementation_run.status = 'succeeded'
+                 AND implementation_run.card_revision = runs.card_revision
                 WHERE runs.phase = ANY(%s)
                   {scope_predicate}
                   AND (

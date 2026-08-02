@@ -220,6 +220,24 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
         self.assertNotIn("description", text)
         self.assertNotIn("DELETE", text)
 
+    def test_worker_events_select_grant_is_narrow_and_reversible(self):
+        sql = self.ROOT / "deployments/agent_common/sql"
+        grant = (sql / "agent-worker-events-select-grant.sql").read_text()
+        rollback = (
+            sql / "agent-worker-events-select-grant.rollback.sql"
+        ).read_text()
+
+        self.assertIn("GRANT SELECT ON agent.events TO %I", grant)
+        self.assertIn("REVOKE SELECT ON agent.events FROM %I", rollback)
+        self.assertNotIn("GRANT ALL", grant)
+        self.assertNotIn("agent.cards", grant)
+        self.assertNotIn("UPDATE", grant)
+        self.assertNotIn("DELETE", grant)
+        self.assertNotIn("TRUNCATE", grant)
+        self.assertNotIn("REFERENCES", grant)
+        self.assertNotIn("TRIGGER", grant)
+        self.assertNotIn("REVOKE INSERT", rollback)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1082,7 +1082,10 @@ class GitBackendDeploymentManager:
         metadata: dict,
         test: dict,
     ) -> bool:
-        return True
+        # Backend Codex test reports are advisory review evidence. The protected
+        # deployment validator independently compiles the exact materialized
+        # candidate and runs the complete test suite before any promotion.
+        return False
 
     def _validate_implementation_tests(
         self,

@@ -43,19 +43,29 @@ Each deployment worker remains run-once and claims only an approved,
 scope-matching deployment run. Starting an empty worker does not create,
 approve, retry, or modify a card.
 
-## Database role grant
+## Database role grants
 
 Planning completion persists both `repository_scope` and Android
 `base_branch = master`. The restricted production and QA worker roles therefore
 need column-limited update access to both fields.
 
-The protected SQL asset is:
+Exact deployment approval and retry binding is persisted in `agent.events`.
+The same restricted worker roles therefore also need read-only access to that
+table when claiming deployment work or reconstructing an exact retry binding.
 
-`deployments/agent_common/sql/agent-worker-card-update-grants.sql`
+The protected SQL assets are:
 
-It grants only:
+- `deployments/agent_common/sql/agent-worker-card-update-grants.sql`
+- `deployments/agent_common/sql/agent-worker-events-select-grant.sql`
 
-`UPDATE (repository_scope, base_branch) ON agent.cards`
+They grant only:
+
+- `UPDATE (repository_scope, base_branch) ON agent.cards`
+- `SELECT ON agent.events`
+
+The event grant does not add `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, or
+`TRIGGER` privileges. The existing `INSERT` privilege remains unchanged so
+workers can continue writing audit events.
 
 Role grants intentionally remain outside ordinary application migrations so
 the automatic backend deployment SQL policy does not need to permit role or
@@ -66,5 +76,8 @@ privilege administration.
 Restore the previous timers and sudo-based trigger assets only together. A
 partial rollback can leave the API unable to wake workers.
 
-The protected rollback SQL revokes only the newly required `base_branch`
+The card-update rollback SQL revokes only the newly required `base_branch`
 privilege. It does not revoke the older `repository_scope` grant.
+
+The event-read rollback SQL revokes only `SELECT ON agent.events`. It does not
+revoke the worker's existing `INSERT` privilege.
