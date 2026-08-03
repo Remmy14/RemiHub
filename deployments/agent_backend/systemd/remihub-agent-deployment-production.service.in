@@ -14,6 +14,7 @@ ConditionPathIsDirectory=/opt/remihub-agent/deployment/production/artifacts
 ConditionFileIsExecutable=/opt/remihub-agent/runtime/venv/bin/python
 ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-validation-sandbox
 ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-deployment-control
+ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-github-sync-control
 ConditionFileIsExecutable=@PG_DUMP@
 ConditionFileIsExecutable=@PG_RESTORE@
 ConditionPathExists=/opt/remihub-agent/deployment/config/git-safe-directory.ini
@@ -55,6 +56,7 @@ Environment=REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY=@PG_RESTORE@
 Environment=REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT=/var/backups/remihub-agent/backend-deployments/production
 Environment=REMIHUB_AGENT_DEPLOYMENT_VALIDATOR=/usr/local/libexec/remihub-backend-validation-sandbox
 Environment=REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER=/usr/local/libexec/remihub-backend-deployment-control
+Environment=REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER=/usr/local/libexec/remihub-backend-github-sync-control
 Environment=REMIHUB_AGENT_DEPLOYMENT_HEALTH_URL=http://127.0.0.1:8000/openapi.json
 Environment=REMIHUB_AGENT_DEPLOYMENT_TIMEOUT_SECONDS=900
 Environment=REMIHUB_AGENT_DEPLOYMENT_RETRY_SECONDS=60

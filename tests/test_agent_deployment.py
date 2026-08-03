@@ -298,6 +298,39 @@ class FakeRuntime:
         )
 
 
+class FakeGitHubSynchronizer:
+    def __init__(self, *, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.calls = []
+
+    def synchronize(
+        self,
+        *,
+        candidate_commit,
+        base_commit,
+        card_id,
+        deployment_run_id,
+    ):
+        self.calls.append(
+            {
+                "candidate_commit": candidate_commit,
+                "base_commit": base_commit,
+                "card_id": card_id,
+                "deployment_run_id": deployment_run_id,
+            }
+        )
+        if self.fail_times:
+            self.fail_times -= 1
+            raise AgentDeploymentError("GitHub unavailable")
+        return {
+            "status": "verified",
+            "candidate_commit": candidate_commit,
+            "remote_before": base_commit,
+            "remote_after": candidate_commit,
+            "push_return_code": 0,
+        }
+
+
 class PostgresDeploymentDatabaseTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -931,6 +964,87 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                     claim,
                     repository_scope=RepositoryScope.BACKEND_AND_ANDROID,
                 )
+            )
+
+    def test_production_executor_records_verified_github_sync(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        synchronizer = FakeGitHubSynchronizer()
+        executor = GitBackendDeploymentExecutor(
+            deployment_manager=self._manager(environment="production"),
+            github_synchronizer=synchronizer,
+            retry_after_seconds=90,
+        )
+
+        result = executor.execute(claim)
+
+        self.assertEqual(result.card_status, CardStatus.COMPLETED)
+        self.assertEqual(result.metadata["github_sync"]["status"], "verified")
+        self.assertEqual(len(synchronizer.calls), 1)
+        manifest_path = Path(result.metadata["candidate"]["manifest_path"])
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["attempts"][-1]["status"], "succeeded")
+        self.assertEqual(manifest["attempts"][-1]["stage"], "github_synchronized")
+        self.assertEqual(
+            manifest["github_sync"]["remote_after"],
+            result.metadata["candidate"]["candidate_commit"],
+        )
+
+    def test_github_failure_blocks_without_redeploy_and_retry_only_resynchronizes(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        runtime = FakeRuntime()
+        synchronizer = FakeGitHubSynchronizer(fail_times=1)
+        executor = GitBackendDeploymentExecutor(
+            deployment_manager=self._manager(
+                environment="production",
+                runtime=runtime,
+            ),
+            github_synchronizer=synchronizer,
+            retry_after_seconds=90,
+        )
+
+        with self.assertRaises(AgentTemporarilyBlockedError) as raised:
+            executor.execute(claim)
+        self.assertEqual(raised.exception.retry_after_seconds, 90)
+        events_after_local_success = list(runtime.events)
+        self.assertIn("stop", events_after_local_success)
+        self.assertTrue(
+            any(
+                isinstance(event, tuple) and event[0] == "promote"
+                for event in events_after_local_success
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(event, tuple) and event[0] == "sync"
+                for event in events_after_local_success
+            )
+        )
+
+        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        pending_manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(pending_manifest["attempts"][-1]["status"], "succeeded")
+        self.assertEqual(pending_manifest["attempts"][-1]["stage"], "github_sync_pending")
+        self.assertEqual(pending_manifest["github_sync"]["status"], "pending")
+
+        result = executor.execute(claim)
+
+        self.assertEqual(result.card_status, CardStatus.COMPLETED)
+        self.assertEqual(len(synchronizer.calls), 2)
+        self.assertEqual(runtime.events[:-1], events_after_local_success)
+        self.assertEqual(runtime.events[-1], "verify")
+        completed_manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(len(completed_manifest["attempts"]), 1)
+        self.assertEqual(completed_manifest["attempts"][-1]["stage"], "github_synchronized")
+        self.assertEqual(completed_manifest["github_sync"]["status"], "verified")
+
+    def test_production_executor_requires_github_synchronizer(self):
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "requires a GitHub synchronizer",
+        ):
+            GitBackendDeploymentExecutor(
+                deployment_manager=self._manager(environment="production"),
+                retry_after_seconds=90,
             )
 
     def test_production_requires_production_target_branch(self):

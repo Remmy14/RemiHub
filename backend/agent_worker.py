@@ -17,6 +17,7 @@ from backend.core.agent_deployment import (
     GitBackendDeploymentExecutor,
     GitBackendDeploymentManager,
     PostgresDeploymentDatabase,
+    PrivilegedBackendGitHubSynchronizer,
     PrivilegedDeploymentRuntime,
     SandboxBackendValidator,
 )
@@ -95,6 +96,7 @@ class AgentWorkerSettings:
     deployment_pg_restore_binary: str | None
     deployment_validator: str | None
     deployment_runtime_helper: str | None
+    deployment_github_sync_helper: str | None
     deployment_health_url: str
     deployment_timeout_seconds: int
     deployment_retry_seconds: int
@@ -205,6 +207,9 @@ class AgentWorkerSettings:
         )
         deployment_runtime_helper = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER"
+        )
+        deployment_github_sync_helper = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER"
         )
         deployment_health_url = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_HEALTH_URL",
@@ -327,6 +332,12 @@ class AgentWorkerSettings:
             deployment_runtime_helper=(
                 deployment_runtime_helper.strip()
                 if deployment_runtime_helper and deployment_runtime_helper.strip()
+                else None
+            ),
+            deployment_github_sync_helper=(
+                deployment_github_sync_helper.strip()
+                if deployment_github_sync_helper
+                and deployment_github_sync_helper.strip()
                 else None
             ),
             deployment_health_url=deployment_health_url,
@@ -575,6 +586,10 @@ def build_executor(
                 settings.deployment_runtime_helper
             ),
         }
+        if settings.environment == "production":
+            required_paths["REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER"] = (
+                settings.deployment_github_sync_helper
+            )
         missing = [name for name, value in required_paths.items() if value is None]
         if missing:
             raise AgentWorkerConfigurationError(
@@ -612,8 +627,15 @@ def build_executor(
             runtime=runtime,
             command_timeout_seconds=settings.git_timeout_seconds,
         )
+        github_synchronizer = None
+        if settings.environment == "production":
+            github_synchronizer = PrivilegedBackendGitHubSynchronizer(
+                helper_path=settings.deployment_github_sync_helper,
+                command_timeout_seconds=settings.deployment_timeout_seconds,
+            )
         return GitBackendDeploymentExecutor(
             deployment_manager=deployment_manager,
+            github_synchronizer=github_synchronizer,
             retry_after_seconds=settings.deployment_retry_seconds,
         )
 

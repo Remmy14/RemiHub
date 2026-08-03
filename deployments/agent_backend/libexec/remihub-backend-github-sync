@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+VERSION = "1.0.0"
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+TEST_MODE = os.environ.get("REMIHUB_GITHUB_SYNC_TEST_MODE") == "1"
+REPO = Path(os.environ.get("REMIHUB_GITHUB_SYNC_CANONICAL_REPO", "/opt/remihub"))
+REQUEST = Path(os.environ.get("REMIHUB_GITHUB_SYNC_REQUEST_PATH", "/run/remihub-agent/github-sync/backend-request.json"))
+STATE = Path(os.environ.get("REMIHUB_GITHUB_SYNC_STATE_ROOT", "/var/lib/remihub-agent/github-sync/backend"))
+REMOTE = os.environ.get("REMIHUB_GITHUB_SYNC_REMOTE_URL", "git@github.com:Remmy14/RemiHub.git")
+BRANCH = os.environ.get("REMIHUB_GITHUB_SYNC_REMOTE_BRANCH", "main")
+KEY = Path(os.environ.get("REMIHUB_GITHUB_SYNC_IDENTITY_FILE", "/etc/remihub-agent/github-sync/backend/id_ed25519"))
+KNOWN = Path(os.environ.get("REMIHUB_GITHUB_SYNC_KNOWN_HOSTS_FILE", "/etc/remihub-agent/github-sync/backend/known_hosts"))
+ALLOWED_DIRTY = os.environ.get("REMIHUB_GITHUB_SYNC_ALLOWED_DIRTY", " M deployments/release_version.json")
+RELEASE = REPO / "deployments/release_version.json"
+
+
+class Failure(RuntimeError):
+    pass
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp_path = Path(tmp)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+class Evidence:
+    def __init__(self, root: Path):
+        self.root = root
+        root.mkdir(parents=True, exist_ok=False)
+        os.chmod(root, 0o700)
+
+    def run(self, label: str, cmd: Sequence[str], env: dict[str, str], check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(list(cmd), text=True, encoding="utf-8", errors="replace", capture_output=True, env=env, check=False)
+        safe = label.replace("/", "-")
+        (self.root / f"{safe}.command.json").write_text(json.dumps(list(cmd), indent=2) + "\n", encoding="utf-8")
+        (self.root / f"{safe}.stdout").write_text(result.stdout, encoding="utf-8")
+        (self.root / f"{safe}.stderr").write_text(result.stderr, encoding="utf-8")
+        (self.root / f"{safe}.return_code").write_text(f"{result.returncode}\n", encoding="ascii")
+        if check and result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+            raise Failure(f"{label} failed: {detail[:500]}")
+        return result
+
+
+def require_hex(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not HEX40.fullmatch(value):
+        raise Failure(f"{field} is not a lowercase 40-character hash")
+    return value
+
+
+def require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not HEX64.fullmatch(value):
+        raise Failure(f"{field} is not a lowercase 64-character SHA-256")
+    return value
+
+
+def require_id(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not SAFE_ID.fullmatch(value):
+        raise Failure(f"{field} is invalid")
+    return value
+
+
+def load_request() -> dict[str, Any]:
+    st = REQUEST.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise Failure("request is not a regular non-symlink file")
+    if not TEST_MODE and st.st_uid != 0:
+        raise Failure("request is not root-owned")
+    if st.st_mode & 0o022:
+        raise Failure("request is writable by group or others")
+    if not 2 <= st.st_size <= 16384:
+        raise Failure("request size is invalid")
+    value = json.loads(REQUEST.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise Failure("request is not a JSON object")
+    return value
+
+
+def env() -> dict[str, str]:
+    value = {
+        "HOME": "/nonexistent",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    if REMOTE.startswith("git@") or REMOTE.startswith("ssh://"):
+        value["GIT_SSH_COMMAND"] = " ".join([
+            "/usr/bin/ssh", "-i", str(KEY), "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no", "-o", "StrictHostKeyChecking=yes",
+            "-o", f"UserKnownHostsFile={KNOWN}", "-o", "HostKeyAlias=github.com",
+        ])
+    return value
+
+
+def git(*args: str) -> list[str]:
+    return ["/usr/bin/git", "-c", f"safe.directory={REPO}", "-C", str(REPO), *args]
+
+
+def single(result: subprocess.CompletedProcess[str], field: str) -> str:
+    lines = [x.strip() for x in result.stdout.splitlines() if x.strip()]
+    if len(lines) != 1:
+        raise Failure(f"{field} did not resolve to one line")
+    return lines[0]
+
+
+def remote_hash(result: subprocess.CompletedProcess[str]) -> str:
+    target = f"refs/heads/{BRANCH}"
+    values = [parts[0] for line in result.stdout.splitlines() if len(parts := line.split()) == 2 and parts[1] == target]
+    if len(values) != 1 or not HEX40.fullmatch(values[0]):
+        raise Failure("remote branch did not resolve to one commit")
+    return values[0]
+
+
+def main() -> int:
+    result: dict[str, Any] = {
+        "schema_version": 1, "sync_version": VERSION, "repository": "backend",
+        "status": "failed", "started_at": now(), "finished_at": None,
+        "failure_stage": "initialization", "failure_reason": None,
+        "push_return_code": "not_run", "remote_before": None, "remote_after": None,
+    }
+    stage = "initialization"
+    result_path: Path | None = None
+    try:
+        req = load_request()
+        request_id = require_id(req.get("request_id"), "request_id")
+        candidate = require_hex(req.get("candidate_commit"), "candidate_commit")
+        base = require_hex(req.get("base_commit"), "base_commit")
+        tree = require_hex(req.get("expected_tree"), "expected_tree")
+        release_expected = require_sha256(req.get("release_sha256"), "release_sha256")
+        if req.get("repository") != "backend" or req.get("branch") != BRANCH:
+            raise Failure("request does not match fixed repository/branch")
+        root = STATE / "results" / request_id
+        result_path = root / "result.json"
+        ev = Evidence(root / "evidence")
+        (root / "request.json").write_text(json.dumps(req, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(root / "request.json", 0o600)
+        result.update({
+            "request_id": request_id, "candidate_commit": candidate, "base_commit": base,
+            "expected_tree": tree, "release_sha256_before": release_expected,
+            "card_id": req.get("card_id"), "deployment_run_id": req.get("deployment_run_id"),
+            "evidence_directory": str(ev.root),
+        })
+        e = env()
+
+        stage = "credential_preflight"
+        if REMOTE.startswith("git@") or REMOTE.startswith("ssh://"):
+            for p in (KEY, KNOWN):
+                if p.is_symlink() or not p.is_file():
+                    raise Failure(f"credential path is missing or unsafe: {p}")
+            if KEY.stat().st_mode & 0o077:
+                raise Failure("private key permissions are broader than 0600")
+
+        stage = "canonical_identity"
+        if single(ev.run("branch", git("symbolic-ref", "--quiet", "--short", "HEAD"), e), "branch") != BRANCH:
+            raise Failure("canonical branch is not main")
+        if single(ev.run("commit", git("rev-parse", "--verify", "HEAD^{commit}"), e), "commit") != candidate:
+            raise Failure("canonical commit does not match candidate")
+        if single(ev.run("tree", git("rev-parse", "--verify", "HEAD^{tree}"), e), "tree") != tree:
+            raise Failure("canonical tree does not match request")
+        ev.run("base-object", git("cat-file", "-e", f"{base}^{{commit}}"), e)
+        ev.run("base-ancestry", git("merge-base", "--is-ancestor", base, candidate), e)
+
+        stage = "canonical_integrity_before"
+        status_before = ev.run("status-before", git("status", "--porcelain=v1", "--untracked-files=all"), e).stdout.rstrip("\n")
+        if status_before != ALLOWED_DIRTY:
+            raise Failure("canonical worktree has unexpected changes")
+        if RELEASE.is_symlink() or not RELEASE.is_file():
+            raise Failure("release metadata is missing or unsafe")
+        release_before = sha(RELEASE)
+        if release_before != release_expected:
+            raise Failure("release metadata changed after request creation")
+        result["worktree_status_before"] = status_before
+
+        stage = "remote_before"
+        before = remote_hash(ev.run("ls-remote-before", git("ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"), e))
+        result["remote_before"] = before
+
+        stage = "remote_ancestry"
+        ev.run("remote-object", git("cat-file", "-e", f"{before}^{{commit}}"), e)
+        ev.run("remote-ancestry", git("merge-base", "--is-ancestor", before, candidate), e)
+        result["remote_local_counts"] = single(ev.run("counts", git("rev-list", "--left-right", "--count", f"{before}...{candidate}"), e), "counts")
+
+        stage = "pre_push_recheck"
+        if remote_hash(ev.run("ls-remote-pre-push", git("ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"), e)) != before:
+            raise Failure("remote changed during preflight")
+
+        stage = "push"
+        if before == candidate:
+            result["push_return_code"] = "not_needed"
+        else:
+            pushed = ev.run("push", git("push", "--porcelain", REMOTE, f"{candidate}:refs/heads/{BRANCH}"), e, check=False)
+            result["push_return_code"] = pushed.returncode
+            if pushed.returncode:
+                detail = pushed.stderr.strip() or pushed.stdout.strip() or str(pushed.returncode)
+                raise Failure(f"normal fast-forward push failed: {detail[:500]}")
+
+        stage = "remote_after"
+        after = remote_hash(ev.run("ls-remote-after", git("ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"), e))
+        result["remote_after"] = after
+        if after != candidate:
+            raise Failure("remote after does not equal candidate")
+
+        stage = "canonical_integrity_after"
+        status_after = ev.run("status-after", git("status", "--porcelain=v1", "--untracked-files=all"), e).stdout.rstrip("\n")
+        if status_after != status_before or sha(RELEASE) != release_before:
+            raise Failure("canonical worktree or release metadata changed")
+        if single(ev.run("commit-after", git("rev-parse", "--verify", "HEAD^{commit}"), e), "commit after") != candidate:
+            raise Failure("canonical commit changed")
+        result.update({"status": "verified", "worktree_status_after": status_after,
+                       "release_sha256_after": release_before, "failure_stage": None,
+                       "failure_reason": None})
+        rc = 0
+    except Exception as exc:
+        result["failure_stage"] = stage
+        result["failure_reason"] = f"{type(exc).__name__}: {exc}"[:2000]
+        rc = 1
+    finally:
+        result["finished_at"] = now()
+        if result_path is None:
+            fallback = STATE / "results" / f"failed-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            fallback.mkdir(parents=True, exist_ok=False)
+            os.chmod(fallback, 0o700)
+            result_path = fallback / "result.json"
+        atomic_json(result_path, result)
+        atomic_json(STATE / "latest-result.json", result)
+        print(json.dumps(result, sort_keys=True))
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

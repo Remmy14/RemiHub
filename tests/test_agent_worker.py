@@ -630,11 +630,13 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
         )
         deployment_executor.assert_called_once_with(
             deployment_manager=deployment_manager.return_value,
+            github_synchronizer=None,
             retry_after_seconds=75,
         )
 
     @patch("backend.agent_worker.GitBackendDeploymentExecutor")
     @patch("backend.agent_worker.GitBackendDeploymentManager")
+    @patch("backend.agent_worker.PrivilegedBackendGitHubSynchronizer")
     @patch("backend.agent_worker.PrivilegedDeploymentRuntime")
     @patch("backend.agent_worker.PostgresDeploymentDatabase")
     @patch("backend.agent_worker.SandboxBackendValidator")
@@ -643,6 +645,7 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
         sandbox_validator,
         deployment_database,
         deployment_runtime,
+        github_synchronizer,
         deployment_manager,
         deployment_executor,
     ):
@@ -676,6 +679,9 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": (
                 "/srv/agent/bin/runtime-helper"
             ),
+            "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER": (
+                "/srv/agent/bin/github-sync-helper"
+            ),
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = AgentWorkerSettings.from_environment()
@@ -692,6 +698,42 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             deployment_manager.call_args.kwargs["target_branch"],
             "production-main",
         )
+        github_synchronizer.assert_called_once_with(
+            helper_path="/srv/agent/bin/github-sync-helper",
+            command_timeout_seconds=900,
+        )
+        deployment_executor.assert_called_once_with(
+            deployment_manager=deployment_manager.return_value,
+            github_synchronizer=github_synchronizer.return_value,
+            retry_after_seconds=60,
+        )
+
+    def test_production_backend_deployment_requires_github_sync_helper(self):
+        environment = {
+            "REMIHUB_AGENT_ENVIRONMENT": "production",
+            "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+            "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+            "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": "/srv/agent/production.git",
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": "/srv/agent/production-worktrees",
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": "/srv/agent/production-artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": "/srv/agent/prod.ini",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub",
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": "/usr/bin/pg_dump",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": "/usr/bin/pg_restore",
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/validate",
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": "/srv/agent/runtime-helper",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER",
+        ):
+            build_executor(settings, queue=MagicMock())
 
     def test_backend_deployment_requires_explicit_postgresql_clients(self):
         environment = {

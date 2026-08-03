@@ -13,7 +13,7 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 from backend.config import load_config
 from backend.core.agent_state import (
@@ -170,6 +170,17 @@ class DeploymentRuntime(Protocol):
     def restore_sources(self, *, expected_current: str, rollback_commit: str) -> None: ...
 
     def verify(self) -> RuntimeHealth: ...
+
+
+class BackendGitHubSynchronizer(Protocol):
+    def synchronize(
+        self,
+        *,
+        candidate_commit: str,
+        base_commit: str,
+        card_id: str,
+        deployment_run_id: str,
+    ) -> dict[str, Any]: ...
 
 
 class SandboxBackendValidator:
@@ -611,6 +622,88 @@ class PrivilegedDeploymentRuntime:
         return result.stdout
 
 
+class PrivilegedBackendGitHubSynchronizer:
+    """Invoke the installed, narrowly authorized backend GitHub sync helper."""
+
+    def __init__(
+        self,
+        *,
+        helper_path: str | Path,
+        command_timeout_seconds: int = 300,
+    ):
+        if command_timeout_seconds < 1:
+            raise ValueError("command_timeout_seconds must be at least 1")
+        self.helper_path = _required_executable(
+            helper_path,
+            field="REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER",
+        )
+        self.command_timeout_seconds = command_timeout_seconds
+
+    def synchronize(
+        self,
+        *,
+        candidate_commit: str,
+        base_commit: str,
+        card_id: str,
+        deployment_run_id: str,
+    ) -> dict[str, Any]:
+        command = [
+            "sudo",
+            "-n",
+            str(self.helper_path),
+            "synchronize",
+            "production",
+            candidate_commit,
+            base_commit,
+            card_id,
+            deployment_run_id,
+        ]
+        environment = {
+            "HOME": "/nonexistent",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                timeout=self.command_timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AgentDeploymentError(
+                "Backend GitHub synchronization helper could not be executed"
+            ) from exc
+        if result.returncode != 0:
+            detail = _tail(result.stderr, 3000) or _tail(result.stdout, 3000)
+            suffix = f": {detail}" if detail else ""
+            raise AgentDeploymentError(
+                f"Backend GitHub synchronization helper failed{suffix}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise AgentDeploymentError(
+                "Backend GitHub synchronization helper returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AgentDeploymentError(
+                "Backend GitHub synchronization helper returned a non-object result"
+            )
+        if (
+            payload.get("status") != "verified"
+            or payload.get("candidate_commit") != candidate_commit
+            or payload.get("remote_after") != candidate_commit
+        ):
+            raise AgentDeploymentError(
+                "Backend GitHub synchronization helper did not verify the candidate"
+            )
+        return payload
+
+
 class GitBackendDeploymentManager:
     """Validate, test, migrate, promote, verify, and roll back one backend candidate."""
 
@@ -826,6 +919,60 @@ class GitBackendDeploymentManager:
                     manifest=manifest,
                     attempt=attempt,
                 )
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def record_github_sync(
+        self,
+        claim: ClaimedRun,
+        candidate: DeploymentCandidate,
+        evidence: dict[str, Any],
+    ) -> None:
+        manifest_path = Path(candidate.manifest_path).resolve()
+        if not manifest_path.is_relative_to(self.deployment_artifact_root):
+            raise AgentDeploymentError(
+                "GitHub synchronization manifest is outside the deployment artifact root"
+            )
+        lock_path = self.lock_root / f"{claim.card_id}.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            os.chmod(lock_path, 0o640)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise AgentDeploymentError(
+                        "Deployment manifest is unavailable for GitHub synchronization evidence"
+                    ) from exc
+                if (
+                    not isinstance(manifest, dict)
+                    or manifest.get("card_id") != claim.card_id
+                    or manifest.get("deployment_run_id") != claim.id
+                    or manifest.get("candidate_commit") != candidate.candidate_commit
+                ):
+                    raise AgentDeploymentError(
+                        "Deployment manifest does not match GitHub synchronization evidence"
+                    )
+                attempt = self._successful_attempt(manifest)
+                if attempt is None:
+                    raise AgentDeploymentError(
+                        "GitHub synchronization requires a successful local deployment attempt"
+                    )
+                normalized = dict(evidence)
+                status = normalized.get("status")
+                if status not in {"pending", "verified"}:
+                    raise AgentDeploymentError(
+                        "GitHub synchronization evidence has an invalid status"
+                    )
+                normalized["recorded_at"] = _utc_now()
+                attempt["github_sync"] = normalized
+                attempt["stage"] = (
+                    "github_synchronized"
+                    if status == "verified"
+                    else "github_sync_pending"
+                )
+                manifest["github_sync"] = normalized
+                self._write_manifest(manifest_path, manifest)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -2266,11 +2413,21 @@ class GitBackendDeploymentExecutor:
         self,
         *,
         deployment_manager: GitBackendDeploymentManager,
+        github_synchronizer: BackendGitHubSynchronizer | None = None,
         retry_after_seconds: int = 60,
     ):
         if retry_after_seconds < 1:
             raise ValueError("retry_after_seconds must be at least 1")
+        if deployment_manager.environment == "production" and github_synchronizer is None:
+            raise AgentWorkerConfigurationError(
+                "Production backend deployment requires a GitHub synchronizer"
+            )
+        if deployment_manager.environment != "production" and github_synchronizer is not None:
+            raise AgentWorkerConfigurationError(
+                "Backend GitHub synchronization is restricted to production"
+            )
         self.deployment_manager = deployment_manager
+        self.github_synchronizer = github_synchronizer
         self.retry_after_seconds = retry_after_seconds
 
     def execute(self, claim: ClaimedRun) -> ExecutionResult:
@@ -2285,6 +2442,56 @@ class GitBackendDeploymentExecutor:
                 str(exc),
                 retry_after_seconds=self.retry_after_seconds,
             ) from exc
+
+        github_sync: dict[str, Any] | None = None
+        if candidate.environment == "production":
+            assert self.github_synchronizer is not None
+            try:
+                github_sync = self.github_synchronizer.synchronize(
+                    candidate_commit=candidate.candidate_commit,
+                    base_commit=candidate.base_commit,
+                    card_id=claim.card_id,
+                    deployment_run_id=claim.id,
+                )
+            except AgentDeploymentError as exc:
+                pending = {
+                    "status": "pending",
+                    "candidate_commit": candidate.candidate_commit,
+                    "failure_reason": _tail(str(exc), 3000),
+                }
+                record_error = None
+                try:
+                    self.deployment_manager.record_github_sync(
+                        claim,
+                        candidate,
+                        pending,
+                    )
+                except AgentDeploymentError as evidence_exc:
+                    record_error = evidence_exc
+                reason = _tail(str(exc), 1000)
+                if record_error is not None:
+                    reason = (
+                        f"{reason}; manifest evidence is also pending: "
+                        f"{_tail(str(record_error), 1000)}"
+                    )
+                raise AgentTemporarilyBlockedError(
+                    "Backend deployment and local source synchronization succeeded, "
+                    f"but GitHub synchronization is pending: {reason}",
+                    retry_after_seconds=self.retry_after_seconds,
+                ) from exc
+            try:
+                self.deployment_manager.record_github_sync(
+                    claim,
+                    candidate,
+                    github_sync,
+                )
+            except AgentDeploymentError as exc:
+                raise AgentTemporarilyBlockedError(
+                    "Backend GitHub synchronization was verified, but deployment "
+                    f"manifest evidence is pending: {_tail(str(exc), 1000)}",
+                    retry_after_seconds=self.retry_after_seconds,
+                ) from exc
+
         changed_files = "\n".join(
             f"- `{path}`" for path in candidate.changed_files
         )
@@ -2292,6 +2499,9 @@ class GitBackendDeploymentExecutor:
             ", ".join(candidate.migrations_applied)
             if candidate.migrations_applied
             else "none"
+        )
+        github_text = (
+            "verified" if github_sync is not None else "not applicable in QA"
         )
         message = f"""
 Deployed the approved backend candidate to {candidate.environment}.
@@ -2302,6 +2512,7 @@ Deployed the approved backend candidate to {candidate.environment}.
 - Service restart performed: yes
 - Migrations applied: {migration_text}
 - Health check: `/openapi.json` passed
+- GitHub synchronization: {github_text}
 
 Changed files:
 {changed_files}
@@ -2315,6 +2526,7 @@ Changed files:
                 "environment": candidate.environment,
                 "mode": "backend-qa-to-production",
                 "candidate": asdict(candidate),
+                "github_sync": github_sync,
             },
         )
 
