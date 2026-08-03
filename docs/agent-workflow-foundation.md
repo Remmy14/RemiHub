@@ -96,6 +96,7 @@ fresh Codex thread against the then-current repository.
 | `POST /agent/cards/{id}/messages` | Add feedback and queue the appropriate next run |
 | `POST /agent/cards/{id}/approve-implementation` | Record approval and queue implementation |
 | `POST /agent/cards/{id}/approve-deployment` | Record approval and queue deployment |
+| `POST /agent/cards/{id}/deployments/{run_id}/retry-github-sync` | Retry only post-deployment backend GitHub synchronization for the exact deployment run |
 | `POST /agent/cards/{id}/cancel` | Cancel a cancellable card and its active run |
 | `POST /agent/cards/{id}/close` | Close a completed, cancelled, or failed card |
 
@@ -106,6 +107,11 @@ card so an Android retry cannot silently enqueue the same work twice.
 Card creation still requires only title and description. The server assigns
 `repository_scope = 'auto'`, and list/detail responses include the current
 scope.
+
+Backend deployment list/detail responses may include `deployment_recovery`
+metadata. This is the stable client contract for GitHub-only deployment
+blockers; clients must not parse `blocked_reason` or worker message text to
+decide whether GitHub synchronization can be retried.
 
 ## Migration and rollback
 

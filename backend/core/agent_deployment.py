@@ -120,6 +120,91 @@ class DeploymentCandidate:
     rollback_performed: bool = False
 
 
+GITHUB_SYNC_LOCAL_INCOMPLETE = "local_deployment_incomplete"
+GITHUB_SYNC_PENDING = "github_sync_pending"
+GITHUB_SYNC_RUNNING = "github_sync_running"
+GITHUB_SYNC_FAILED_RETRYABLE = "github_sync_failed_retryable"
+GITHUB_SYNC_SUCCEEDED = "github_sync_succeeded"
+GITHUB_SYNC_FAILED_NON_RETRYABLE = "github_sync_failed_non_retryable"
+
+GITHUB_SYNC_RETRY_ACTION = "retry_github_sync"
+
+GITHUB_SYNC_RETRYABLE_BLOCKERS = frozenset(
+    {
+        "github_sync_pending",
+        "github_sync_failed",
+        "github_sync_helper_unavailable",
+        "github_sync_timeout",
+        "github_sync_canonical_dirty",
+        "github_sync_health_failed",
+        "github_sync_manifest_pending",
+    }
+)
+GITHUB_SYNC_NON_RETRYABLE_BLOCKERS = frozenset(
+    {
+        "github_sync_remote_divergent",
+        "github_sync_integrity_failure",
+    }
+)
+
+
+def github_sync_blocker_code(error: str) -> str:
+    normalized = error.lower()
+    if "remote" in normalized and (
+        "ancestor" in normalized
+        or "diverg" in normalized
+        or "non-fast-forward" in normalized
+        or "neither the expected base nor candidate" in normalized
+    ):
+        return "github_sync_remote_divergent"
+    if (
+        "protected repository refs" in normalized
+        or "canonical commit does not match" in normalized
+        or "canonical tree does not match" in normalized
+        or "production target" in normalized
+        or "implementation main" in normalized
+        or "planning checkout changed" in normalized
+        or "canonical commit changed" in normalized
+    ):
+        return "github_sync_integrity_failure"
+    if "canonical worktree has an unexpected dirty state" in normalized:
+        return "github_sync_canonical_dirty"
+    if "health" in normalized:
+        return "github_sync_health_failed"
+    if "could not be executed" in normalized:
+        return "github_sync_helper_unavailable"
+    if "timed out" in normalized or "timeoutexpired" in normalized:
+        return "github_sync_timeout"
+    return "github_sync_failed"
+
+
+def github_sync_retryable(blocker_code: str) -> bool:
+    if blocker_code in GITHUB_SYNC_NON_RETRYABLE_BLOCKERS:
+        return False
+    return blocker_code in GITHUB_SYNC_RETRYABLE_BLOCKERS
+
+
+def deployment_recovery_metadata(
+    *,
+    github_sync_status: str,
+    retryable: bool,
+    blocker_code: str | None,
+    last_error: str | None,
+    candidate_commit: str | None,
+    deployment_run_id: str,
+    production_deployed: bool,
+) -> dict[str, Any]:
+    return {
+        "github_sync_status": github_sync_status,
+        "retryable": retryable,
+        "blocker_code": blocker_code,
+        "last_error": last_error,
+        "candidate_commit": candidate_commit,
+        "deployment_run_id": deployment_run_id,
+        "production_deployed": production_deployed,
+    }
+
+
 class BackendValidator(Protocol):
     def validate(self, candidate_worktree: Path) -> ValidationEvidence: ...
 
@@ -975,6 +1060,7 @@ class GitBackendDeploymentManager:
                 self._write_manifest(manifest_path, manifest)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
 
     def _execute_candidate(
         self,
@@ -2072,6 +2158,7 @@ class GitBackendDeploymentManager:
             rollback_performed=False,
         )
 
+
     @staticmethod
     def _write_manifest(path: Path, manifest: dict) -> None:
         temporary_path = path.with_suffix(".json.tmp")
@@ -2454,10 +2541,27 @@ class GitBackendDeploymentExecutor:
                     deployment_run_id=claim.id,
                 )
             except AgentDeploymentError as exc:
+                blocker_code = github_sync_blocker_code(str(exc))
+                retryable = github_sync_retryable(blocker_code)
+                recovery = deployment_recovery_metadata(
+                    github_sync_status=(
+                        GITHUB_SYNC_FAILED_RETRYABLE
+                        if retryable
+                        else GITHUB_SYNC_FAILED_NON_RETRYABLE
+                    ),
+                    retryable=retryable,
+                    blocker_code=blocker_code,
+                    last_error=_tail(str(exc), 3000),
+                    candidate_commit=candidate.candidate_commit,
+                    deployment_run_id=claim.id,
+                    production_deployed=True,
+                )
                 pending = {
                     "status": "pending",
                     "candidate_commit": candidate.candidate_commit,
+                    "blocker_code": blocker_code,
                     "failure_reason": _tail(str(exc), 3000),
+                    "retryable": retryable,
                 }
                 record_error = None
                 try:
@@ -2478,6 +2582,15 @@ class GitBackendDeploymentExecutor:
                     "Backend deployment and local source synchronization succeeded, "
                     f"but GitHub synchronization is pending: {reason}",
                     retry_after_seconds=self.retry_after_seconds,
+                    metadata={
+                        "executor": "git_backend_deployment",
+                        "phase": claim.phase.value,
+                        "environment": candidate.environment,
+                        "mode": "backend-qa-to-production",
+                        "candidate": asdict(candidate),
+                        "github_sync": pending,
+                        "deployment_recovery": recovery,
+                    },
                 ) from exc
             try:
                 self.deployment_manager.record_github_sync(
@@ -2527,14 +2640,22 @@ Changed files:
                 "mode": "backend-qa-to-production",
                 "candidate": asdict(candidate),
                 "github_sync": github_sync,
+                "deployment_recovery": deployment_recovery_metadata(
+                    github_sync_status=(
+                        GITHUB_SYNC_SUCCEEDED
+                        if github_sync is not None
+                        else GITHUB_SYNC_LOCAL_INCOMPLETE
+                    ),
+                    retryable=False,
+                    blocker_code=None,
+                    last_error=None,
+                    candidate_commit=candidate.candidate_commit,
+                    deployment_run_id=claim.id,
+                    production_deployed=candidate.environment == "production",
+                ),
             },
         )
 
-
-# Compatibility aliases for the promoted documentation-only foundation. New worker
-# configuration uses git-backend-deployment and the generic classes above.
-GitQaDeploymentManager = GitBackendDeploymentManager
-GitQaDeploymentExecutor = GitBackendDeploymentExecutor
 
 
 def _required_absolute_directory(value: str | Path, *, field: str) -> Path:

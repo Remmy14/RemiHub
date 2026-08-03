@@ -221,6 +221,8 @@ def main() -> int:
         stage = "remote_before"
         before = remote_hash(ev.run("ls-remote-before", git("ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"), e))
         result["remote_before"] = before
+        if before not in {base, candidate}:
+            raise Failure("remote branch is neither the expected base nor candidate")
 
         stage = "remote_ancestry"
         ev.run("remote-object", git("cat-file", "-e", f"{before}^{{commit}}"), e)

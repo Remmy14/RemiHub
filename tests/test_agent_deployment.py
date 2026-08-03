@@ -299,8 +299,16 @@ class FakeRuntime:
 
 
 class FakeGitHubSynchronizer:
-    def __init__(self, *, fail_times: int = 0):
+    def __init__(
+        self,
+        *,
+        fail_times: int = 0,
+        failure_message: str = "GitHub unavailable",
+        already_current: bool = False,
+    ):
         self.fail_times = fail_times
+        self.failure_message = failure_message
+        self.already_current = already_current
         self.calls = []
 
     def synchronize(
@@ -321,13 +329,13 @@ class FakeGitHubSynchronizer:
         )
         if self.fail_times:
             self.fail_times -= 1
-            raise AgentDeploymentError("GitHub unavailable")
+            raise AgentDeploymentError(self.failure_message)
         return {
             "status": "verified",
             "candidate_commit": candidate_commit,
-            "remote_before": base_commit,
+            "remote_before": candidate_commit if self.already_current else base_commit,
             "remote_after": candidate_commit,
-            "push_return_code": 0,
+            "push_return_code": "not_needed" if self.already_current else 0,
         }
 
 
@@ -1036,6 +1044,11 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(len(completed_manifest["attempts"]), 1)
         self.assertEqual(completed_manifest["attempts"][-1]["stage"], "github_synchronized")
         self.assertEqual(completed_manifest["github_sync"]["status"], "verified")
+
+
+
+
+
 
     def test_production_executor_requires_github_synchronizer(self):
         with self.assertRaisesRegex(

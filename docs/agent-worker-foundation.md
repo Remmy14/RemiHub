@@ -62,6 +62,13 @@ migration can grant it access. The worker receives only:
 
 It cannot create or delete cards, approvals, runs, users, notifications, or any
 other RemiHub data. It receives no access to unrelated public-schema tables.
+The authenticated administrator API owns explicit post-deployment GitHub
+synchronization retry requests, but it does not invoke repository or sudo
+helpers. It validates and makes the exact blocked deployment run immediately
+available, then requests the existing protected production deployment worker.
+The worker retains the existing repository, sudo, systemd, credential, and
+remote-write boundaries and executes only the successful-attempt health and
+GitHub synchronization path.
 Migration `0005_agent_repository_scope` adds the durable scope column but does
 not grant worker privileges. Successful Android planning completion also
 normalizes `base_branch` to `master`. The protected control-plane hardening

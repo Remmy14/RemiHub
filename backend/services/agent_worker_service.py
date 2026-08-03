@@ -333,6 +333,12 @@ def claim_next_run(
                     lease_token,
                     lease_seconds,
                     attempt_count,
+                    json.dumps(
+                        row.get("result_metadata") or {}
+                        if previous_run_status is RunStatus.BLOCKED
+                        else {},
+                        sort_keys=True,
+                    ),
                     row["id"],
                 ),
             )
@@ -777,6 +783,7 @@ def block_run(
     *,
     reason: str,
     retry_after_seconds: int,
+    metadata: dict | None = None,
 ) -> None:
     normalized_reason = reason.strip()
     if not normalized_reason:
@@ -787,6 +794,7 @@ def block_run(
         retry_after_seconds,
         field="retry_after_seconds",
     )
+    metadata_payload = json.dumps(dict(metadata or {}), sort_keys=True)
     resume_status = queued_card_status_for_phase(claim.phase)
 
     conn = get_db_conn()
@@ -806,6 +814,7 @@ def block_run(
                     lease_expires_at = NULL,
                     available_at = CURRENT_TIMESTAMP + {_lease_interval_sql()},
                     blocked_reason = %s,
+                    result_metadata = %s::jsonb,
                     finished_at = NULL
                 WHERE id = %s
                 """,
@@ -813,6 +822,7 @@ def block_run(
                     RunStatus.BLOCKED.value,
                     retry_after_seconds,
                     normalized_reason,
+                    metadata_payload,
                     claim.id,
                 ),
             )
@@ -844,6 +854,7 @@ def block_run(
                     "retry_after_seconds": retry_after_seconds,
                     "run_id": claim.id,
                     "worker_id": claim.worker_id,
+                    "metadata": dict(metadata or {}),
                 },
             )
         conn.commit()
@@ -885,7 +896,7 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
                     finished_at = CURRENT_TIMESTAMP,
                     error_message = %s,
                     result_message_id = NULL,
-                    result_metadata = '{}'::jsonb
+                    result_metadata = %s::jsonb
                 WHERE id = %s
                 """,
                 (RunStatus.FAILED.value, normalized_error, claim.id),
@@ -980,11 +991,13 @@ class DatabaseAgentQueue:
         *,
         reason: str,
         retry_after_seconds: int,
+        metadata: dict | None = None,
     ) -> None:
         block_run(
             claim,
             reason=reason,
             retry_after_seconds=retry_after_seconds,
+            metadata=metadata,
         )
 
     def fail_run(self, claim: ClaimedRun, *, error_message: str) -> None:

@@ -29,11 +29,16 @@ class AgentDecisionRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class AgentGitHubSyncRetryRequest(AgentRequestModel):
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class AgentCardAction(str, Enum):
     ADD_FOLLOW_UP = "add_follow_up"
     APPROVE_IMPLEMENTATION = "approve_implementation"
     APPROVE_DEPLOYMENT = "approve_deployment"
     RETRY = "retry"
+    RETRY_GITHUB_SYNC = "retry_github_sync"
     CANCEL = "cancel"
     CLOSE = "close"
 
@@ -52,6 +57,16 @@ class AgentLatestRun(BaseModel):
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class AgentDeploymentRecovery(BaseModel):
+    github_sync_status: str
+    retryable: bool
+    blocker_code: str | None = None
+    last_error: str | None = None
+    candidate_commit: str | None = None
+    deployment_run_id: UUID
+    production_deployed: bool
 
 
 class AgentCardSummary(BaseModel):
@@ -73,6 +88,7 @@ class AgentCardSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     latest_run: AgentLatestRun | None = None
+    deployment_recovery: AgentDeploymentRecovery | None = None
     allowed_actions: list[AgentCardAction] = Field(default_factory=list)
 
 

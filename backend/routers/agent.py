@@ -9,6 +9,7 @@ from backend.models.agent_models import (
     AgentCardResponse,
     AgentDecisionRequest,
     AgentErrorResponse,
+    AgentGitHubSyncRetryRequest,
     AgentMessageCreate,
 )
 from backend.services import agent_service
@@ -204,6 +205,30 @@ def retry_card(
     try:
         card = agent_service.retry_card(
             card_id=str(card_id),
+            requested_by=principal.id,
+            notes=request.notes,
+        )
+    except Exception as exc:
+        _raise_http_error(exc)
+
+    return {"success": True, "data": card}
+
+
+@router.post(
+    "/cards/{card_id}/deployments/{deployment_run_id}/retry-github-sync",
+    response_model=AgentCardResponse,
+    responses=CARD_ERROR_RESPONSES,
+)
+def retry_deployment_github_sync(
+    card_id: UUID,
+    deployment_run_id: UUID,
+    request: AgentGitHubSyncRetryRequest,
+    principal: AuthenticatedPrincipal = Depends(require_admin_principal),
+):
+    try:
+        card = agent_service.retry_deployment_github_sync(
+            card_id=str(card_id),
+            deployment_run_id=str(deployment_run_id),
             requested_by=principal.id,
             notes=request.notes,
         )

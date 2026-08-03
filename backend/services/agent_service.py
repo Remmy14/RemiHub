@@ -7,6 +7,16 @@ from uuid import UUID, uuid4
 
 from psycopg2 import errors
 
+from backend.core.agent_deployment import (
+    GITHUB_SYNC_FAILED_NON_RETRYABLE,
+    GITHUB_SYNC_FAILED_RETRYABLE,
+    GITHUB_SYNC_LOCAL_INCOMPLETE,
+    GITHUB_SYNC_PENDING,
+    GITHUB_SYNC_RETRY_ACTION,
+    GITHUB_SYNC_RUNNING,
+    GITHUB_SYNC_SUCCEEDED,
+    deployment_recovery_metadata,
+)
 from backend.core.agent_deployment_trigger import (
     AgentDeploymentTriggerError,
     trigger_deployment_worker,
@@ -144,6 +154,104 @@ def _latest_run_summary(run: dict | None) -> dict | None:
     }
 
 
+def _run_metadata(run: dict | None) -> dict:
+    if run is None:
+        return {}
+    metadata = run.get("result_metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _deployment_recovery_from_run(run: dict | None) -> dict | None:
+    if run is None or run.get("phase") != RunPhase.DEPLOYMENT.value:
+        return None
+    metadata = _run_metadata(run)
+    recovery = metadata.get("deployment_recovery")
+    github_sync = metadata.get("github_sync")
+    candidate = metadata.get("candidate")
+
+    candidate_commit = None
+    production_deployed = False
+    if isinstance(recovery, dict):
+        candidate_commit = recovery.get("candidate_commit")
+        production_deployed = bool(recovery.get("production_deployed"))
+    if not isinstance(candidate_commit, str) and isinstance(candidate, dict):
+        candidate_commit = candidate.get("candidate_commit")
+    if not isinstance(candidate_commit, str) and isinstance(github_sync, dict):
+        candidate_commit = github_sync.get("candidate_commit")
+
+    if run.get("status") in {
+        RunStatus.QUEUED.value,
+        RunStatus.CLAIMED.value,
+        RunStatus.RUNNING.value,
+    }:
+        if production_deployed:
+            return deployment_recovery_metadata(
+                github_sync_status=GITHUB_SYNC_RUNNING,
+                retryable=False,
+                blocker_code=None,
+                last_error=None,
+                candidate_commit=candidate_commit,
+                deployment_run_id=run["id"],
+                production_deployed=True,
+            )
+        return deployment_recovery_metadata(
+            github_sync_status=GITHUB_SYNC_LOCAL_INCOMPLETE,
+            retryable=False,
+            blocker_code=None,
+            last_error=None,
+            candidate_commit=candidate_commit,
+            deployment_run_id=run["id"],
+            production_deployed=False,
+        )
+
+    if isinstance(recovery, dict):
+        return recovery
+
+    if isinstance(github_sync, dict):
+        status = github_sync.get("status")
+        if status == "verified":
+            return deployment_recovery_metadata(
+                github_sync_status=GITHUB_SYNC_SUCCEEDED,
+                retryable=False,
+                blocker_code=None,
+                last_error=None,
+                candidate_commit=candidate_commit,
+                deployment_run_id=run["id"],
+                production_deployed=True,
+            )
+        if status == "pending":
+            retryable = bool(github_sync.get("retryable", True))
+            has_failure = bool(github_sync.get("failure_reason"))
+            return deployment_recovery_metadata(
+                github_sync_status=(
+                    GITHUB_SYNC_FAILED_RETRYABLE
+                    if retryable and has_failure
+                    else (
+                        GITHUB_SYNC_PENDING
+                        if retryable
+                        else GITHUB_SYNC_FAILED_NON_RETRYABLE
+                    )
+                ),
+                retryable=retryable,
+                blocker_code=github_sync.get("blocker_code")
+                or "github_sync_pending",
+                last_error=github_sync.get("failure_reason"),
+                candidate_commit=candidate_commit,
+                deployment_run_id=run["id"],
+                production_deployed=True,
+            )
+
+    return deployment_recovery_metadata(
+        github_sync_status=GITHUB_SYNC_LOCAL_INCOMPLETE,
+        retryable=False,
+        blocker_code=None,
+        last_error=run.get("error_message") or run.get("blocked_reason"),
+        candidate_commit=candidate_commit,
+        deployment_run_id=run["id"],
+        production_deployed=False,
+    )
+
+
 def _allowed_actions(card: dict) -> list[str]:
     status = CardStatus(card["status"])
     scope = coerce_repository_scope(card["repository_scope"])
@@ -171,6 +279,16 @@ def _allowed_actions(card: dict) -> list[str]:
     if status is CardStatus.FAILED:
         actions.append("retry")
 
+    recovery = card.get("deployment_recovery")
+    if (
+        status is CardStatus.BLOCKED
+        and isinstance(recovery, dict)
+        and recovery.get("retryable") is True
+        and recovery.get("github_sync_status")
+        in {GITHUB_SYNC_PENDING, GITHUB_SYNC_FAILED_RETRYABLE}
+    ):
+        actions.append(GITHUB_SYNC_RETRY_ACTION)
+
     if CardStatus.CANCELLED in ALLOWED_CARD_TRANSITIONS[status]:
         actions.append("cancel")
 
@@ -183,6 +301,7 @@ def _allowed_actions(card: dict) -> list[str]:
 def _decorate_card(card: dict, *, latest_run: dict | None = None) -> dict:
     result = dict(card)
     result["latest_run"] = _latest_run_summary(latest_run)
+    result["deployment_recovery"] = _deployment_recovery_from_run(latest_run)
     result["allowed_actions"] = _allowed_actions(result)
     return result
 
@@ -198,6 +317,8 @@ def _request_deployment_worker(scope: RepositoryScope) -> None:
             "Deployment worker immediate trigger failed; fallback timer will retry: scope=%s",
             scope.value,
         )
+
+
 
 def _required_text(value: str, *, field: str, maximum: int) -> str:
     normalized = value.strip()
@@ -889,6 +1010,7 @@ def list_cards(*, include_closed: bool = False) -> list[dict]:
                        attempt_count,
                        blocked_reason,
                        error_message,
+                       result_metadata,
                        created_at,
                        updated_at
                 FROM agent.runs
@@ -1275,6 +1397,164 @@ def retry_card(
     except errors.UniqueViolation as exc:
         conn.rollback()
         raise _unique_violation_error(exc) from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+    if deployment_trigger_scope is not None:
+        _request_deployment_worker(deployment_trigger_scope)
+    return result
+
+
+def retry_deployment_github_sync(
+    *,
+    card_id: str,
+    deployment_run_id: str,
+    requested_by: str,
+    notes: str | None = None,
+) -> dict:
+    notes = _optional_text(notes, field="notes", maximum=2000)
+    deployment_trigger_scope: RepositoryScope | None = None
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+            _require_backend_scope(card, action="GitHub synchronization retry")
+            cur.execute(
+                """
+                SELECT id,
+                       card_id,
+                       phase,
+                       status,
+                       card_revision,
+                       attempt_count,
+                       blocked_reason,
+                       error_message,
+                       result_metadata,
+                       created_at,
+                       updated_at
+                FROM agent.runs
+                WHERE id::text = %s
+                  AND card_id = %s
+                  AND phase = 'deployment'
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (deployment_run_id, card_id),
+            )
+            run = _row_to_dict(cur, cur.fetchone())
+            if run is None:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry requires the exact deployment run"
+                )
+            recovery = _deployment_recovery_from_run(run)
+            if (
+                run["status"] == RunStatus.SUCCEEDED.value
+                and isinstance(recovery, dict)
+                and recovery.get("github_sync_status") == GITHUB_SYNC_SUCCEEDED
+            ):
+                _insert_event(
+                    cur,
+                    card_id=card_id,
+                    event_type="card.github_sync_retry_noop",
+                    actor_type="user",
+                    actor_user_id=requested_by,
+                    payload={
+                        "deployment_run_id": deployment_run_id,
+                        "notes": notes,
+                    },
+                )
+                result = _card_detail(conn, card_id)
+                conn.commit()
+                return result
+
+            if run["status"] != RunStatus.BLOCKED.value:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry requires a blocked deployment run"
+                )
+            if CardStatus(card["status"]) is not CardStatus.BLOCKED:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry requires a blocked card"
+                )
+            if run["card_revision"] != card["revision"]:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry requires the current card revision"
+                )
+            if (
+                not isinstance(recovery, dict)
+                or recovery.get("retryable") is not True
+                or recovery.get("github_sync_status")
+                not in {GITHUB_SYNC_PENDING, GITHUB_SYNC_FAILED_RETRYABLE}
+                or recovery.get("production_deployed") is not True
+            ):
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry is not available for this deployment state"
+                )
+
+            metadata = _run_metadata(run)
+            queued_recovery = dict(recovery)
+            queued_recovery.update(
+                {
+                    "github_sync_status": GITHUB_SYNC_RUNNING,
+                    "retryable": False,
+                    "blocker_code": None,
+                    "last_error": None,
+                }
+            )
+            metadata["deployment_recovery"] = queued_recovery
+            cur.execute(
+                """
+                UPDATE agent.runs
+                SET available_at = CURRENT_TIMESTAMP,
+                    blocked_reason = %s,
+                    result_metadata = %s::jsonb
+                WHERE id::text = %s
+                  AND status = 'blocked'
+                """,
+                (
+                    "Explicit GitHub synchronization retry requested",
+                    json.dumps(metadata, sort_keys=True),
+                    deployment_run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry lost the blocked deployment run"
+                )
+            cur.execute(
+                """
+                UPDATE agent.cards
+                SET blocked_reason = %s,
+                    blocked_until = CURRENT_TIMESTAMP
+                WHERE id = %s
+                  AND status = 'blocked'
+                """,
+                (
+                    "Explicit GitHub synchronization retry requested",
+                    card_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise AgentStateConflictError(
+                    "GitHub synchronization retry lost the blocked card"
+                )
+            _insert_event(
+                cur,
+                card_id=card_id,
+                event_type="card.github_sync_retry_requested",
+                actor_type="user",
+                actor_user_id=requested_by,
+                payload={
+                    "deployment_run_id": deployment_run_id,
+                    "notes": notes,
+                },
+            )
+            result = _card_detail(conn, card_id)
+            deployment_trigger_scope = RepositoryScope.BACKEND
+        conn.commit()
     except Exception:
         conn.rollback()
         raise

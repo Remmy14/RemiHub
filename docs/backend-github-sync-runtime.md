@@ -20,8 +20,9 @@ verification.
 The GitHub stage is allowed to run only after the production deployment and
 protected local source synchronization have succeeded. Before pushing, the
 service must read the configured GitHub branch and prove that the remote commit
-is an ancestor of the exact deployed canonical commit. Missing, divergent, or
-otherwise unexpected remote state is refused rather than repaired silently.
+is either the expected pre-deployment base commit or the exact deployed
+canonical commit. Missing, divergent, intermediate, or otherwise unexpected
+remote state is refused rather than repaired silently.
 
 Synchronization uses a normal fast-forward push of the exact deployed canonical
 commit. It must never use `--force`, `--force-with-lease`, or any equivalent
@@ -35,6 +36,29 @@ integration must record GitHub failure separately and retry only this control
 helper after repeating production health verification. That retry path must not
 repeat migrations, promotion, service restart, release metadata publication, or
 local source synchronization.
+
+## API recovery state
+
+The card API exposes structured `deployment_recovery` data for backend
+deployment runs so clients do not parse `blocked_reason` or free-form worker
+messages. The GitHub synchronization state distinguishes local deployment
+incomplete, GitHub synchronization pending, GitHub synchronization running,
+retryable GitHub synchronization failure, verified GitHub synchronization, and
+non-retryable remote divergence or integrity failure. The structure includes the
+GitHub synchronization status, retryability, stable blocker code, last sync
+error, deployed candidate commit, exact deployment run ID, and whether
+production has already been deployed successfully.
+
+Administrators may request an exact-run retry through the Agent API. The API
+does not execute repository or sudo operations in the web-service process.
+Instead it validates and requeues the exact blocked deployment run for immediate
+claim by the existing protected production deployment worker. That worker
+reuses the successful-attempt path: it repeats production health verification,
+then invokes the existing protected GitHub synchronization helper, without
+repeating validation, migrations, promotion, restart, target advancement, or
+local source synchronization. The action is idempotent: an already-verified run
+is a no-op, and a remote already at the candidate is recorded as verified
+success.
 
 ## Permanent permissions rule
 

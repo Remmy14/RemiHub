@@ -167,6 +167,20 @@ after a GitHub-only failure performs production health verification and GitHub
 synchronization only; it must not repeat migrations, promotion, service restart,
 release metadata publication, or local source synchronization.
 
+GitHub-only blocked deployments also expose structured recovery metadata through
+the Agent card response. Clients receive a machine-readable GitHub sync status,
+retryability flag, blocker code, last synchronization error, candidate commit,
+deployment run ID, and a flag proving production was already deployed. The
+explicit administrative retry action is bound to the exact card and deployment
+run. It requeues that existing blocked run for the protected production worker;
+the API process does not construct the deployment executor or invoke sudo
+helpers directly. The worker transitions the run/card to normal completion only
+after the protected GitHub helper records verified synchronization. If the
+helper reports a retryable blocker, production remains untouched and the
+structured blocker is updated. If the helper reports remote divergence or
+protected-source integrity failure, the state is marked non-retryable for
+manual recovery.
+
 ## Static services
 
 The installer creates but does not enable or start the deployment workers:

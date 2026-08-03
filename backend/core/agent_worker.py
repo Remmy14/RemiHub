@@ -20,7 +20,13 @@ class AgentWorkerConfigurationError(RuntimeError):
 
 
 class AgentTemporarilyBlockedError(RuntimeError):
-    def __init__(self, reason: str, *, retry_after_seconds: int):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        retry_after_seconds: int,
+        metadata: dict | None = None,
+    ):
         normalized_reason = reason.strip()
         if not normalized_reason:
             raise ValueError("A temporary block requires a reason")
@@ -30,6 +36,7 @@ class AgentTemporarilyBlockedError(RuntimeError):
         super().__init__(normalized_reason)
         self.reason = normalized_reason
         self.retry_after_seconds = retry_after_seconds
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,7 @@ class AgentQueue(Protocol):
         *,
         reason: str,
         retry_after_seconds: int,
+        metadata: dict | None = None,
     ) -> None: ...
 
     def fail_run(self, claim: ClaimedRun, *, error_message: str) -> None: ...
@@ -237,6 +245,7 @@ class AgentWorker:
                     claim,
                     reason=exc.reason,
                     retry_after_seconds=exc.retry_after_seconds,
+                    metadata=exc.metadata,
                 )
             except AgentLeaseLostError:
                 self._log_lease_lost(claim)

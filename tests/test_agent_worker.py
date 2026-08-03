@@ -188,6 +188,7 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
             claim,
             reason="Usage limit reached",
             retry_after_seconds=900,
+            metadata={},
         )
         self.queue.fail_run.assert_not_called()
 
