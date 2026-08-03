@@ -19,6 +19,7 @@ approved implementation revision
 → service restart
 → process and /openapi.json verification
 → target/source synchronization
+→ post-deployment GitHub synchronization for production
 → completed, safely rolled back for retry, or failed closed
 ```
 
@@ -143,6 +144,14 @@ worker can resolve the exact commit and read `backend/agent_worker.py`.
 Production source synchronization is transactional and applies the same
 hardening after automatic restoration.
 
+Only after production deployment, health verification, target promotion, and
+local source synchronization have all succeeded may the executor request
+post-deployment GitHub synchronization. The GitHub stage is not part of the
+transactional production rollback boundary. A GitHub-only failure must be
+recorded separately and must not roll back an otherwise successful production
+deployment, database migration, local source synchronization, or release
+metadata publication.
+
 ## Manifest and retries
 
 Each deployment run writes one protected JSON manifest below the environment's
@@ -153,7 +162,10 @@ attempt.
 
 A safely rolled-back failure returns the card to a timed retry state. A retry
 reuses the same immutable candidate and appends a new attempt. A retry after a
-confirmed success is idempotent and performs only health verification.
+confirmed success is idempotent and performs only health verification. A retry
+after a GitHub-only failure performs production health verification and GitHub
+synchronization only; it must not repeat migrations, promotion, service restart,
+release metadata publication, or local source synchronization.
 
 ## Static services
 
