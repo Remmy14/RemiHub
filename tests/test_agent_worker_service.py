@@ -9,6 +9,7 @@ from backend.services.agent_worker_service import (
     _validate_candidate,
     claim_next_run,
     complete_run,
+    fail_run,
     heartbeat_run,
     persist_codex_thread_id,
     persist_implementation_workspace,
@@ -134,6 +135,68 @@ class AgentClaimCandidateTests(unittest.TestCase):
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
+
+    @patch("backend.services.agent_worker_service._rows_to_dicts")
+    @patch("backend.services.agent_worker_service._row_to_dict")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_claim_blocked_run_preserves_result_metadata_with_matching_parameters(
+        self,
+        get_db_conn,
+        put_db_conn,
+        insert_event,
+        row_to_dict,
+        rows_to_dicts,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = object()
+        cursor.fetchall.return_value = []
+        get_db_conn.return_value = connection
+        recovery_metadata = {
+            "deployment_recovery": {
+                "github_sync_status": "github_sync_failed_retryable",
+                "retryable": True,
+            }
+        }
+        row_to_dict.return_value = candidate(
+            run_status="blocked",
+            card_status="blocked",
+            resume_status="planning_queued",
+            result_metadata=recovery_metadata,
+            card_revision=1,
+            attempt_count=1,
+            title="Retry metadata",
+            description="Preserve structured state.",
+            base_branch="main",
+            feature_branch=None,
+            worktree_path=None,
+            codex_thread_id=None,
+            deployment_approval_id=None,
+            implementation_run_id=None,
+            implementation_result_metadata=None,
+        )
+        rows_to_dicts.return_value = []
+
+        result = claim_next_run(
+            worker_id="production-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.PLANNING}),
+        )
+
+        self.assertIsNotNone(result)
+        run_update_sql, run_update_parameters = cursor.execute.call_args_list[1].args
+        self.assertIn("result_metadata = %s::jsonb", run_update_sql)
+        self.assertEqual(run_update_sql.count("%s"), len(run_update_parameters))
+        self.assertEqual(
+            run_update_parameters[-2],
+            '{"deployment_recovery": {"github_sync_status": "github_sync_failed_retryable", "retryable": true}}',
+        )
+        self.assertEqual(run_update_parameters[-1], row_to_dict.return_value["id"])
+        insert_event.assert_called_once()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
 
     @patch("backend.services.agent_worker_service.put_db_conn")
     @patch("backend.services.agent_worker_service.get_db_conn")
@@ -537,6 +600,43 @@ class AgentWorkerIdentityTests(unittest.TestCase):
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
+class RunFailureMetadataTests(unittest.TestCase):
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_fail_run_clears_result_metadata_without_parameter_mismatch(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        claim = claimed_run()
+        lock_owned_run.return_value = {
+            "card_status": "planning",
+            "phase": "planning",
+            "repository_scope": "backend",
+        }
+
+        fail_run(claim, error_message="boom")
+
+        run_update_sql, run_update_parameters = cursor.execute.call_args_list[0].args
+        self.assertIn("result_metadata = '{}'::jsonb", run_update_sql)
+        self.assertEqual(run_update_sql.count("%s"), len(run_update_parameters))
+        self.assertEqual(
+            run_update_parameters,
+            ("failed", "boom", claim.id),
+        )
+        insert_message.assert_called_once()
+        insert_event.assert_called_once()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
 
 if __name__ == "__main__":
     unittest.main()

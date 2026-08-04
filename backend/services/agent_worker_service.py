@@ -324,7 +324,7 @@ def claim_next_run(
                     finished_at = NULL,
                     error_message = NULL,
                     result_message_id = NULL,
-                    result_metadata = '{{}}'::jsonb
+                    result_metadata = %s::jsonb
                 WHERE id = %s
                 """,
                 (
@@ -896,7 +896,7 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
                     finished_at = CURRENT_TIMESTAMP,
                     error_message = %s,
                     result_message_id = NULL,
-                    result_metadata = %s::jsonb
+                    result_metadata = '{}'::jsonb
                 WHERE id = %s
                 """,
                 (RunStatus.FAILED.value, normalized_error, claim.id),
