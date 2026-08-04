@@ -70,3 +70,17 @@ owner/group/mode/ACL, Git `safe.directory`, `HOME` and credential context,
 deploy-key path and permissions, known-hosts path and permissions, sudo policy,
 fixed repository URL and branch, exact read/push/reread commands, return code,
 stdout, and stderr in cumulative handoff evidence.
+
+## Controlled recovery acceptance
+
+A GitHub-only synchronization failure may leave the production deployment and
+protected local source synchronization healthy and committed. The card API must
+expose structured deployment recovery state and the exact deployment run ID so
+operators can target the failed post-deployment synchronization step directly.
+
+An explicit GitHub synchronization retry repeats only production health
+verification and the trusted GitHub synchronization helper. It must not repeat
+validation, migrations, database backup, target promotion, application restart,
+release publication, or protected local source synchronization. A successful
+retry updates the same deployment run to succeeded and verifies the remote
+branch at the exact deployed candidate.
