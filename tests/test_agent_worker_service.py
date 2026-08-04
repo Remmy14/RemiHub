@@ -427,6 +427,26 @@ class ImplementationWorkspacePersistenceTests(unittest.TestCase):
 
 
 class RunCompletionTests(unittest.TestCase):
+    def _mock_successful_completion(
+        self,
+        get_db_conn,
+        lock_owned_run,
+        insert_message,
+        *,
+        card_status: str,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        lock_owned_run.return_value = {
+            "card_status": card_status,
+            "phase": card_status,
+            "repository_scope": "backend",
+        }
+        insert_message.return_value = "message-id"
+        return connection, cursor
+
+    @patch("backend.services.agent_worker_service.insert_notification")
     @patch("backend.services.agent_worker_service._insert_event")
     @patch("backend.services.agent_worker_service._insert_message")
     @patch("backend.services.agent_worker_service._lock_owned_run")
@@ -439,6 +459,7 @@ class RunCompletionTests(unittest.TestCase):
         lock_owned_run,
         insert_message,
         insert_event,
+        insert_notification,
     ):
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
@@ -481,7 +502,16 @@ class RunCompletionTests(unittest.TestCase):
         )
         connection.commit.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
+        insert_notification.assert_called_once()
+        notification = insert_notification.call_args.args[0]
+        self.assertEqual(notification.title, "Agent plan is ready")
+        self.assertEqual(notification.module, "Agent")
+        self.assertEqual(notification.data["card_id"], claim.card_id)
+        self.assertEqual(notification.data["run_id"], claim.id)
+        self.assertEqual(notification.data["status"], "awaiting_implementation_approval")
+        self.assertEqual(notification.data["action"], "approve_implementation")
 
+    @patch("backend.services.agent_worker_service.insert_notification")
     @patch("backend.services.agent_worker_service._insert_event")
     @patch("backend.services.agent_worker_service._insert_message")
     @patch("backend.services.agent_worker_service._lock_owned_run")
@@ -494,6 +524,7 @@ class RunCompletionTests(unittest.TestCase):
         lock_owned_run,
         insert_message,
         insert_event,
+        insert_notification,
     ):
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
@@ -539,6 +570,171 @@ class RunCompletionTests(unittest.TestCase):
         )
         connection.commit.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
+        insert_notification.assert_called_once()
+
+    @patch("backend.services.agent_worker_service.insert_notification")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_planning_feedback_completion_inserts_actionable_notification(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+        insert_notification,
+    ):
+        self._mock_successful_completion(
+            get_db_conn,
+            lock_owned_run,
+            insert_message,
+            card_status="planning",
+        )
+        claim = claimed_run()
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="Need an answer",
+                card_status=CardStatus.AWAITING_FEEDBACK,
+                repository_scope=RepositoryScope.BACKEND,
+            ),
+        )
+
+        insert_notification.assert_called_once()
+        notification = insert_notification.call_args.args[0]
+        self.assertEqual(notification.title, "Agent needs feedback")
+        self.assertEqual(notification.priority, 1)
+        self.assertEqual(notification.data["phase"], "planning")
+        self.assertEqual(notification.data["status"], "awaiting_feedback")
+        self.assertEqual(notification.data["action"], "add_follow_up")
+
+    @patch("backend.services.agent_worker_service.insert_notification")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_implementation_completion_inserts_review_notification(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+        insert_notification,
+    ):
+        self._mock_successful_completion(
+            get_db_conn,
+            lock_owned_run,
+            insert_message,
+            card_status="implementing",
+        )
+        claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="Done",
+                card_status=CardStatus.REVIEW_READY,
+                metadata={"workspace": {"changed_files": ["backend/example.py"]}},
+            ),
+        )
+
+        insert_notification.assert_called_once()
+        notification = insert_notification.call_args.args[0]
+        self.assertEqual(notification.title, "Implementation is ready for review")
+        self.assertEqual(notification.data["phase"], "implementation")
+        self.assertEqual(notification.data["status"], "review_ready")
+        self.assertEqual(notification.data["action"], "approve_deployment")
+
+    @patch("backend.services.agent_worker_service.insert_notification")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_backend_completion_inserts_completed_notification(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+        insert_notification,
+    ):
+        self._mock_successful_completion(
+            get_db_conn,
+            lock_owned_run,
+            insert_message,
+            card_status="deploying",
+        )
+        claim = claimed_run(phase=RunPhase.DEPLOYMENT)
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="Deployed",
+                card_status=CardStatus.COMPLETED,
+                metadata={"candidate": {"changed_files": ["backend/example.py"]}},
+            ),
+        )
+
+        insert_notification.assert_called_once()
+        notification = insert_notification.call_args.args[0]
+        self.assertEqual(notification.title, "Agent task completed")
+        self.assertEqual(notification.priority, 0)
+        self.assertEqual(notification.data["phase"], "deployment")
+        self.assertEqual(notification.data["status"], "completed")
+        self.assertEqual(notification.data["action"], "view_card")
+        self.assertNotIn("frontend_build_ready", notification.data)
+
+    @patch("backend.services.agent_worker_service.insert_notification")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_frontend_completion_inserts_build_ready_notification(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+        insert_notification,
+    ):
+        self._mock_successful_completion(
+            get_db_conn,
+            lock_owned_run,
+            insert_message,
+            card_status="deploying",
+        )
+        claim = claimed_run(phase=RunPhase.DEPLOYMENT)
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="Deployed",
+                card_status=CardStatus.COMPLETED,
+                metadata={
+                    "candidate": {
+                        "changed_files": [
+                            "backend/example.py",
+                            "frontend-web/src/App.tsx",
+                        ],
+                    }
+                },
+            ),
+        )
+
+        insert_notification.assert_called_once()
+        notification = insert_notification.call_args.args[0]
+        self.assertEqual(notification.title, "Frontend build is ready")
+        self.assertEqual(notification.data["frontend_build_ready"], "true")
 
     def test_planning_success_rejects_unresolved_repository_scope(self):
         with self.assertRaisesRegex(AgentQueueStateError, "resolved"):

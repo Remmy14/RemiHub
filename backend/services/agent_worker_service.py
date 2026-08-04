@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from uuid import uuid4
 
 from backend.core.agent_state import (
@@ -21,6 +22,10 @@ from backend.core.agent_worker import (
     DeploymentSource,
     ExecutionResult,
 )
+from backend.notifications.notifications import (
+    agent_status_notification,
+    insert_notification,
+)
 from backend.services.agent_service import (
     _insert_event,
     _insert_message,
@@ -29,6 +34,9 @@ from backend.services.agent_service import (
     get_db_conn,
     put_db_conn,
 )
+
+
+logger = logging.getLogger("remihub.agent_worker_service")
 
 
 class AgentQueueStateError(RuntimeError):
@@ -776,6 +784,25 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         raise
     finally:
         put_db_conn(conn)
+
+    notification = agent_status_notification(
+        card_id=claim.card_id,
+        run_id=claim.id,
+        card_title=claim.title,
+        phase=claim.phase.value,
+        status=target_status.value,
+        metadata=metadata_payload,
+    )
+    if notification is not None:
+        try:
+            insert_notification(notification)
+        except Exception:
+            logger.exception(
+                "Failed to insert agent status notification: card=%s run=%s status=%s",
+                claim.card_id,
+                claim.id,
+                target_status.value,
+            )
 
 
 def block_run(
