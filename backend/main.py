@@ -33,6 +33,7 @@ from backend.routers import (
         rh_storage,
         speedtest,
         weather,
+        weightlifting,
         kids_investing,
         spotify,
     )
@@ -128,6 +129,7 @@ protected_routers = [
     rh_storage.router,
     finance.router,
     kids_investing.router,
+    weightlifting.router,
     spotify.router,
 ]
 

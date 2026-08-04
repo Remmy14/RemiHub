@@ -87,6 +87,7 @@ class AuthenticationRoutePolicyTests(unittest.TestCase):
                 "rh_storage",
                 "finance",
                 "kids_investing",
+                "weightlifting",
                 "spotify",
             },
         )

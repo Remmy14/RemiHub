@@ -26,6 +26,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0003", "agent_workflow_foundation"),
                 ("0004", "agent_worker_leases"),
                 ("0005", "agent_repository_scope"),
+                ("0006", "weightlifting_foundation"),
             ],
         )
 
@@ -53,6 +54,20 @@ class MigrationDiscoveryTests(unittest.TestCase):
     def test_repository_scope_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0005_agent_repository_scope.up.sql"
         down = MIGRATIONS_DIR / "0005_agent_repository_scope.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_weightlifting_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0006_weightlifting_foundation.up.sql"
+        down = MIGRATIONS_DIR / "0006_weightlifting_foundation.down.sql"
 
         GitBackendDeploymentManager._validate_migration_sql(
             up,
