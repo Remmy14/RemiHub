@@ -16,10 +16,12 @@ ASSETS = ROOT / "deployments" / "agent_android"
 CONTROL = ASSETS / "libexec" / "remihub-android-release-control"
 VALIDATOR = ASSETS / "libexec" / "remihub-android-release-validator"
 PROBE = ASSETS / "libexec" / "remihub-android-release-counter-namespace-probe"
+PREFLIGHT = ASSETS / "libexec" / "remihub-android-canonical-index-preflight"
 EXPECTED_HASHES = {
-    CONTROL: "f0cc13780b591dd44f0b1bc55899b8de994f73443584767d407d1651e484884e",
+    CONTROL: "4101d16a8d1da77c6648c85c321ceadb8f407d641ef9326019e982baa2be940a",
     VALIDATOR: "72b068950ca764817344b30b1c3635395174ea29092f154fd4318f00d66973c2",
-    PROBE: "7be52e73d59fdf9dbcda1a2f0e812dd6013fe9908369034f3fabdb58d61ac492",
+    PROBE: "9a2f7c0aa0b7a5955d0746b84242e9a27af6eee0c94ace280e9c3b112540dc01",
+    PREFLIGHT: "8185021080406ed2174092b9e459ece52baac8e856bf1109cc5ee7d2855651a0",
 }
 
 
@@ -63,6 +65,10 @@ class AndroidDeploymentAssetTests(unittest.TestCase):
             '"platform":"android"',
             "active release database verification failed",
             "published APK no longer matches signed release",
+            'VERSION_FILE = Path("/var/lib/remihub-agent/android-release-counter/release_version.json")',
+            'rev(CANONICAL_REPO, "master", user="alex")',
+            'PLANNING_REPO = Path("/opt/remihub-agent/repositories/remihub-android-planning")',
+            'rev(PLANNING_REPO, "HEAD", user="alex")',
         )
         for value in required:
             self.assertIn(value, source)
@@ -182,6 +188,9 @@ class AndroidDeploymentAssetTests(unittest.TestCase):
         namespace = (
             ASSETS / "systemd" / "40-release-counter-namespace.conf"
         ).read_text(encoding="utf-8")
+        canonical = (
+            ASSETS / "systemd" / "50-canonical-index-preflight.conf"
+        ).read_text(encoding="utf-8")
         sudoers = (
             ASSETS / "sudoers" / "remihub-android-release"
         ).read_text(encoding="utf-8")
@@ -192,9 +201,15 @@ class AndroidDeploymentAssetTests(unittest.TestCase):
         self.assertEqual(
             namespace,
             "[Service]\n"
-            "ReadWritePaths=/opt/remihub/deployments\n"
+            "ReadWritePaths=/var/lib/remihub-agent/android-release-counter\n"
             "ExecStartPre=+/usr/local/libexec/"
             "remihub-android-release-counter-namespace-probe\n",
+        )
+        self.assertEqual(
+            canonical,
+            "[Service]\n"
+            "ExecStartPre=+/usr/local/libexec/"
+            "remihub-android-canonical-index-preflight\n",
         )
         self.assertEqual(
             sudoers,

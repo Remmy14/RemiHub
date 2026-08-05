@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -14,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 CANONICAL_REPO = Path("/opt/remihub")
@@ -27,8 +26,6 @@ SERVICE = "remihub-agent-backend-github-sync.service"
 SYNC_GROUP = "remihub-github-sync"
 BRANCH = "main"
 PRODUCTION_BRANCH = "production-main"
-ALLOWED_DIRTY = " M deployments/release_version.json"
-RELEASE_FILE = CANONICAL_REPO / "deployments/release_version.json"
 HEALTH_URL = "http://127.0.0.1:8000/openapi.json"
 
 
@@ -64,14 +61,6 @@ def git_worktree(repo: Path, *args: str, user: str | None = None) -> subprocess.
 
 def git_bare(repo: Path, *args: str, user: str) -> subprocess.CompletedProcess[str]:
     return run(["/usr/bin/env", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "/usr/bin/git", f"--git-dir={repo}", *args], user=user)
-
-
-def sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def atomic_request(payload: dict[str, Any]) -> None:
@@ -132,11 +121,10 @@ def synchronize(candidate: str, base: str, card_id: str, deployment_run_id: str)
 
     for path in (CANONICAL_REPO, IMPLEMENTATION_REPO, PLANNING_REPO, PRODUCTION_REPO, STATE_ROOT, REQUEST_PATH.parent):
         verify_path(path)
-    verify_path(RELEASE_FILE, directory=False)
 
-    canonical_branch = one_line(git_worktree(CANONICAL_REPO, "symbolic-ref", "--quiet", "--short", "HEAD"), "canonical branch")
-    canonical_commit = one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{commit}"), "canonical commit")
-    canonical_tree = one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{tree}"), "canonical tree")
+    canonical_branch = one_line(git_worktree(CANONICAL_REPO, "symbolic-ref", "--quiet", "--short", "HEAD", user="alex"), "canonical branch")
+    canonical_commit = one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{commit}", user="alex"), "canonical commit")
+    canonical_tree = one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{tree}", user="alex"), "canonical tree")
     implementation_commit = one_line(git_bare(IMPLEMENTATION_REPO, "rev-parse", "--verify", "refs/heads/main^{commit}", user="remihub-agent"), "implementation main")
     planning_branch = one_line(git_worktree(PLANNING_REPO, "symbolic-ref", "--quiet", "--short", "HEAD", user="alex"), "planning branch")
     planning_commit = one_line(git_worktree(PLANNING_REPO, "rev-parse", "--verify", "HEAD^{commit}", user="alex"), "planning commit")
@@ -147,11 +135,11 @@ def synchronize(candidate: str, base: str, card_id: str, deployment_run_id: str)
     observed = {canonical_commit, implementation_commit, planning_commit, production_commit}
     if observed != {candidate}:
         fail(f"protected repository refs do not all equal candidate {candidate}: {sorted(observed)}")
-    git_worktree(CANONICAL_REPO, "cat-file", "-e", f"{base}^{{commit}}")
-    git_worktree(CANONICAL_REPO, "merge-base", "--is-ancestor", base, candidate)
-    status = git_worktree(CANONICAL_REPO, "status", "--porcelain=v1", "--untracked-files=all").stdout.rstrip("\n")
-    if status != ALLOWED_DIRTY:
-        fail("canonical worktree has an unexpected dirty state")
+    git_worktree(CANONICAL_REPO, "cat-file", "-e", f"{base}^{{commit}}", user="alex")
+    git_worktree(CANONICAL_REPO, "merge-base", "--is-ancestor", base, candidate, user="alex")
+    status = git_worktree(CANONICAL_REPO, "status", "--porcelain=v1", "--untracked-files=all", user="alex").stdout.rstrip("\n")
+    if status:
+        fail("canonical worktree is not clean")
 
     health = run(["/usr/bin/curl", "--fail", "--silent", "--show-error", "--max-time", "20", HEALTH_URL])
     try:
@@ -171,7 +159,6 @@ def synchronize(candidate: str, base: str, card_id: str, deployment_run_id: str)
         "candidate_commit": candidate,
         "base_commit": base,
         "expected_tree": canonical_tree,
-        "release_sha256": sha256_path(RELEASE_FILE),
         "card_id": card_id,
         "deployment_run_id": deployment_run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -197,7 +184,7 @@ def synchronize(candidate: str, base: str, card_id: str, deployment_run_id: str)
         fail(f"GitHub sync failed after deployment remained successful: {reason}")
 
     # Re-prove all local durable boundaries after the network operation.
-    if one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{commit}"), "canonical commit after") != candidate:
+    if one_line(git_worktree(CANONICAL_REPO, "rev-parse", "--verify", "HEAD^{commit}", user="alex"), "canonical commit after") != candidate:
         fail("canonical commit changed during GitHub synchronization")
     if one_line(git_bare(IMPLEMENTATION_REPO, "rev-parse", "--verify", "refs/heads/main^{commit}", user="remihub-agent"), "implementation main after") != candidate:
         fail("implementation main changed during GitHub synchronization")
@@ -205,6 +192,15 @@ def synchronize(candidate: str, base: str, card_id: str, deployment_run_id: str)
         fail("planning checkout changed during GitHub synchronization")
     if one_line(git_bare(PRODUCTION_REPO, "rev-parse", "--verify", f"refs/heads/{PRODUCTION_BRANCH}^{{commit}}", user="remihub-deployer"), "production target after") != candidate:
         fail("production target changed during GitHub synchronization")
+    status_after = git_worktree(
+        CANONICAL_REPO,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        user="alex",
+    ).stdout.rstrip("\n")
+    if status_after:
+        fail("canonical worktree changed during GitHub synchronization")
     REQUEST_PATH.unlink(missing_ok=True)
     return result
 

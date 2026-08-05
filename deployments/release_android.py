@@ -18,8 +18,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("release_android")
 
-DEPLOYMENT_DIR = Path("/mnt/secure-pool/Q_Drive/Projects/RemiHub/deployments")
-VERSION_FILE = DEPLOYMENT_DIR / "release_version.json"
+VERSION_FILE = Path("/var/lib/remihub-agent/android-release-counter/release_version.json")
 
 ANDROID_APP_DIR = Path("/home/alex/StudioProjects/RemiHub-App/")
 GRADLE_FILE = ANDROID_APP_DIR / "app" / "build.gradle.kts"

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -12,20 +11,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 TEST_MODE = os.environ.get("REMIHUB_GITHUB_SYNC_TEST_MODE") == "1"
 REPO = Path(os.environ.get("REMIHUB_GITHUB_SYNC_CANONICAL_REPO", "/opt/remihub"))
+GIT_DIR = REPO / ".git"
 REQUEST = Path(os.environ.get("REMIHUB_GITHUB_SYNC_REQUEST_PATH", "/run/remihub-agent/github-sync/backend-request.json"))
 STATE = Path(os.environ.get("REMIHUB_GITHUB_SYNC_STATE_ROOT", "/var/lib/remihub-agent/github-sync/backend"))
 REMOTE = os.environ.get("REMIHUB_GITHUB_SYNC_REMOTE_URL", "git@github.com:Remmy14/RemiHub.git")
 BRANCH = os.environ.get("REMIHUB_GITHUB_SYNC_REMOTE_BRANCH", "main")
 KEY = Path(os.environ.get("REMIHUB_GITHUB_SYNC_IDENTITY_FILE", "/etc/remihub-agent/github-sync/backend/id_ed25519"))
 KNOWN = Path(os.environ.get("REMIHUB_GITHUB_SYNC_KNOWN_HOSTS_FILE", "/etc/remihub-agent/github-sync/backend/known_hosts"))
-ALLOWED_DIRTY = os.environ.get("REMIHUB_GITHUB_SYNC_ALLOWED_DIRTY", " M deployments/release_version.json")
-RELEASE = REPO / "deployments/release_version.json"
 
 
 class Failure(RuntimeError):
@@ -34,14 +31,6 @@ class Failure(RuntimeError):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def sha(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -91,12 +80,6 @@ def require_hex(value: Any, field: str) -> str:
     return value
 
 
-def require_sha256(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not HEX64.fullmatch(value):
-        raise Failure(f"{field} is not a lowercase 64-character SHA-256")
-    return value
-
-
 def require_id(value: Any, field: str) -> str:
     if not isinstance(value, str) or not SAFE_ID.fullmatch(value):
         raise Failure(f"{field} is invalid")
@@ -140,7 +123,9 @@ def env() -> dict[str, str]:
 
 
 def git(*args: str) -> list[str]:
-    return ["/usr/bin/git", "-c", f"safe.directory={REPO}", "-C", str(REPO), *args]
+    # The network worker operates on repository objects and refs only. It must
+    # never open or refresh the canonical worktree index.
+    return ["/usr/bin/git", f"--git-dir={GIT_DIR}", *args]
 
 
 def single(result: subprocess.CompletedProcess[str], field: str) -> str:
@@ -173,7 +158,6 @@ def main() -> int:
         candidate = require_hex(req.get("candidate_commit"), "candidate_commit")
         base = require_hex(req.get("base_commit"), "base_commit")
         tree = require_hex(req.get("expected_tree"), "expected_tree")
-        release_expected = require_sha256(req.get("release_sha256"), "release_sha256")
         if req.get("repository") != "backend" or req.get("branch") != BRANCH:
             raise Failure("request does not match fixed repository/branch")
         root = STATE / "results" / request_id
@@ -183,7 +167,7 @@ def main() -> int:
         os.chmod(root / "request.json", 0o600)
         result.update({
             "request_id": request_id, "candidate_commit": candidate, "base_commit": base,
-            "expected_tree": tree, "release_sha256_before": release_expected,
+            "expected_tree": tree,
             "card_id": req.get("card_id"), "deployment_run_id": req.get("deployment_run_id"),
             "evidence_directory": str(ev.root),
         })
@@ -207,16 +191,9 @@ def main() -> int:
         ev.run("base-object", git("cat-file", "-e", f"{base}^{{commit}}"), e)
         ev.run("base-ancestry", git("merge-base", "--is-ancestor", base, candidate), e)
 
-        stage = "canonical_integrity_before"
-        status_before = ev.run("status-before", git("status", "--porcelain=v1", "--untracked-files=all"), e).stdout.rstrip("\n")
-        if status_before != ALLOWED_DIRTY:
-            raise Failure("canonical worktree has unexpected changes")
-        if RELEASE.is_symlink() or not RELEASE.is_file():
-            raise Failure("release metadata is missing or unsafe")
-        release_before = sha(RELEASE)
-        if release_before != release_expected:
-            raise Failure("release metadata changed after request creation")
-        result["worktree_status_before"] = status_before
+        stage = "repository_integrity_before"
+        if GIT_DIR.is_symlink() or not GIT_DIR.is_dir():
+            raise Failure("canonical Git directory is missing or unsafe")
 
         stage = "remote_before"
         before = remote_hash(ev.run("ls-remote-before", git("ls-remote", "--heads", REMOTE, f"refs/heads/{BRANCH}"), e))
@@ -249,15 +226,16 @@ def main() -> int:
         if after != candidate:
             raise Failure("remote after does not equal candidate")
 
-        stage = "canonical_integrity_after"
-        status_after = ev.run("status-after", git("status", "--porcelain=v1", "--untracked-files=all"), e).stdout.rstrip("\n")
-        if status_after != status_before or sha(RELEASE) != release_before:
-            raise Failure("canonical worktree or release metadata changed")
+        stage = "repository_integrity_after"
         if single(ev.run("commit-after", git("rev-parse", "--verify", "HEAD^{commit}"), e), "commit after") != candidate:
             raise Failure("canonical commit changed")
-        result.update({"status": "verified", "worktree_status_after": status_after,
-                       "release_sha256_after": release_before, "failure_stage": None,
-                       "failure_reason": None})
+        if single(ev.run("tree-after", git("rev-parse", "--verify", "HEAD^{tree}"), e), "tree after") != tree:
+            raise Failure("canonical tree changed")
+        result.update({
+            "status": "verified",
+            "failure_stage": None,
+            "failure_reason": None,
+        })
         rc = 0
     except Exception as exc:
         result["failure_stage"] = stage

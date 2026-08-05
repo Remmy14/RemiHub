@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import grp
 import hashlib
 import os
 from pathlib import Path
+import pwd
 import stat
 import sys
 import tempfile
 
 
-COUNTER = Path("/opt/remihub/deployments/release_version.json")
+COUNTER = Path("/var/lib/remihub-agent/android-release-counter/release_version.json")
 
 
 def digest(path: Path) -> str:
@@ -29,6 +31,17 @@ def probe(counter: Path) -> None:
     counter_stat = counter.stat()
     if not stat.S_ISREG(counter_stat.st_mode):
         raise RuntimeError("counter is not a regular file")
+    try:
+        owner_uid = pwd.getpwnam("alex").pw_uid
+        group_gid = grp.getgrnam("storage").gr_gid
+    except KeyError as exc:
+        raise RuntimeError("counter owner or group is unavailable") from exc
+    if (
+        counter_stat.st_uid != owner_uid
+        or counter_stat.st_gid != group_gid
+        or stat.S_IMODE(counter_stat.st_mode) != 0o640
+    ):
+        raise RuntimeError("counter ownership or mode is unsafe")
 
     parent = counter.parent
     if parent.is_symlink() or not parent.is_dir():

@@ -2,17 +2,12 @@
 """Root-owned, fixed-path control boundary for RemiHub backend deployment."""
 from __future__ import annotations
 
-import fcntl
 import grp
-import hashlib
-import json
 import os
 import pwd
 import re
-import stat
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,15 +33,6 @@ class Environment:
     runtime_user: str
 
 
-@dataclass(frozen=True)
-class OperationalReleaseSnapshot:
-    content: bytes
-    sha256: str
-    owner_uid: int
-    group_gid: int
-    mode: int
-
-
 ENVIRONMENTS = {
     "qa": Environment(
         service="remihub-backend-qa.service",
@@ -70,18 +56,6 @@ PLANNING_REPO = Path("/opt/remihub-agent/repositories/remihub-planning")
 GIT_SAFE_CONFIG = Path(
     "/opt/remihub-agent/deployment/config/git-safe-directory.ini"
 )
-
-RELEASE_VERSION_RELATIVE = Path("deployments/release_version.json")
-ANDROID_RELEASE_LOCK = Path("/var/lib/remihub-agent/android-release/release.lock")
-RELEASE_VERSION_KEYS = (
-    "version_code",
-    "version_major",
-    "version_minor",
-    "version_patch",
-)
-RELEASE_VERSION_OWNER = "alex"
-RELEASE_VERSION_GROUP = "storage"
-RELEASE_VERSION_MODE = 0o775
 
 
 def fail(message: str) -> "NoReturn":
@@ -169,19 +143,6 @@ def resolve(repo: Path, ref: str, *, user: str | None = None) -> str:
     return commit(value)
 
 
-def _is_production(environment: Environment) -> bool:
-    return environment.target_branch == "production-main"
-
-
-def _release_identity() -> tuple[int, int]:
-    try:
-        owner_uid = pwd.getpwnam(RELEASE_VERSION_OWNER).pw_uid
-        group_gid = grp.getgrnam(RELEASE_VERSION_GROUP).gr_gid
-    except KeyError:
-        fail("release metadata owner or group is missing")
-    return owner_uid, group_gid
-
-
 def _parse_runtime_status(raw: str) -> tuple[tuple[str, str], ...]:
     if not raw:
         return ()
@@ -224,175 +185,6 @@ def _parse_runtime_status(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(records)
 
 
-def _release_payload(content: bytes, *, source: str) -> dict[str, int]:
-    try:
-        decoded = content.decode("utf-8")
-        payload = json.loads(decoded)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        fail(f"{source} release metadata is not valid UTF-8 JSON")
-    if not isinstance(payload, dict) or set(payload) != set(RELEASE_VERSION_KEYS):
-        fail(f"{source} release metadata has an invalid schema")
-
-    normalized: dict[str, int] = {}
-    for key in RELEASE_VERSION_KEYS:
-        value = payload.get(key)
-        if type(value) is not int or value < 0:
-            fail(f"{source} release metadata field {key} is invalid")
-        normalized[key] = value
-    if normalized["version_code"] <= 0:
-        fail(f"{source} release metadata version_code is invalid")
-    return normalized
-
-
-def _read_regular_file(path: Path) -> tuple[bytes, os.stat_result]:
-    if path.is_symlink():
-        fail("release metadata path is a symlink")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        fail("release metadata file is missing or unsafe")
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            fail("release metadata path is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        final = os.fstat(descriptor)
-        if (
-            opened.st_dev != final.st_dev
-            or opened.st_ino != final.st_ino
-            or opened.st_size != final.st_size
-        ):
-            fail("release metadata changed while being read")
-        return b"".join(chunks), final
-    finally:
-        os.close(descriptor)
-
-
-def _committed_release_payload(
-    environment: Environment,
-    expected: str,
-) -> dict[str, int]:
-    result = run(
-        [
-            GIT,
-            "-C",
-            str(environment.runtime),
-            "show",
-            f"{expected}:{RELEASE_VERSION_RELATIVE.as_posix()}",
-        ],
-        user=environment.runtime_user,
-    )
-    return _release_payload(
-        result.stdout.encode("utf-8"),
-        source="committed",
-    )
-
-
-def capture_operational_release(
-    environment: Environment,
-    expected: str,
-) -> OperationalReleaseSnapshot | None:
-    if not _is_production(environment):
-        return None
-
-    path = environment.runtime / RELEASE_VERSION_RELATIVE
-    content, metadata = _read_regular_file(path)
-    owner_uid, group_gid = _release_identity()
-    mode = stat.S_IMODE(metadata.st_mode)
-    if (
-        metadata.st_uid != owner_uid
-        or metadata.st_gid != group_gid
-        or mode != RELEASE_VERSION_MODE
-    ):
-        fail("release metadata ownership or mode is invalid")
-
-    live = _release_payload(content, source="live")
-    committed = _committed_release_payload(environment, expected)
-    if live["version_code"] < committed["version_code"]:
-        fail("live release metadata version_code regressed")
-    if (
-        live["version_major"],
-        live["version_minor"],
-        live["version_patch"],
-    ) < (
-        committed["version_major"],
-        committed["version_minor"],
-        committed["version_patch"],
-    ):
-        fail("live release metadata version tuple regressed")
-
-    return OperationalReleaseSnapshot(
-        content=content,
-        sha256=hashlib.sha256(content).hexdigest(),
-        owner_uid=metadata.st_uid,
-        group_gid=metadata.st_gid,
-        mode=mode,
-    )
-
-
-def restore_operational_release(
-    environment: Environment,
-    snapshot: OperationalReleaseSnapshot | None,
-) -> None:
-    if snapshot is None:
-        return
-
-    path = environment.runtime / RELEASE_VERSION_RELATIVE
-    parent = path.parent
-    if parent.is_symlink() or not parent.is_dir():
-        fail("release metadata parent is missing or unsafe")
-
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=parent,
-            prefix=f".{path.name}.backend-deployment.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            handle.write(snapshot.content)
-            handle.flush()
-            os.fsync(handle.fileno())
-            os.fchown(
-                handle.fileno(),
-                snapshot.owner_uid,
-                snapshot.group_gid,
-            )
-            os.fchmod(handle.fileno(), snapshot.mode)
-        os.replace(temporary_path, path)
-        temporary_path = None
-        directory_fd = os.open(
-            parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-    restored, metadata = _read_regular_file(path)
-    if (
-        hashlib.sha256(restored).hexdigest() != snapshot.sha256
-        or restored != snapshot.content
-        or metadata.st_uid != snapshot.owner_uid
-        or metadata.st_gid != snapshot.group_gid
-        or stat.S_IMODE(metadata.st_mode) != snapshot.mode
-    ):
-        fail("release metadata did not restore exactly")
-
-
 def _runtime_status(environment: Environment) -> tuple[tuple[str, str], ...]:
     result = run(
         [
@@ -416,28 +208,12 @@ def require_runtime_state(environment: Environment, expected: str) -> None:
         fail("runtime HEAD does not match the expected commit")
 
     status_records = _runtime_status(environment)
-    if not status_records:
-        if _is_production(environment):
-            capture_operational_release(environment, expected)
-        return
-
-    allowed = ((" M", RELEASE_VERSION_RELATIVE.as_posix()),)
-    if not _is_production(environment) or status_records != allowed:
+    if status_records:
         details = "; ".join(
             f"{status_code} {relative!r}"
             for status_code, relative in status_records
         )
         fail(f"runtime has tracked modifications: {details}")
-    capture_operational_release(environment, expected)
-
-
-def _with_release_lock(environment: Environment):
-    if not _is_production(environment):
-        return None
-    ANDROID_RELEASE_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    handle = ANDROID_RELEASE_LOCK.open("a+")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    return handle
 
 
 def reset_runtime_preserving_operational_release(
@@ -446,33 +222,18 @@ def reset_runtime_preserving_operational_release(
     expected_before: str,
     target: str,
 ) -> None:
-    lock_handle = _with_release_lock(environment)
-    try:
-        require_runtime_state(environment, expected_before)
-        snapshot = capture_operational_release(environment, expected_before)
-        reset_error: BaseException | None = None
-        try:
-            run(
-                [GIT, "-C", str(environment.runtime), "reset", "--hard", target],
-                user=environment.runtime_user,
-            )
-        except BaseException as exc:
-            reset_error = exc
-        try:
-            restore_operational_release(environment, snapshot)
-        except BaseException:
-            if reset_error is not None:
-                raise
-            raise
-        if reset_error is not None:
-            raise reset_error
-        if environment.target_branch == "qa-main":
-            harden_qa_runtime(environment, target)
-        else:
-            require_runtime_state(environment, target)
-    finally:
-        if lock_handle is not None:
-            lock_handle.close()
+    # The legacy function name is retained for the installed command contract.
+    # Mutable Android release state now lives outside the Git worktree, so the
+    # runtime must be clean and can be reset directly.
+    require_runtime_state(environment, expected_before)
+    run(
+        [GIT, "-C", str(environment.runtime), "reset", "--hard", target],
+        user=environment.runtime_user,
+    )
+    if environment.target_branch == "qa-main":
+        harden_qa_runtime(environment, target)
+    else:
+        require_runtime_state(environment, target)
 
 
 def _tracked_file_modes(repository: Path) -> dict[Path, int]:

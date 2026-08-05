@@ -24,6 +24,7 @@ TARGET_REPO = Path("/opt/remihub-agent/android/deployment/repository.git")
 TARGET_BRANCH = "production-main"
 CANONICAL_REPO = Path("/opt/remihub-android")
 IMPLEMENTATION_REPO = Path("/opt/remihub-agent/repositories/remihub-android-implementation.git")
+PLANNING_REPO = Path("/opt/remihub-agent/repositories/remihub-android-planning")
 ARTIFACT_ROOT = Path("/opt/remihub-agent/android/deployment/artifacts")
 RELEASE_ROOT = Path("/opt/remihub/releases/android")
 LEGACY_STAGING_ROOT = RELEASE_ROOT / ".agent-staging"
@@ -35,7 +36,7 @@ FAILPOINT_ROOT = STATE_ROOT / "failpoints"
 FAILPOINT_TRIGGER_STAGE = "after_sources_promoted_before_endpoint_verification"
 SIGNING_CONFIG = Path("/etc/remihub-agent/android-signing.json")
 READINESS = Path("/var/lib/remihub-agent/phase3b/android-signing-ready.json")
-VERSION_FILE = Path("/opt/remihub/deployments/release_version.json")
+VERSION_FILE = Path("/var/lib/remihub-agent/android-release-counter/release_version.json")
 APKSIGNER = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/apksigner")
 ZIPALIGN = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/zipalign")
 AAPT = Path("/opt/remihub-android-toolchain/android-sdk/build-tools/34.0.0/aapt2")
@@ -694,16 +695,27 @@ def git(repo: Path, *args: str, user: str | None = None, check=True):
     command_env = None
     if user:
         try:
-            home = pwd.getpwnam(user).pw_dir
+            pwd.getpwnam(user)
         except KeyError as exc:
             raise ReleaseError(f"required Git identity is missing: {user}") from exc
         command = ["runuser", "-u", user, "--", *command]
-        command_env = {"HOME": home}
+        command_env = {
+            "HOME": "/nonexistent",
+            "XDG_CONFIG_HOME": "/nonexistent",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+        }
     return run(command, check=check, timeout=300, env=command_env)
 
 
-def rev(repo: Path, ref: str) -> str:
-    value = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").stdout.strip().lower()
+def rev(repo: Path, ref: str, *, user: str | None = None) -> str:
+    value = git(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"{ref}^{{commit}}",
+        user=user,
+    ).stdout.strip().lower()
     if not COMMIT_RE.fullmatch(value):
         raise ReleaseError(f"invalid Git commit for {repo}: {ref}")
     return value
@@ -1256,8 +1268,7 @@ def sync_sources(candidate, base, candidate_branch):
         ["systemctl", "start", "remihub-agent-planning-sync.service"],
         timeout=180,
     )
-    planning = Path("/opt/remihub-agent/planning/android")
-    if not planning.is_dir() or rev(planning, "HEAD") != candidate:
+    if not PLANNING_REPO.is_dir() or rev(PLANNING_REPO, "HEAD", user="alex") != candidate:
         raise ReleaseError("Android planning checkout did not synchronize")
 
 
@@ -1270,7 +1281,7 @@ def restore_sources(base, candidate):
             candidate,
             user="remihub-deployer",
         )
-    if rev(CANONICAL_REPO, "master") == candidate:
+    if rev(CANONICAL_REPO, "master", user="alex") == candidate:
         set_ref(
             CANONICAL_REPO,
             "refs/heads/master",
@@ -1291,8 +1302,7 @@ def restore_sources(base, candidate):
         ["systemctl", "start", "remihub-agent-planning-sync.service"],
         timeout=180,
     )
-    planning = Path("/opt/remihub-agent/planning/android")
-    if not planning.is_dir() or rev(planning, "HEAD") != base:
+    if not PLANNING_REPO.is_dir() or rev(PLANNING_REPO, "HEAD", user="alex") != base:
         raise ReleaseError("Android planning checkout did not restore")
 
 
@@ -1327,12 +1337,11 @@ def verify_publish(request_path_raw):
     candidate = request["candidate_commit"]
     if (
         rev(TARGET_REPO, TARGET_BRANCH) != candidate
-        or rev(CANONICAL_REPO, "master") != candidate
+        or rev(CANONICAL_REPO, "master", user="alex") != candidate
         or rev(IMPLEMENTATION_REPO, "master") != candidate
     ):
         raise ReleaseError("published source refs no longer match")
-    planning = Path("/opt/remihub-agent/planning/android")
-    if not planning.is_dir() or rev(planning, "HEAD") != candidate:
+    if not PLANNING_REPO.is_dir() or rev(PLANNING_REPO, "HEAD", user="alex") != candidate:
         raise ReleaseError("published planning source no longer matches")
     state = active_state()
     active = state["active"]
