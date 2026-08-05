@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,9 +20,11 @@ from backend.core.agent_deployment import (
     DeploymentValidationError,
     GitBackendDeploymentExecutor,
     GitBackendDeploymentManager,
+    PostgresMigrationHistoryReader,
     PostgresDeploymentDatabase,
     RuntimeHealth,
     ValidationEvidence,
+    verify_distinct_database_identities,
 )
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import (
@@ -163,16 +166,35 @@ class FakeDatabase:
         self,
         *,
         pending=(),
+        history=(),
+        history_sequence=None,
         fail_upgrade=False,
         apply_before_failure=False,
         fail_downgrade=False,
     ):
         self.configured_pending = tuple(pending)
+        self.configured_history = tuple(history)
+        self.history_sequence = (
+            [tuple(item) for item in history_sequence]
+            if history_sequence is not None
+            else None
+        )
         self.applied = []
         self.fail_upgrade = fail_upgrade
         self.apply_before_failure = apply_before_failure
         self.fail_downgrade = fail_downgrade
         self.events = []
+
+    def migration_history(self):
+        self.events.append("history")
+        if self.history_sequence is not None:
+            if len(self.history_sequence) > 1:
+                return self.history_sequence.pop(0)
+            return self.history_sequence[0]
+        return self.configured_history
+
+    def database_identity(self):
+        return ("database", "session_user", "current_user", "127.0.0.1", "5432")
 
     def pending_versions(self, migrations_dir: Path):
         self.events.append(("pending", migrations_dir))
@@ -207,6 +229,26 @@ class FakeDatabase:
             if version in self.applied:
                 self.applied.remove(version)
         return tuple(reversed(versions))
+
+
+class FakeHistoryReader:
+    def __init__(self, history=(), *, identity=None):
+        self.history = tuple(history)
+        self.identity = identity or (
+            "qa",
+            "qa_reader",
+            "qa_reader",
+            "127.0.0.1",
+            "5432",
+        )
+        self.events = []
+
+    def migration_history(self):
+        self.events.append("history")
+        return self.history
+
+    def database_identity(self):
+        return self.identity
 
 
 class FakeRuntime:
@@ -425,6 +467,51 @@ class PostgresDeploymentDatabaseTests(unittest.TestCase):
                 owner_role="remihub; DROP ROLE",
             )
 
+    def test_read_only_history_reader_rejects_invalid_role(self):
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "QA_PARITY_DATABASE_ROLE",
+        ):
+            PostgresMigrationHistoryReader(
+                config_path=self.config,
+                role="reader; DROP",
+            )
+
+    def test_history_reader_uses_read_only_transaction_and_sanitized_rows(self):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (True,)
+        cursor.fetchall.return_value = [
+            ("0001", "initial", "a" * 64, datetime.now(timezone.utc)),
+        ]
+
+        with patch(
+            "backend.core.agent_deployment._connect_explicit_database_config",
+            return_value=connection,
+        ):
+            history = PostgresMigrationHistoryReader(
+                config_path=self.config,
+                role="remihub_qa_migration_reader",
+            ).migration_history()
+
+        self.assertEqual(
+            history,
+            ({"version": "0001", "name": "initial", "checksum": "a" * 64},),
+        )
+        executed = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertIn("SET ROLE remihub_qa_migration_reader", executed)
+        self.assertIn("SET TRANSACTION READ ONLY", executed)
+
+    def test_same_database_identity_is_rejected(self):
+        first = FakeHistoryReader(identity=("remihub", "u", "u", "127.0.0.1", "5432"))
+        second = FakeHistoryReader(identity=("remihub", "u", "u", "127.0.0.1", "5432"))
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "must be distinct",
+        ):
+            verify_distinct_database_identities(first, second)
+
 
 class GitBackendDeploymentManagerTests(unittest.TestCase):
     def setUp(self):
@@ -504,7 +591,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             artifact_root=self.source_artifacts,
         )
         self.validator = FakeValidator()
-        self.database = FakeDatabase()
+        self.database = FakeDatabase(history=self._expected_history())
         self.runtime = FakeRuntime()
 
     def _prepare_deployment(self, changes, *, tests=None):
@@ -569,6 +656,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         validator=None,
         database=None,
         runtime=None,
+        qa_history_reader=None,
         environment="qa",
     ):
         target_branch = "qa-main" if environment == "qa" else "production-main"
@@ -586,7 +674,23 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             validator=validator or self.validator,
             database=database or self.database,
             runtime=runtime or self.runtime,
+            qa_history_reader=(
+                qa_history_reader
+                if qa_history_reader is not None
+                else (
+                    FakeHistoryReader(self._expected_history())
+                    if environment == "production"
+                    else None
+                )
+            ),
         )
+
+    def _expected_history(self, migrations_dir=None):
+        if migrations_dir is None:
+            migrations_dir = self.seed / "backend" / "database" / "migrations"
+        from backend.core.agent_deployment import _expected_migration_history
+
+        return _expected_migration_history(Path(migrations_dir))
 
     def test_git_commands_use_protected_fixed_safe_directory_config(self):
         environment = self._manager()._git_environment()
@@ -662,7 +766,15 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                 ),
             }
         )
-        database = FakeDatabase(pending=("0002",))
+        database = FakeDatabase(
+            pending=("0002",),
+            history=self._expected_history(
+                self.implementation_workspace.path
+                / "backend"
+                / "database"
+                / "migrations"
+            ),
+        )
         candidate = self._manager(database=database).deploy(claim)
 
         self.assertEqual(candidate.migrations_applied, ("0002",))
@@ -673,6 +785,182 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
         upgrade_index = database.events.index(("upgrade", ("0002",)))
         self.assertLess(backup_index, upgrade_index)
+
+    def test_production_refuses_when_qa_missing_candidate_migration_before_mutation(self):
+        changes = {}
+        for version in range(2, 7):
+            changes[f"backend/database/migrations/{version:04d}_step_{version}.up.sql"] = (
+                f"CREATE TABLE step_{version} (id integer PRIMARY KEY);\n"
+            )
+            changes[
+                f"backend/database/migrations/{version:04d}_step_{version}.down.sql"
+            ] = f"DROP TABLE step_{version};\n"
+        claim = self._prepare_deployment(changes)
+        expected = self._expected_history(
+            self.implementation_workspace.path / "backend" / "database" / "migrations"
+        )
+        database = FakeDatabase(pending=("0002", "0003", "0004", "0005", "0006"))
+        runtime = FakeRuntime()
+        qa_reader = FakeHistoryReader(expected[:-1])
+
+        with self.assertRaisesRegex(AgentDeploymentError, "missing=\\('0006'"):
+            self._manager(
+                database=database,
+                runtime=runtime,
+                qa_history_reader=qa_reader,
+                environment="production",
+            ).deploy(claim)
+
+        self.assertEqual(runtime.events, [])
+        self.assertEqual(database.events, [])
+        self.assertEqual(
+            _git(self.target, "rev-parse", "production-main"),
+            self.base_commit,
+        )
+        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest = json.loads(manifest_path.read_text())
+        attempt = manifest["attempts"][-1]
+        self.assertEqual(attempt["status"], "failed_migration_parity")
+        self.assertEqual(
+            [item["version"] for item in manifest["migration_plan"]["expected_history"]],
+            ["0001", "0002", "0003", "0004", "0005", "0006"],
+        )
+
+    def test_production_aligned_qa_history_permits_continued_execution(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        qa_reader = FakeHistoryReader(expected)
+
+        candidate = self._manager(
+            qa_history_reader=qa_reader,
+            environment="production",
+        ).deploy(claim)
+
+        self.assertEqual(
+            _git(self.target, "rev-parse", "production-main"),
+            candidate.candidate_commit,
+        )
+        self.assertIn("history", qa_reader.events)
+
+    def test_production_refuses_qa_name_mismatch(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        observed = ({**expected[0], "name": "different_name"},)
+
+        with self.assertRaisesRegex(AgentDeploymentError, "name_mismatch=\\('0001'"):
+            self._manager(
+                qa_history_reader=FakeHistoryReader(observed),
+                environment="production",
+            ).deploy(claim)
+
+    def test_production_refuses_qa_checksum_mismatch(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        observed = ({**expected[0], "checksum": "0" * 64},)
+
+        with self.assertRaisesRegex(AgentDeploymentError, "checksum_mismatch=\\('0001'"):
+            self._manager(
+                qa_history_reader=FakeHistoryReader(observed),
+                environment="production",
+            ).deploy(claim)
+
+    def test_production_refuses_unexpected_qa_migration(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        observed = expected + (
+            {"version": "9999", "name": "future", "checksum": "f" * 64},
+        )
+
+        with self.assertRaisesRegex(AgentDeploymentError, "unexpected=\\('9999'"):
+            self._manager(
+                qa_history_reader=FakeHistoryReader(observed),
+                environment="production",
+            ).deploy(claim)
+
+    def test_no_new_migration_candidate_still_enforces_complete_qa_parity(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+
+        with self.assertRaisesRegex(AgentDeploymentError, "missing=\\('0001'"):
+            self._manager(
+                qa_history_reader=FakeHistoryReader(()),
+                environment="production",
+            ).deploy(claim)
+
+    def test_qa_history_is_rechecked_after_candidate_validation(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        database = FakeDatabase(
+            pending=(),
+            history=(),
+        )
+
+        with self.assertRaises(DeploymentRolledBackError):
+            self._manager(database=database).deploy(claim)
+
+        self.assertIn("verify", self.runtime.events)
+        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest = json.loads(manifest_path.read_text())
+        attempt = manifest["attempts"][-1]
+        self.assertEqual(attempt["failure_stage"], "qa_history_after_validation")
+        self.assertEqual(attempt["status"], "rolled_back")
+
+    def test_production_history_is_rechecked_after_production_validation(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        database = FakeDatabase(history=expected)
+
+        candidate = self._manager(
+            database=database,
+            qa_history_reader=FakeHistoryReader(expected),
+            environment="production",
+        ).deploy(claim)
+
+        self.assertEqual(candidate.target_after, candidate.candidate_commit)
+        self.assertIn("history", database.events)
+
+    def test_post_deployment_production_history_mismatch_rolls_back(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        database = FakeDatabase(history=())
+        runtime = FakeRuntime()
+
+        with self.assertRaises(DeploymentRolledBackError):
+            self._manager(
+                database=database,
+                runtime=runtime,
+                qa_history_reader=FakeHistoryReader(expected),
+                environment="production",
+            ).deploy(claim)
+
+        self.assertEqual(runtime.current_commit, self.base_commit)
+        self.assertEqual(
+            _git(self.target, "rev-parse", "production-main"),
+            self.base_commit,
+        )
+        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest = json.loads(manifest_path.read_text())
+        attempt = manifest["attempts"][-1]
+        self.assertEqual(attempt["status"], "rolled_back")
+        self.assertEqual(
+            attempt["failure_stage"],
+            "production_history_after_validation",
+        )
+
+    def test_migration_parity_evidence_omits_protected_values(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        expected = self._expected_history()
+        candidate = self._manager(
+            qa_history_reader=FakeHistoryReader(expected),
+            environment="production",
+        ).deploy(claim)
+
+        manifest = json.loads(Path(candidate.manifest_path).read_text())
+        serialized = json.dumps(manifest)
+        self.assertIn("qa_history_before_production_mutation", serialized)
+        self.assertIn("production_history_after_validation", serialized)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("migrator.ini", serialized)
+        self.assertNotIn("password", serialized.lower())
 
     def test_historical_migration_modification_is_rejected(self):
         claim = self._prepare_deployment(

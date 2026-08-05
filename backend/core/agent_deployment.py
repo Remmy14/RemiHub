@@ -71,6 +71,7 @@ class MigrationPlan:
     versions: tuple[str, ...] = ()
     names: tuple[str, ...] = ()
     files: tuple[str, ...] = ()
+    expected_history: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,8 @@ class BackendValidator(Protocol):
 
 
 class DeploymentDatabase(Protocol):
+    def migration_history(self) -> tuple[dict[str, str], ...]: ...
+
     def pending_versions(self, migrations_dir: Path) -> tuple[str, ...]: ...
 
     def backup(self, *, card_id: str, deployment_run_id: str) -> BackupEvidence: ...
@@ -225,6 +228,12 @@ class DeploymentDatabase(Protocol):
         migrations_dir: Path,
         versions: tuple[str, ...],
     ) -> tuple[str, ...]: ...
+
+
+class MigrationHistoryReader(Protocol):
+    def migration_history(self) -> tuple[dict[str, str], ...]: ...
+
+    def database_identity(self) -> tuple[str | None, ...]: ...
 
 
 class DeploymentRuntime(Protocol):
@@ -364,6 +373,27 @@ class PostgresDeploymentDatabase:
         if command_timeout_seconds < 1:
             raise ValueError("command_timeout_seconds must be at least 1")
         self.command_timeout_seconds = command_timeout_seconds
+
+    def migration_history(self) -> tuple[dict[str, str], ...]:
+        conn = self._connect()
+        try:
+            migration_runner._ensure_migration_table(conn)
+            migration_runner._acquire_lock(conn)
+            return _migration_history_from_applied(
+                migration_runner._applied_migrations(conn)
+            )
+        finally:
+            try:
+                migration_runner._release_lock(conn)
+            finally:
+                conn.close()
+
+    def database_identity(self) -> tuple[str | None, ...]:
+        conn = self._connect()
+        try:
+            return _database_identity(conn)
+        finally:
+            conn.close()
 
     def pending_versions(self, migrations_dir: Path) -> tuple[str, ...]:
         migrations = migration_runner.discover_migrations(migrations_dir)
@@ -541,6 +571,65 @@ class PostgresDeploymentDatabase:
             detail = _tail(result.stderr, 2000)
             suffix = f": {detail}" if detail else ""
             raise AgentDeploymentError(f"{context}{suffix}")
+
+
+class PostgresMigrationHistoryReader:
+    """Read-only schema_migrations access for cross-environment parity checks."""
+
+    def __init__(
+        self,
+        *,
+        config_path: str | Path,
+        role: str | None = None,
+    ):
+        self.config_path = _required_absolute_file(
+            config_path,
+            field="REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG",
+        )
+        normalized_role = role.strip() if role is not None else None
+        if normalized_role and not re.fullmatch(
+            r"[a-z_][a-z0-9_]{0,62}",
+            normalized_role,
+        ):
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_ROLE is invalid"
+            )
+        self.role = normalized_role
+
+    def migration_history(self) -> tuple[dict[str, str], ...]:
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+            migration_runner._acquire_lock(conn)
+            return _migration_history_from_applied(
+                migration_runner._applied_migrations(conn)
+            )
+        finally:
+            try:
+                migration_runner._release_lock(conn)
+            finally:
+                conn.rollback()
+                conn.close()
+
+    def database_identity(self) -> tuple[str | None, ...]:
+        conn = self._connect()
+        try:
+            return _database_identity(conn)
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def _connect(self):
+        conn = _connect_explicit_database_config(self.config_path)
+        try:
+            if self.role is not None:
+                with conn.cursor() as cur:
+                    cur.execute(f"SET ROLE {self.role}")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
 
 class PrivilegedDeploymentRuntime:
@@ -827,6 +916,7 @@ class GitBackendDeploymentManager:
         validator: BackendValidator,
         database: DeploymentDatabase,
         runtime: DeploymentRuntime,
+        qa_history_reader: MigrationHistoryReader | None = None,
         git_binary: str = "git",
         command_timeout_seconds: int = 120,
     ):
@@ -843,6 +933,7 @@ class GitBackendDeploymentManager:
         self.validator = validator
         self.database = database
         self.runtime = runtime
+        self.qa_history_reader = qa_history_reader
 
         self.source_repository = _required_absolute_directory(
             source_repository,
@@ -880,6 +971,10 @@ class GitBackendDeploymentManager:
             raise AgentWorkerConfigurationError(
                 f"{self.environment} deployment target branch must be "
                 f"{expected_target_branch}"
+            )
+        if self.environment == "production" and self.qa_history_reader is None:
+            raise AgentWorkerConfigurationError(
+                "Production backend deployment requires QA migration parity reader"
             )
 
         self._run_git(
@@ -1086,14 +1181,39 @@ class GitBackendDeploymentManager:
         source_sync_attempted = False
         sources_synchronized = False
         service_stopped = False
+        migrations_dir = candidate_path / "backend" / "database" / "migrations"
 
         try:
             validation = self.validator.validate(candidate_path)
             attempt["validation"] = asdict(validation)
             attempt["stage"] = "validated"
             self._write_manifest(manifest_path, manifest)
+        except DeploymentValidationError as exc:
+            attempt["status"] = "failed_validation"
+            attempt["error"] = str(exc)[:10000]
+            attempt["finished_at"] = _utc_now()
+            self._write_manifest(manifest_path, manifest)
+            raise
 
-            migrations_dir = candidate_path / "backend" / "database" / "migrations"
+        if self.environment == "production":
+            try:
+                self._record_and_require_migration_history(
+                    attempt,
+                    manifest_path,
+                    manifest,
+                    source="qa",
+                    stage="qa_history_before_production_mutation",
+                    expected_history=migration_plan.expected_history,
+                    reader=self._required_qa_history_reader(),
+                )
+            except Exception as exc:
+                attempt["status"] = "failed_migration_parity"
+                attempt["error"] = f"{type(exc).__name__}: {exc}"[:10000]
+                attempt["finished_at"] = _utc_now()
+                self._write_manifest(manifest_path, manifest)
+                raise
+
+        try:
             pending = self.database.pending_versions(migrations_dir)
             if pending != migration_plan.versions:
                 raise AgentDeploymentError(
@@ -1160,6 +1280,27 @@ class GitBackendDeploymentManager:
             attempt["stage"] = "health_verified"
             self._write_manifest(manifest_path, manifest)
 
+            if self.environment == "qa":
+                self._record_and_require_migration_history(
+                    attempt,
+                    manifest_path,
+                    manifest,
+                    source="qa",
+                    stage="qa_history_after_validation",
+                    expected_history=migration_plan.expected_history,
+                    reader=self.database,
+                )
+            else:
+                self._record_and_require_migration_history(
+                    attempt,
+                    manifest_path,
+                    manifest,
+                    source="production",
+                    stage="production_history_after_validation",
+                    expected_history=migration_plan.expected_history,
+                    reader=self.database,
+                )
+
             target_update_attempted = True
             self._run_git(
                 self.target_repository,
@@ -1207,12 +1348,6 @@ class GitBackendDeploymentManager:
                 database_backup=asdict(backup) if backup else None,
                 rollback_performed=False,
             )
-        except DeploymentValidationError as exc:
-            attempt["status"] = "failed_validation"
-            attempt["error"] = str(exc)[:10000]
-            attempt["finished_at"] = _utc_now()
-            self._write_manifest(manifest_path, manifest)
-            raise
         except Exception as exc:
             rollback_errors: list[str] = []
             attempt["failure_stage"] = attempt.get("stage")
@@ -1685,6 +1820,8 @@ class GitBackendDeploymentManager:
         candidate_path: Path,
     ) -> MigrationPlan:
         migration_prefix = "backend/database/migrations/"
+        migrations_dir = candidate_path / migration_prefix
+        expected_history = _expected_migration_history(migrations_dir)
         status_lines = self._run_git(
             self.target_repository,
             "diff",
@@ -1697,7 +1834,7 @@ class GitBackendDeploymentManager:
             error_context="Unable to inspect candidate migrations",
         ).stdout.splitlines()
         if not status_lines:
-            return MigrationPlan()
+            return MigrationPlan(expected_history=expected_history)
 
         added_files: list[str] = []
         grouped: dict[tuple[str, str], set[str]] = {}
@@ -1762,6 +1899,7 @@ class GitBackendDeploymentManager:
             versions=tuple(key[0] for key, _ in ordered),
             names=tuple(key[1] for key, _ in ordered),
             files=tuple(sorted(added_files)),
+            expected_history=expected_history,
         )
 
     @staticmethod
@@ -2158,6 +2296,39 @@ class GitBackendDeploymentManager:
             rollback_performed=False,
         )
 
+    def _required_qa_history_reader(self) -> MigrationHistoryReader:
+        if self.qa_history_reader is None:
+            raise AgentWorkerConfigurationError(
+                "Production backend deployment requires QA migration parity reader"
+            )
+        return self.qa_history_reader
+
+    def _record_and_require_migration_history(
+        self,
+        attempt: dict,
+        manifest_path: Path,
+        manifest: dict,
+        *,
+        source: str,
+        stage: str,
+        expected_history: tuple[dict[str, str], ...],
+        reader: MigrationHistoryReader,
+    ) -> None:
+        observed_history = reader.migration_history()
+        evidence = {
+            "source": source,
+            "checked_at": _utc_now(),
+            "expected_history": list(expected_history),
+            "observed_history": list(observed_history),
+        }
+        attempt[stage] = evidence
+        attempt["stage"] = stage
+        self._write_manifest(manifest_path, manifest)
+        _require_exact_migration_history(
+            source=source,
+            expected=expected_history,
+            observed=observed_history,
+        )
 
     @staticmethod
     def _write_manifest(path: Path, manifest: dict) -> None:
@@ -2688,6 +2859,124 @@ def _required_executable(value: str | Path, *, field: str) -> Path:
     if not path.is_file() or not os.access(path, os.X_OK):
         raise AgentWorkerConfigurationError(f"{field} is not executable: {path}")
     return path.resolve()
+
+
+def _expected_migration_history(migrations_dir: Path) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "version": migration.version,
+            "name": migration.name,
+            "checksum": migration.checksum,
+        }
+        for migration in migration_runner.discover_migrations(migrations_dir)
+    )
+
+
+def _migration_history_from_applied(
+    applied: dict[str, dict[str, str]],
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "version": version,
+            "name": record["name"],
+            "checksum": record["checksum"],
+        }
+        for version, record in sorted(applied.items())
+    )
+
+
+def _require_exact_migration_history(
+    *,
+    source: str,
+    expected: tuple[dict[str, str], ...],
+    observed: tuple[dict[str, str], ...],
+) -> None:
+    if observed == expected:
+        return
+
+    expected_by_version = {item["version"]: item for item in expected}
+    observed_by_version = {item["version"]: item for item in observed}
+
+    missing = tuple(
+        item["version"]
+        for item in expected
+        if item["version"] not in observed_by_version
+    )
+    unexpected = tuple(
+        item["version"]
+        for item in observed
+        if item["version"] not in expected_by_version
+    )
+    mismatched_names = tuple(
+        version
+        for version, item in expected_by_version.items()
+        if version in observed_by_version
+        and observed_by_version[version]["name"] != item["name"]
+    )
+    mismatched_checksums = tuple(
+        version
+        for version, item in expected_by_version.items()
+        if version in observed_by_version
+        and observed_by_version[version]["name"] == item["name"]
+        and observed_by_version[version]["checksum"] != item["checksum"]
+    )
+
+    details: list[str] = []
+    if missing:
+        details.append(f"missing={missing!r}")
+    if unexpected:
+        details.append(f"unexpected={unexpected!r}")
+    if mismatched_names:
+        details.append(f"name_mismatch={mismatched_names!r}")
+    if mismatched_checksums:
+        details.append(f"checksum_mismatch={mismatched_checksums!r}")
+    suffix = "; ".join(details) or "history differs"
+    raise AgentDeploymentError(
+        f"{source} migration history does not match the approved candidate: {suffix}"
+    )
+
+
+def _connect_explicit_database_config(config_path: Path):
+    import psycopg2
+
+    config = load_config(config_path)["Database"]
+    return psycopg2.connect(
+        user=config["user"],
+        password=config["password"],
+        host=config["host"],
+        port=config["port"],
+        database=config["database"],
+    )
+
+
+def _database_identity(conn) -> tuple[str | None, ...]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                current_database(),
+                session_user,
+                current_user,
+                inet_server_addr()::text,
+                inet_server_port()::text;
+            """
+        )
+        row = cur.fetchone()
+    return tuple(None if value is None else str(value) for value in row)
+
+
+def verify_distinct_database_identities(
+    first: MigrationHistoryReader,
+    second: MigrationHistoryReader,
+) -> None:
+    first_identity = first.database_identity()
+    second_identity = second.database_identity()
+    first_database = (first_identity[0], first_identity[3], first_identity[4])
+    second_database = (second_identity[0], second_identity[3], second_identity[4])
+    if first_database == second_database:
+        raise AgentWorkerConfigurationError(
+            "Production database and QA parity database must be distinct"
+        )
 
 
 def _sha256_file(path: Path) -> str:

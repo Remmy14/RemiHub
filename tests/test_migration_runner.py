@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from backend.core.agent_deployment import GitBackendDeploymentManager
+from backend.core.agent_deployment import _expected_migration_history
 from backend.database.migration_runner import (
     MIGRATIONS_DIR,
     _acquire_lock,
@@ -29,6 +30,22 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0006", "weightlifting_foundation"),
             ],
         )
+
+    def test_repository_candidate_history_contains_current_complete_identity(self):
+        history = _expected_migration_history(MIGRATIONS_DIR)
+
+        self.assertEqual(
+            [(item["version"], item["name"]) for item in history],
+            [
+                ("0001", "auth_foundation"),
+                ("0002", "remove_uv_alert_prototype"),
+                ("0003", "agent_workflow_foundation"),
+                ("0004", "agent_worker_leases"),
+                ("0005", "agent_repository_scope"),
+                ("0006", "weightlifting_foundation"),
+            ],
+        )
+        self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
 
     def test_agent_migration_enforces_single_open_card_and_active_run(self):
         migration = (

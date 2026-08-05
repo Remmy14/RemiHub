@@ -627,6 +627,7 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             validator=sandbox_validator.return_value,
             database=deployment_database.return_value,
             runtime=deployment_runtime.return_value,
+            qa_history_reader=None,
             command_timeout_seconds=45,
         )
         deployment_executor.assert_called_once_with(
@@ -637,16 +638,20 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
 
     @patch("backend.agent_worker.GitBackendDeploymentExecutor")
     @patch("backend.agent_worker.GitBackendDeploymentManager")
+    @patch("backend.agent_worker.verify_distinct_database_identities")
     @patch("backend.agent_worker.PrivilegedBackendGitHubSynchronizer")
     @patch("backend.agent_worker.PrivilegedDeploymentRuntime")
+    @patch("backend.agent_worker.PostgresMigrationHistoryReader")
     @patch("backend.agent_worker.PostgresDeploymentDatabase")
     @patch("backend.agent_worker.SandboxBackendValidator")
     def test_production_backend_deployment_uses_production_target(
         self,
         sandbox_validator,
         deployment_database,
+        qa_history_reader,
         deployment_runtime,
         github_synchronizer,
+        verify_distinct,
         deployment_manager,
         deployment_executor,
     ):
@@ -669,6 +674,12 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
                 "/srv/agent/config/prod-migrator.ini"
             ),
             "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub",
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG": (
+                "/srv/agent/config/qa-parity-reader.ini"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_ROLE": (
+                "remihub_qa_migration_reader"
+            ),
             "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
             "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": (
                 "/usr/lib/postgresql/16/bin/pg_dump"
@@ -698,6 +709,18 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
         self.assertEqual(
             deployment_manager.call_args.kwargs["target_branch"],
             "production-main",
+        )
+        qa_history_reader.assert_called_once_with(
+            config_path="/srv/agent/config/qa-parity-reader.ini",
+            role="remihub_qa_migration_reader",
+        )
+        verify_distinct.assert_called_once_with(
+            deployment_database.return_value,
+            qa_history_reader.return_value,
+        )
+        self.assertEqual(
+            deployment_manager.call_args.kwargs["qa_history_reader"],
+            qa_history_reader.return_value,
         )
         github_synchronizer.assert_called_once_with(
             helper_path="/srv/agent/bin/github-sync-helper",
@@ -733,6 +756,34 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(
             AgentWorkerConfigurationError,
             "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+    def test_production_backend_deployment_requires_qa_parity_config(self):
+        environment = {
+            "REMIHUB_AGENT_ENVIRONMENT": "production",
+            "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+            "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+            "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": "/srv/agent/production.git",
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": "/srv/agent/production-worktrees",
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": "/srv/agent/production-artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": "/srv/agent/prod.ini",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub",
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": "/usr/bin/pg_dump",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": "/usr/bin/pg_restore",
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/validate",
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": "/srv/agent/runtime-helper",
+            "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER": "/srv/agent/github-sync",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG",
         ):
             build_executor(settings, queue=MagicMock())
 

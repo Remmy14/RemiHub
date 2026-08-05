@@ -11,13 +11,15 @@ approved implementation revision
 → independent worktree/patch verification
 → immutable RemiHub-authored candidate commit
 → isolated compile and complete unittest suite
-→ migration-history and reversible-pair validation
+→ complete candidate migration-history and reversible-pair validation
+→ QA migration-history parity check before production mutation
 → Git rollback reference
 → PostgreSQL custom-format backup when migrations are pending
 → controlled migration execution
 → exact runtime promotion
 → service restart
 → process and /openapi.json verification
+→ post-validation migration-history parity check
 → target/source synchronization
 → post-deployment GitHub synchronization for production
 → completed, safely rolled back for retry, or failed closed
@@ -108,6 +110,29 @@ state and uses idempotent compare-and-swap restoration. If code or database
 restoration fails, the run fails closed and preserves the backup and complete
 attempt manifest for manual recovery.
 
+Every deployment candidate also derives the complete expected migration history
+from its own `backend/database/migrations` tree, not just migrations added by
+the current card. Each expected row contains only the migration `version`,
+`name`, and up-file SHA-256 checksum. QA deployments re-read
+`public.schema_migrations` after candidate runtime and health validation and
+must match that complete history exactly before the QA target ref advances.
+Production deployments independently re-read QA history before creating a
+rollback reference, backing up or migrating production, stopping the service,
+promoting runtime code, advancing refs, or synchronizing sources. This check
+runs even when the candidate adds no migration files. After production runtime
+health succeeds, production history is re-read and must also match exactly
+before target/source synchronization and success reporting; a mismatch enters
+the normal protected rollback path.
+
+The production worker receives a separate
+`REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG` that points to
+`/opt/remihub-agent/deployment/config/qa-parity-reader.ini`. That file must
+contain a least-privilege QA database login with read-only access to
+`public.schema_migrations`; it is never used for backup, upgrade, downgrade, or
+other QA mutation. The worker refuses production deployment when the parity
+configuration is absent or when the QA parity and production migrator
+connections report the same database identity.
+
 ## Runtime and source promotion
 
 QA promotes into the fixed `qa-runtime` checkout and controls
@@ -157,8 +182,11 @@ metadata publication.
 Each deployment run writes one protected JSON manifest below the environment's
 artifact root. It binds the approval, implementation run, card revision,
 implementation patch hash, exact candidate commit, migration plan, validation
-evidence, backup evidence, health evidence, rollback reference, and every
-attempt.
+evidence, backup evidence, health evidence, rollback reference, migration
+parity evidence, and every attempt. Migration parity evidence records only
+expected and observed `version`, `name`, and `checksum` rows plus the check
+time; it never records database configuration paths, users, passwords, URLs, or
+other protected values.
 
 A safely rolled-back failure returns the card to a timed retry state. A retry
 reuses the same immutable candidate and appends a new attempt. A retry after a

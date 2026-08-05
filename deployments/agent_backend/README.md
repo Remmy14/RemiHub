@@ -58,6 +58,17 @@ executables, and verifies both as `remihub-deployer`. It does not rely on the
 generic Ubuntu `pg_wrapper`. Database-proof failures are printed into the
 protected installer log before rollback.
 
+Production backend deployment also requires
+`/opt/remihub-agent/config/qa-parity-reader.ini`. The installer copies it to
+`/opt/remihub-agent/deployment/config/qa-parity-reader.ini` as a
+root-owned, `remihub-deployer`-readable file. This config must use a
+least-privilege QA database role that can only read
+`public.schema_migrations`; the production worker uses it only to compare
+version, name, and checksum histories before any production mutation. The
+worker refuses production deployment when the QA parity config is missing or
+when the QA parity connection identifies as the same database as the production
+migrator connection.
+
 The QA runtime account receives only execute traversal through the fixed
 `/opt/remihub-agent/deployment`, `deployment/config`, and `deployment/qa`
 ancestors. Its application and log directories remain separately owned, while

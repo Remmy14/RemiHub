@@ -318,6 +318,7 @@
     /opt/remihub-agent/worker-config/qa-worker.ini \
     /opt/remihub-agent/worker-config/prod-worker.ini \
     /opt/remihub-agent/config/qa-migrator.ini \
+    /opt/remihub-agent/config/qa-parity-reader.ini \
     /opt/remihub-agent/config/prod-migrator.ini \
     /opt/remihub-agent/config/qa-app.ini; do
     [[ -f "$config" ]] || { echo "Missing required protected config: $config" >&2; exit 1; }
@@ -457,6 +458,7 @@
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/qa-worker.ini /opt/remihub-agent/deployment/config/qa-worker.ini
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/prod-worker.ini /opt/remihub-agent/deployment/config/prod-worker.ini
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/config/qa-migrator.ini /opt/remihub-agent/deployment/config/qa-migrator.ini
+  install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/config/qa-parity-reader.ini /opt/remihub-agent/deployment/config/qa-parity-reader.ini
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/config/prod-migrator.ini /opt/remihub-agent/deployment/config/prod-migrator.ini
   install -o root -g remihub-qa-app -m 0640 /opt/remihub-agent/config/qa-app.ini /opt/remihub-agent/deployment/config/qa-app.ini
   install -o root -g remihub-qa-app -m 0640 "$ASSETS/validation-support/application.ini" /opt/remihub-agent/deployment/config/qa-application.ini
@@ -470,6 +472,8 @@
   require_account_path remihub-deployer -x /opt/remihub-agent/deployment/config
   require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/qa-worker.ini
   require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/qa-migrator.ini
+  require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/qa-parity-reader.ini
+  require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/prod-migrator.ini
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment/qa
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment/config

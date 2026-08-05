@@ -16,10 +16,12 @@ from backend.core.android_deployment import (
 from backend.core.agent_deployment import (
     GitBackendDeploymentExecutor,
     GitBackendDeploymentManager,
+    PostgresMigrationHistoryReader,
     PostgresDeploymentDatabase,
     PrivilegedBackendGitHubSynchronizer,
     PrivilegedDeploymentRuntime,
     SandboxBackendValidator,
+    verify_distinct_database_identities,
 )
 from backend.core.agent_worker import (
     AgentWorker,
@@ -91,6 +93,8 @@ class AgentWorkerSettings:
     deployment_target_branch: str
     deployment_database_config: str | None
     deployment_database_owner_role: str | None
+    deployment_qa_parity_database_config: str | None
+    deployment_qa_parity_database_role: str | None
     deployment_backup_root: str | None
     deployment_pg_dump_binary: str | None
     deployment_pg_restore_binary: str | None
@@ -192,6 +196,12 @@ class AgentWorkerSettings:
         )
         deployment_database_owner_role = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE"
+        )
+        deployment_qa_parity_database_config = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG"
+        )
+        deployment_qa_parity_database_role = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_ROLE"
         )
         deployment_backup_root = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT"
@@ -305,6 +315,18 @@ class AgentWorkerSettings:
                 deployment_database_owner_role.strip()
                 if deployment_database_owner_role
                 and deployment_database_owner_role.strip()
+                else None
+            ),
+            deployment_qa_parity_database_config=(
+                deployment_qa_parity_database_config.strip()
+                if deployment_qa_parity_database_config
+                and deployment_qa_parity_database_config.strip()
+                else None
+            ),
+            deployment_qa_parity_database_role=(
+                deployment_qa_parity_database_role.strip()
+                if deployment_qa_parity_database_role
+                and deployment_qa_parity_database_role.strip()
                 else None
             ),
             deployment_backup_root=(
@@ -590,6 +612,9 @@ def build_executor(
             required_paths["REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER"] = (
                 settings.deployment_github_sync_helper
             )
+            required_paths["REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG"] = (
+                settings.deployment_qa_parity_database_config
+            )
         missing = [name for name, value in required_paths.items() if value is None]
         if missing:
             raise AgentWorkerConfigurationError(
@@ -607,6 +632,13 @@ def build_executor(
             pg_restore_binary=settings.deployment_pg_restore_binary,
             command_timeout_seconds=settings.deployment_timeout_seconds,
         )
+        qa_history_reader = None
+        if settings.environment == "production":
+            qa_history_reader = PostgresMigrationHistoryReader(
+                config_path=settings.deployment_qa_parity_database_config,
+                role=settings.deployment_qa_parity_database_role,
+            )
+            verify_distinct_database_identities(database, qa_history_reader)
         runtime = PrivilegedDeploymentRuntime(
             environment=settings.environment,
             helper_path=settings.deployment_runtime_helper,
@@ -625,6 +657,7 @@ def build_executor(
             validator=validator,
             database=database,
             runtime=runtime,
+            qa_history_reader=qa_history_reader,
             command_timeout_seconds=settings.git_timeout_seconds,
         )
         github_synchronizer = None
