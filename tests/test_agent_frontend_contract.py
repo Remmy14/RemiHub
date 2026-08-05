@@ -231,6 +231,7 @@ class AgentFrontendContractTests(unittest.TestCase):
     @patch("backend.services.agent_service._insert_event")
     @patch("backend.services.agent_service._update_card_status")
     @patch("backend.services.agent_service._insert_run")
+    @patch("backend.services.agent_service._insert_message")
     @patch("backend.services.agent_service._row_to_dict")
     @patch("backend.services.agent_service._locked_card")
     @patch("backend.services.agent_service.put_db_conn")
@@ -241,6 +242,7 @@ class AgentFrontendContractTests(unittest.TestCase):
         put_db_conn,
         locked_card,
         row_to_dict,
+        insert_message,
         insert_run,
         update_card_status,
         insert_event,
@@ -256,6 +258,7 @@ class AgentFrontendContractTests(unittest.TestCase):
             "card_revision": 2,
             "input_message_id": "message-id",
         }
+        insert_message.return_value = "retry-message"
         insert_run.return_value = "retry-run"
         card_detail.return_value = {"status": "planning_queued"}
 
@@ -268,8 +271,20 @@ class AgentFrontendContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "planning_queued")
         insert_run.assert_called_once()
         self.assertEqual(insert_run.call_args.kwargs["phase"].value, "planning")
+        insert_message.assert_called_once_with(
+            cursor,
+            card_id=CARD_ID,
+            author_type="user",
+            content="Try again",
+            created_by=USER_ID,
+            client_message_id=None,
+        )
         self.assertEqual(
-            insert_run.call_args.kwargs["input_message_id"], "message-id"
+            insert_run.call_args.kwargs["input_message_id"], "retry-message"
+        )
+        self.assertEqual(
+            insert_event.call_args.kwargs["payload"]["input_message_id"],
+            "retry-message",
         )
         self.assertEqual(
             update_card_status.call_args.kwargs["status"].value,
@@ -282,6 +297,116 @@ class AgentFrontendContractTests(unittest.TestCase):
         cursor.execute.assert_called()
         connection.commit.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_service._card_detail")
+    @patch("backend.services.agent_service._insert_event")
+    @patch("backend.services.agent_service._update_card_status")
+    @patch("backend.services.agent_service._insert_run")
+    @patch("backend.services.agent_service._insert_message")
+    @patch("backend.services.agent_service._row_to_dict")
+    @patch("backend.services.agent_service._locked_card")
+    @patch("backend.services.agent_service.put_db_conn")
+    @patch("backend.services.agent_service.get_db_conn")
+    def test_failed_implementation_retry_notes_are_actionable(
+        self,
+        get_db_conn,
+        put_db_conn,
+        locked_card,
+        row_to_dict,
+        insert_message,
+        insert_run,
+        update_card_status,
+        insert_event,
+        card_detail,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        locked_card.return_value = card(status="failed", scope="android")
+        row_to_dict.return_value = {
+            "id": "failed-run",
+            "phase": "implementation",
+            "card_revision": 2,
+            "input_message_id": None,
+        }
+        insert_message.return_value = "retry-message"
+        insert_run.return_value = "retry-run"
+        card_detail.return_value = {"status": "implementation_queued"}
+
+        result = retry_card(
+            card_id=CARD_ID,
+            requested_by=USER_ID,
+            notes="Fix the Kotlin compiler errors and rerun validation.",
+        )
+
+        self.assertEqual(result["status"], "implementation_queued")
+        insert_message.assert_called_once_with(
+            cursor,
+            card_id=CARD_ID,
+            author_type="user",
+            content="Fix the Kotlin compiler errors and rerun validation.",
+            created_by=USER_ID,
+            client_message_id=None,
+        )
+        self.assertEqual(
+            insert_run.call_args.kwargs["input_message_id"],
+            "retry-message",
+        )
+        self.assertEqual(
+            insert_event.call_args.kwargs["payload"]["input_message_id"],
+            "retry-message",
+        )
+        self.assertEqual(
+            insert_event.call_args.kwargs["payload"]["notes"],
+            "Fix the Kotlin compiler errors and rerun validation.",
+        )
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_service._card_detail")
+    @patch("backend.services.agent_service._insert_event")
+    @patch("backend.services.agent_service._update_card_status")
+    @patch("backend.services.agent_service._insert_run")
+    @patch("backend.services.agent_service._insert_message")
+    @patch("backend.services.agent_service._row_to_dict")
+    @patch("backend.services.agent_service._locked_card")
+    @patch("backend.services.agent_service.put_db_conn")
+    @patch("backend.services.agent_service.get_db_conn")
+    def test_blank_implementation_retry_notes_do_not_create_a_message(
+        self,
+        get_db_conn,
+        put_db_conn,
+        locked_card,
+        row_to_dict,
+        insert_message,
+        insert_run,
+        update_card_status,
+        insert_event,
+        card_detail,
+    ):
+        connection = MagicMock()
+        get_db_conn.return_value = connection
+        locked_card.return_value = card(status="failed", scope="android")
+        row_to_dict.return_value = {
+            "id": "failed-run",
+            "phase": "implementation",
+            "card_revision": 2,
+            "input_message_id": None,
+        }
+        insert_run.return_value = "retry-run"
+        card_detail.return_value = {"status": "implementation_queued"}
+
+        retry_card(
+            card_id=CARD_ID,
+            requested_by=USER_ID,
+            notes="   ",
+        )
+
+        insert_message.assert_not_called()
+        self.assertIsNone(insert_run.call_args.kwargs["input_message_id"])
+        self.assertIsNone(
+            insert_event.call_args.kwargs["payload"]["input_message_id"]
+        )
 
     @patch("backend.services.agent_service._locked_card")
     @patch("backend.services.agent_service.put_db_conn")

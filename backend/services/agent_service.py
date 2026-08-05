@@ -1340,6 +1340,20 @@ def retry_card(
                 )
                 deployment_trigger_scope = repository_scope
 
+            retry_message_id: str | None = None
+            if notes is not None and phase in {
+                RunPhase.PLANNING,
+                RunPhase.IMPLEMENTATION,
+            }:
+                retry_message_id = _insert_message(
+                    cur,
+                    card_id=card_id,
+                    author_type="user",
+                    content=notes,
+                    created_by=requested_by,
+                    client_message_id=None,
+                )
+
             run_id = _insert_run(
                 cur,
                 card_id=card_id,
@@ -1347,9 +1361,13 @@ def retry_card(
                 card_revision=failed_run["card_revision"],
                 requested_by=requested_by,
                 input_message_id=(
-                    failed_run["input_message_id"]
-                    if phase is RunPhase.PLANNING
-                    else None
+                    retry_message_id
+                    if retry_message_id is not None
+                    else (
+                        failed_run["input_message_id"]
+                        if phase is RunPhase.PLANNING
+                        else None
+                    )
                 ),
             )
             _update_card_status(
@@ -1384,6 +1402,7 @@ def retry_card(
                 actor_user_id=requested_by,
                 payload={
                     "failed_run_id": failed_run["id"],
+                    "input_message_id": retry_message_id,
                     "notes": notes,
                     "phase": phase.value,
                     "revision": failed_run["card_revision"],

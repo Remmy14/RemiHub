@@ -20,6 +20,7 @@ from backend.core.codex_implementation import (
     CodexImplementationTemporaryFailure,
     CodexImplementationTurn,
     OpenAICodexImplementationGateway,
+    _implementation_prompt,
     _parse_implementation_response,
 )
 from tests.test_agent_worker import claimed_run
@@ -150,6 +151,38 @@ class CodexImplementationExecutorTests(unittest.TestCase):
             self.manager.workspace.path,
         )
 
+
+    def test_retry_prompt_uses_latest_user_guidance(self):
+        retry_guidance = (
+            "Fix the Kotlin compiler errors and rerun authoritative validation."
+        )
+        claim = replace(
+            self.claim,
+            feature_branch="agent/card-test",
+            messages=(
+                {
+                    "author_type": "user",
+                    "content": "Original workout module request.",
+                },
+                {
+                    "author_type": "assistant",
+                    "content": "Implementation validation failed.",
+                },
+                {
+                    "author_type": "user",
+                    "content": retry_guidance,
+                },
+            ),
+        )
+
+        prompt = _implementation_prompt(claim, self.manager.workspace)
+
+        self.assertIn(
+            "Continue implementation in the existing card worktree",
+            prompt,
+        )
+        self.assertIn(retry_guidance, prompt)
+        self.assertNotIn("Original workout module request.", prompt)
 
     def test_android_scope_uses_trusted_validator(self):
         gateway = RecordingGateway()
