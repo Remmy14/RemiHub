@@ -69,6 +69,18 @@
     return 1
   }
 
+  verify_qa_frontend_routes() {
+    local output_dir="${1:?frontend output path required}"
+    mkdir -p "$output_dir"
+    curl -fsS http://127.0.0.1:8001/race >"$output_dir/race.html"
+    curl -fsS http://127.0.0.1:8001/race/draft >"$output_dir/race-draft.html"
+    curl -fsS http://127.0.0.1:8001/storage >"$output_dir/storage.html"
+    if grep -R "frontend-web/dist" "$output_dir" >/dev/null 2>&1; then
+      echo "QA frontend route served stale dist path text" >&2
+      return 1
+    fi
+  }
+
   cleanup() {
     set +e
     systemctl stop remihub-backend-qa.service >/dev/null 2>&1
@@ -176,6 +188,7 @@ PY
 
   echo "[3/4] QA candidate runtime health"
   wait_for_qa_health "$RECORD/qa-openapi.json" "candidate-health"
+  verify_qa_frontend_routes "$RECORD/frontend-routes"
   systemctl stop remihub-backend-qa.service
   "$HELPER" verify-runtime qa "$BASE" \
     >"$RECORD/candidate-runtime-state.txt"

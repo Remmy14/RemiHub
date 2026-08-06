@@ -44,7 +44,7 @@
   required_commands=(
     git systemctl systemd-analyze runuser install sha256sum tar sed curl visudo
     getent groupadd useradd usermod userdel groupdel find seq sudo python3 psql
-    stat journalctl
+    stat journalctl node npm
   )
   for command in "${required_commands[@]}"; do
     command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 1; }
@@ -77,6 +77,8 @@
   PG_RESTORE_BINARY="$(resolve_postgresql_client pg_restore)"
   printf 'PostgreSQL backup clients: %s ; %s\n' \
     "$PG_DUMP_BINARY" "$PG_RESTORE_BINARY"
+  [[ "$(node --version)" == "v22.22.2" ]] || { echo "Unsupported Node version" >&2; exit 1; }
+  [[ "$(npm --version)" == "10.9.7" ]] || { echo "Unsupported npm version" >&2; exit 1; }
 
   mkdir -p "$BACKUP"
   chmod 0700 "$BACKUP"
@@ -105,6 +107,7 @@
     /opt/remihub-agent/deployment/config/qa-app.ini
     /opt/remihub-agent/deployment/config/qa-application.ini
     /opt/remihub-agent/deployment/config/git-safe-directory.ini
+    /opt/remihub-agent/deployment/config/frontend-web-policy.json
   )
 
   backup_system_paths() {
@@ -451,9 +454,12 @@
     /opt/remihub-agent/deployment/qa/artifacts
   chmod 0750 /opt/remihub-agent/deployment/qa/repository.git /opt/remihub-agent/deployment/qa/worktrees /opt/remihub-agent/deployment/qa/artifacts
   install -d -o remihub-qa-app -g remihub-qa-app -m 0750 /opt/remihub-agent/deployment/qa/logs
+  install -d -o root -g remihub-deployer -m 0750 \
+    /opt/remihub-agent/deployment/qa/frontend-backups
   install -d -o remihub-deployer -g root -m 0750 \
     /var/backups/remihub-agent/backend-deployments/qa \
-    /var/backups/remihub-agent/backend-deployments/production
+    /var/backups/remihub-agent/backend-deployments/production \
+    /var/backups/remihub-agent/frontend-web/production
 
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/qa-worker.ini /opt/remihub-agent/deployment/config/qa-worker.ini
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/prod-worker.ini /opt/remihub-agent/deployment/config/prod-worker.ini
@@ -465,6 +471,9 @@
   install -o root -g root -m 0644 \
     "$ASSETS/gitconfig/remihub-backend-deployment.gitconfig" \
     "$GIT_SAFE_CONFIG"
+  install -o root -g root -m 0644 \
+    "$ASSETS/frontend-web-policy.json" \
+    /opt/remihub-agent/deployment/config/frontend-web-policy.json
 
   echo "Validating deployment account traversal before repository seeding"
   require_account_path remihub-deployer -x /opt/remihub-agent/deployment

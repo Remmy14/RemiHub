@@ -5,7 +5,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -84,6 +87,22 @@ class ValidationEvidence:
 
 
 @dataclass(frozen=True)
+class FrontendArtifactEvidence:
+    changed: bool
+    artifact_directory: str | None = None
+    archive_path: str | None = None
+    archive_sha256: str | None = None
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
+    artifact_identity: str | None = None
+    lockfile_sha256: str | None = None
+    node_version: str | None = None
+    npm_version: str | None = None
+    commands: tuple[dict[str, Any], ...] = ()
+    reproducibility: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class BackupEvidence:
     path: str
     size_bytes: int
@@ -115,6 +134,7 @@ class DeploymentCandidate:
     manifest_path: str
     rollback_ref: str
     validation: dict
+    frontend_artifact: dict | None = None
     service_restart_performed: bool = False
     migrations_applied: tuple[str, ...] = ()
     database_backup: dict | None = None
@@ -210,6 +230,22 @@ class BackendValidator(Protocol):
     def validate(self, candidate_worktree: Path) -> ValidationEvidence: ...
 
 
+class FrontendArtifactBuilder(Protocol):
+    def build(
+        self,
+        *,
+        candidate_worktree: Path,
+        artifact_root: Path,
+        card_id: str,
+        card_revision: int,
+        deployment_run_id: str,
+        approval_id: str,
+        implementation_run_id: str,
+        candidate_commit: str,
+        changed_files: tuple[str, ...],
+    ) -> FrontendArtifactEvidence: ...
+
+
 class DeploymentDatabase(Protocol):
     def migration_history(self) -> tuple[dict[str, str], ...]: ...
 
@@ -251,6 +287,26 @@ class DeploymentRuntime(Protocol):
     ) -> None: ...
 
     def restore(self, *, expected_current: str, rollback_commit: str) -> None: ...
+
+    def frontend_install(
+        self,
+        *,
+        artifact_manifest: str,
+        artifact_archive: str,
+        artifact_identity: str,
+        candidate_commit: str,
+        card_id: str,
+        deployment_run_id: str,
+    ) -> dict[str, Any]: ...
+
+    def frontend_restore(self) -> dict[str, Any]: ...
+
+    def frontend_verify(
+        self,
+        *,
+        artifact_manifest: str,
+        artifact_identity: str,
+    ) -> dict[str, Any]: ...
 
     def synchronize_sources(
         self,
@@ -333,6 +389,419 @@ class SandboxBackendValidator:
             suffix = f": {detail}" if detail else ""
             raise DeploymentValidationError(
                 f"Backend compile/test validation failed{suffix}"
+            )
+        return evidence
+
+
+FRONTEND_WEB_POLICY = {
+    "node_version": "v22.22.2",
+    "npm_version": "10.9.7",
+    "root": "frontend-web",
+    "lockfile": "frontend-web/package-lock.json",
+    "prepare_command": ("npm", "ci", "--ignore-scripts"),
+    "lint_command": ("npm", "run", "lint"),
+    "build_command": ("npm", "run", "build"),
+    "archive_mtime": 0,
+    "archive_uid": 0,
+    "archive_gid": 0,
+    "archive_uname": "root",
+    "archive_gname": "root",
+    "directory_mode": 0o755,
+    "file_mode": 0o644,
+}
+
+
+def frontend_web_changed(changed_files: tuple[str, ...]) -> bool:
+    return any(path == "frontend-web" or path.startswith("frontend-web/") for path in changed_files)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _frontend_artifact_manifest(
+    dist_root: Path,
+    *,
+    candidate_commit: str,
+    lockfile_sha256: str,
+) -> dict[str, Any]:
+    if dist_root.is_symlink() or not dist_root.is_dir():
+        raise DeploymentValidationError("Frontend build did not produce dist")
+    entries: list[dict[str, Any]] = []
+    for directory, names, files in os.walk(dist_root, topdown=True, followlinks=False):
+        names.sort()
+        files.sort()
+        current = Path(directory)
+        relative_directory = current.relative_to(dist_root)
+        for name in names:
+            child = current / name
+            relative = child.relative_to(dist_root).as_posix()
+            if child.is_symlink():
+                raise DeploymentValidationError("Frontend artifact rejects symbolic links")
+            if not child.is_dir():
+                raise DeploymentValidationError("Frontend artifact rejects special files")
+            if any(ord(character) < 32 for character in relative) or ".." in PurePosixPath(relative).parts:
+                raise DeploymentValidationError("Frontend artifact contains an unsafe path")
+            entries.append(
+                {
+                    "path": relative,
+                    "type": "directory",
+                    "mode": "0755",
+                }
+            )
+        for name in files:
+            child = current / name
+            relative = child.relative_to(dist_root).as_posix()
+            if child.is_symlink():
+                raise DeploymentValidationError("Frontend artifact rejects symbolic links")
+            try:
+                mode = child.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise DeploymentValidationError("Frontend artifact cannot be inspected") from exc
+            if not stat.S_ISREG(mode):
+                raise DeploymentValidationError("Frontend artifact rejects special files")
+            if mode & 0o111:
+                raise DeploymentValidationError("Frontend artifact rejects executable files")
+            if any(ord(character) < 32 for character in relative) or ".." in PurePosixPath(relative).parts:
+                raise DeploymentValidationError("Frontend artifact contains an unsafe path")
+            size = child.stat(follow_symlinks=False).st_size
+            if size > 10_000_000:
+                raise DeploymentValidationError("Frontend artifact file is too large")
+            entries.append(
+                {
+                    "path": relative,
+                    "type": "file",
+                    "mode": "0644",
+                    "size": size,
+                    "sha256": _sha256_file(child),
+                }
+            )
+    entries.sort(key=lambda item: (item["path"], item["type"]))
+    manifest = {
+        "schema_version": 1,
+        "frontend_root": "frontend-web/dist",
+        "candidate_commit": candidate_commit,
+        "lockfile_sha256": lockfile_sha256,
+        "entries": entries,
+    }
+    manifest["artifact_identity"] = hashlib.sha256(
+        _canonical_json_bytes(manifest)
+    ).hexdigest()
+    return manifest
+
+
+def _write_deterministic_frontend_archive(
+    dist_root: Path,
+    archive_path: Path,
+    manifest: dict[str, Any],
+) -> None:
+    with tarfile.open(archive_path, "w", format=tarfile.PAX_FORMAT) as archive:
+        for entry in manifest["entries"]:
+            source = dist_root / entry["path"]
+            info = archive.gettarinfo(str(source), arcname=entry["path"])
+            info.mtime = FRONTEND_WEB_POLICY["archive_mtime"]
+            info.uid = FRONTEND_WEB_POLICY["archive_uid"]
+            info.gid = FRONTEND_WEB_POLICY["archive_gid"]
+            info.uname = FRONTEND_WEB_POLICY["archive_uname"]
+            info.gname = FRONTEND_WEB_POLICY["archive_gname"]
+            info.pax_headers = {}
+            if entry["type"] == "directory":
+                info.mode = FRONTEND_WEB_POLICY["directory_mode"]
+                archive.addfile(info)
+            else:
+                info.mode = FRONTEND_WEB_POLICY["file_mode"]
+                with source.open("rb") as file_object:
+                    archive.addfile(info, file_object)
+    os.chmod(archive_path, 0o640)
+
+
+def verify_frontend_archive(
+    *,
+    archive_path: Path,
+    manifest_path: Path,
+) -> dict[str, Any]:
+    if archive_path.is_symlink() or not archive_path.is_file():
+        raise DeploymentValidationError("Frontend artifact archive is missing")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise DeploymentValidationError("Frontend artifact manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_entries = manifest.get("entries")
+    if not isinstance(expected_entries, list):
+        raise DeploymentValidationError("Frontend artifact manifest is invalid")
+    expected_names = [entry["path"] for entry in expected_entries]
+    with tarfile.open(archive_path, "r:*") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if names != expected_names:
+            raise DeploymentValidationError("Frontend artifact archive entry order differs from manifest")
+        for member, entry in zip(members, expected_entries):
+            if member.mtime != FRONTEND_WEB_POLICY["archive_mtime"]:
+                raise DeploymentValidationError("Frontend artifact archive has non-deterministic timestamps")
+            if (
+                member.uid != FRONTEND_WEB_POLICY["archive_uid"]
+                or member.gid != FRONTEND_WEB_POLICY["archive_gid"]
+                or member.uname != FRONTEND_WEB_POLICY["archive_uname"]
+                or member.gname != FRONTEND_WEB_POLICY["archive_gname"]
+            ):
+                raise DeploymentValidationError("Frontend artifact archive has non-deterministic ownership")
+            expected_mode = (
+                FRONTEND_WEB_POLICY["directory_mode"]
+                if entry["type"] == "directory"
+                else FRONTEND_WEB_POLICY["file_mode"]
+            )
+            if member.mode != expected_mode:
+                raise DeploymentValidationError("Frontend artifact archive has non-deterministic modes")
+            if entry["type"] == "directory" and not member.isdir():
+                raise DeploymentValidationError("Frontend artifact archive type mismatch")
+            if entry["type"] == "file":
+                if not member.isfile() or member.size != entry["size"]:
+                    raise DeploymentValidationError("Frontend artifact archive file metadata mismatch")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise DeploymentValidationError("Frontend artifact archive file cannot be read")
+                if hashlib.sha256(extracted.read()).hexdigest() != entry["sha256"]:
+                    raise DeploymentValidationError("Frontend artifact archive content differs from manifest")
+    identity_manifest = {key: manifest[key] for key in ("schema_version", "frontend_root", "candidate_commit", "lockfile_sha256", "entries")}
+    identity = hashlib.sha256(_canonical_json_bytes(identity_manifest)).hexdigest()
+    if identity != manifest.get("artifact_identity"):
+        raise DeploymentValidationError("Frontend artifact identity does not match manifest")
+    return {
+        "artifact_identity": identity,
+        "archive_sha256": _sha256_file(archive_path),
+        "manifest_sha256": _sha256_file(manifest_path),
+    }
+
+
+def _frontend_artifact_from_manifest(
+    manifest: dict[str, Any],
+) -> FrontendArtifactEvidence | None:
+    raw = manifest.get("frontend_artifact")
+    if not isinstance(raw, dict) or not raw.get("changed"):
+        return None
+    required = ("manifest_path", "archive_path", "artifact_identity")
+    if not all(isinstance(raw.get(key), str) and raw[key] for key in required):
+        raise AgentDeploymentError("Existing deployment manifest has invalid frontend artifact evidence")
+    return FrontendArtifactEvidence(
+        changed=True,
+        artifact_directory=raw.get("artifact_directory"),
+        archive_path=raw.get("archive_path"),
+        archive_sha256=raw.get("archive_sha256"),
+        manifest_path=raw.get("manifest_path"),
+        manifest_sha256=raw.get("manifest_sha256"),
+        artifact_identity=raw.get("artifact_identity"),
+        lockfile_sha256=raw.get("lockfile_sha256"),
+        node_version=raw.get("node_version"),
+        npm_version=raw.get("npm_version"),
+        commands=tuple(raw.get("commands") or ()),
+        reproducibility=dict(raw.get("reproducibility") or {}),
+    )
+
+
+class LocalFrontendArtifactBuilder:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: int = 900,
+        node_binary: str | Path = "/usr/bin/node",
+        npm_binary: str | Path = "/usr/bin/npm",
+    ):
+        if timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be at least 1")
+        self.timeout_seconds = timeout_seconds
+        self.node_binary = Path(node_binary)
+        self.npm_binary = Path(npm_binary)
+
+    def build(
+        self,
+        *,
+        candidate_worktree: Path,
+        artifact_root: Path,
+        card_id: str,
+        card_revision: int,
+        deployment_run_id: str,
+        approval_id: str,
+        implementation_run_id: str,
+        candidate_commit: str,
+        changed_files: tuple[str, ...],
+    ) -> FrontendArtifactEvidence:
+        if not frontend_web_changed(changed_files):
+            return FrontendArtifactEvidence(changed=False)
+        frontend_root = candidate_worktree / "frontend-web"
+        package_json = frontend_root / "package.json"
+        lockfile = frontend_root / "package-lock.json"
+        if package_json.is_symlink() or not package_json.is_file():
+            raise DeploymentValidationError("Frontend package.json is missing")
+        if lockfile.is_symlink() or not lockfile.is_file():
+            raise DeploymentValidationError("Frontend package-lock.json is missing")
+        lockfile_sha256 = _sha256_file(lockfile)
+        try:
+            node_version = self._run_version([str(self.node_binary), "--version"])
+            npm_version = self._run_version([str(self.npm_binary), "--version"])
+        except DeploymentValidationError:
+            raise
+        if node_version != FRONTEND_WEB_POLICY["node_version"]:
+            raise DeploymentValidationError("Frontend Node version does not match policy")
+        if npm_version != FRONTEND_WEB_POLICY["npm_version"]:
+            raise DeploymentValidationError("Frontend npm version does not match policy")
+
+        artifact_directory = artifact_root / card_id / deployment_run_id / "frontend-web" / candidate_commit
+        artifact_directory.mkdir(mode=0o750, parents=True, exist_ok=True)
+        if artifact_directory.is_symlink():
+            raise DeploymentValidationError("Frontend artifact directory is unsafe")
+        first = self._build_once(
+            candidate_worktree=candidate_worktree,
+            frontend_root=frontend_root,
+            lockfile_sha256=lockfile_sha256,
+            candidate_commit=candidate_commit,
+            artifact_directory=artifact_directory,
+            label="build-1",
+        )
+        second = self._build_once(
+            candidate_worktree=candidate_worktree,
+            frontend_root=frontend_root,
+            lockfile_sha256=lockfile_sha256,
+            candidate_commit=candidate_commit,
+            artifact_directory=artifact_directory,
+            label="build-2",
+        )
+        if first["artifact_identity"] != second["artifact_identity"]:
+            raise DeploymentValidationError("Frontend build artifact identity is not reproducible")
+        return FrontendArtifactEvidence(
+            changed=True,
+            artifact_directory=str(artifact_directory),
+            archive_path=second["archive_path"],
+            archive_sha256=second["archive_sha256"],
+            manifest_path=second["manifest_path"],
+            manifest_sha256=second["manifest_sha256"],
+            artifact_identity=second["artifact_identity"],
+            lockfile_sha256=lockfile_sha256,
+            node_version=node_version,
+            npm_version=npm_version,
+            commands=tuple(first["commands"] + second["commands"]),
+            reproducibility={
+                "first_identity": first["artifact_identity"],
+                "second_identity": second["artifact_identity"],
+                "matched": True,
+                "archive_identity_source": "normalized manifest and content hashes",
+            },
+        )
+
+    def _build_once(
+        self,
+        *,
+        candidate_worktree: Path,
+        frontend_root: Path,
+        lockfile_sha256: str,
+        candidate_commit: str,
+        artifact_directory: Path,
+        label: str,
+    ) -> dict[str, Any]:
+        staging = Path(tempfile.mkdtemp(prefix=f"remihub-frontend-{label}-", dir=str(artifact_directory)))
+        try:
+            source = staging / "source"
+            shutil.copytree(
+                frontend_root,
+                source / "frontend-web",
+                ignore=shutil.ignore_patterns("dist", "node_modules", ".env", ".env.*"),
+                symlinks=False,
+            )
+            commands = [
+                self._run_command(
+                    [str(self.npm_binary), "ci", "--ignore-scripts"],
+                    cwd=source / "frontend-web",
+                    network="package-manager-preparation",
+                ),
+                self._run_command(
+                    [str(self.npm_binary), "run", "lint"],
+                    cwd=source / "frontend-web",
+                    network="denied-by-validation-sandbox",
+                ),
+                self._run_command(
+                    [str(self.npm_binary), "run", "build"],
+                    cwd=source / "frontend-web",
+                    network="denied-by-validation-sandbox",
+                ),
+            ]
+            dist_root = source / "frontend-web" / "dist"
+            manifest = _frontend_artifact_manifest(
+                dist_root,
+                candidate_commit=candidate_commit,
+                lockfile_sha256=lockfile_sha256,
+            )
+            manifest_path = artifact_directory / f"{label}.manifest.json"
+            manifest_path.write_bytes(_canonical_json_bytes(manifest))
+            os.chmod(manifest_path, 0o640)
+            archive_path = artifact_directory / f"{label}.dist.tar"
+            _write_deterministic_frontend_archive(dist_root, archive_path, manifest)
+            verified = verify_frontend_archive(
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            final_manifest = artifact_directory / "manifest.json"
+            final_archive = artifact_directory / "dist.tar"
+            if label == "build-2":
+                manifest_path.replace(final_manifest)
+                archive_path.replace(final_archive)
+                manifest_path = final_manifest
+                archive_path = final_archive
+                verified = verify_frontend_archive(
+                    archive_path=archive_path,
+                    manifest_path=manifest_path,
+                )
+            return {
+                "artifact_identity": verified["artifact_identity"],
+                "archive_sha256": verified["archive_sha256"],
+                "manifest_sha256": verified["manifest_sha256"],
+                "archive_path": str(archive_path),
+                "manifest_path": str(manifest_path),
+                "commands": commands,
+            }
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _run_version(self, command: list[str]) -> str:
+        evidence = self._run_command(command, cwd=Path("/tmp"), network="not_required")
+        return str(evidence["stdout_tail"]).strip()
+
+    def _run_command(self, command: list[str], *, cwd: Path, network: str) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                env={
+                    "HOME": "/nonexistent",
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                    "PATH": "/usr/bin:/bin",
+                    "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+                    "NPM_CONFIG_AUDIT": "false",
+                    "NPM_CONFIG_FUND": "false",
+                    "SOURCE_DATE_EPOCH": "0",
+                },
+                timeout=self.timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DeploymentValidationError(f"Frontend command failed: {' '.join(command)}") from exc
+        evidence = {
+            "command": " ".join(command),
+            "return_code": result.returncode,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "stdout_sha256": hashlib.sha256(result.stdout.encode("utf-8")).hexdigest(),
+            "stdout_tail": _tail(result.stdout, 4000),
+            "stderr_tail": _tail(result.stderr, 4000),
+            "network": network,
+        }
+        if result.returncode != 0:
+            detail = evidence["stderr_tail"] or evidence["stdout_tail"]
+            raise DeploymentValidationError(
+                f"Frontend command failed: {' '.join(command)}: {detail}"
             )
         return evidence
 
@@ -692,6 +1161,44 @@ class PrivilegedDeploymentRuntime:
     def restore(self, *, expected_current: str, rollback_commit: str) -> None:
         self._helper("restore", expected_current, rollback_commit)
 
+    def frontend_install(
+        self,
+        *,
+        artifact_manifest: str,
+        artifact_archive: str,
+        artifact_identity: str,
+        candidate_commit: str,
+        card_id: str,
+        deployment_run_id: str,
+    ) -> dict[str, Any]:
+        payload = self._helper(
+            "frontend-install",
+            artifact_manifest,
+            artifact_archive,
+            artifact_identity,
+            candidate_commit,
+            card_id,
+            deployment_run_id,
+        )
+        return _json_helper_payload(payload, context="frontend install")
+
+    def frontend_restore(self) -> dict[str, Any]:
+        return _json_helper_payload(
+            self._helper("frontend-restore"),
+            context="frontend restore",
+        )
+
+    def frontend_verify(
+        self,
+        *,
+        artifact_manifest: str,
+        artifact_identity: str,
+    ) -> dict[str, Any]:
+        return _json_helper_payload(
+            self._helper("frontend-verify", artifact_manifest, artifact_identity),
+            context="frontend verify",
+        )
+
     def synchronize_sources(
         self,
         *,
@@ -794,6 +1301,20 @@ class PrivilegedDeploymentRuntime:
                 f"Deployment runtime helper failed during {action}{suffix}"
             )
         return result.stdout
+
+
+def _json_helper_payload(payload: str, *, context: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise AgentDeploymentError(
+            f"Deployment runtime helper returned invalid JSON during {context}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise AgentDeploymentError(
+            f"Deployment runtime helper returned a non-object result during {context}"
+        )
+    return parsed
 
 
 class PrivilegedBackendGitHubSynchronizer:
@@ -901,6 +1422,44 @@ class GitBackendDeploymentManager:
             "backend/services/auth_service.py",
         }
     )
+    FRONTEND_FIXED_FILES = frozenset(
+        {
+            "frontend-web/package.json",
+            "frontend-web/package-lock.json",
+            "frontend-web/index.html",
+            "frontend-web/vite.config.ts",
+            "frontend-web/tsconfig.json",
+            "frontend-web/tsconfig.app.json",
+            "frontend-web/tsconfig.node.json",
+            "frontend-web/eslint.config.js",
+            "frontend-web/postcss.config.cjs",
+            "frontend-web/tailwind.config.js",
+            "frontend-web/README.md",
+            "frontend-web/.gitignore",
+        }
+    )
+    FRONTEND_SOURCE_SUFFIXES = frozenset(
+        {
+            ".css",
+            ".gif",
+            ".html",
+            ".ico",
+            ".jpg",
+            ".jpeg",
+            ".json",
+            ".md",
+            ".png",
+            ".svg",
+            ".ts",
+            ".tsx",
+            ".txt",
+            ".webp",
+        }
+    )
+    FRONTEND_SECRET_NAME_RE = re.compile(
+        r"(^|[-_.])(secret|token|credential|credentials|private[-_.]?key|id_rsa|id_ed25519)([-_.]|$)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -916,6 +1475,7 @@ class GitBackendDeploymentManager:
         validator: BackendValidator,
         database: DeploymentDatabase,
         runtime: DeploymentRuntime,
+        frontend_builder: FrontendArtifactBuilder | None = None,
         qa_history_reader: MigrationHistoryReader | None = None,
         git_binary: str = "git",
         command_timeout_seconds: int = 120,
@@ -933,6 +1493,9 @@ class GitBackendDeploymentManager:
         self.validator = validator
         self.database = database
         self.runtime = runtime
+        self.frontend_builder = frontend_builder or LocalFrontendArtifactBuilder(
+            timeout_seconds=command_timeout_seconds
+        )
         self.qa_history_reader = qa_history_reader
 
         self.source_repository = _required_absolute_directory(
@@ -1052,6 +1615,7 @@ class GitBackendDeploymentManager:
                     candidate_commit,
                     candidate_path,
                 )
+                frontend_changed = frontend_web_changed(approved.changed_files)
                 rollback_ref = self._rollback_ref(claim)
                 manifest_path = self._manifest_path(claim)
                 manifest = self._load_or_initialize_manifest(
@@ -1061,6 +1625,7 @@ class GitBackendDeploymentManager:
                     candidate_commit=candidate_commit,
                     rollback_ref=rollback_ref,
                     migration_plan=migration_plan,
+                    frontend_changed=frontend_changed,
                 )
 
                 prior_success = self._successful_attempt(manifest)
@@ -1070,6 +1635,12 @@ class GitBackendDeploymentManager:
                 )
                 if prior_success is not None and current_target == candidate_commit:
                     health = self.runtime.verify()
+                    frontend_artifact = _frontend_artifact_from_manifest(manifest)
+                    if frontend_artifact is not None:
+                        self.runtime.frontend_verify(
+                            artifact_manifest=frontend_artifact.manifest_path,
+                            artifact_identity=frontend_artifact.artifact_identity,
+                        )
                     return self._candidate_from_success(
                         approved,
                         candidate_branch=candidate_branch,
@@ -1078,6 +1649,7 @@ class GitBackendDeploymentManager:
                         manifest_path=manifest_path,
                         attempt=prior_success,
                         health=health,
+                        frontend_artifact=frontend_artifact,
                     )
 
                 if current_target != approved.base_commit:
@@ -1172,6 +1744,9 @@ class GitBackendDeploymentManager:
         attempt: dict,
     ) -> DeploymentCandidate:
         validation: ValidationEvidence | None = None
+        frontend_artifact = FrontendArtifactEvidence(
+            changed=bool(manifest.get("frontend_changed"))
+        )
         backup: BackupEvidence | None = None
         migrations_applied: tuple[str, ...] = ()
         runtime_promotion_attempted = False
@@ -1181,12 +1756,33 @@ class GitBackendDeploymentManager:
         source_sync_attempted = False
         sources_synchronized = False
         service_stopped = False
+        frontend_install_attempted = False
+        frontend_installed = False
         migrations_dir = candidate_path / "backend" / "database" / "migrations"
 
         try:
             validation = self.validator.validate(candidate_path)
             attempt["validation"] = asdict(validation)
             attempt["stage"] = "validated"
+            self._write_manifest(manifest_path, manifest)
+            frontend_artifact = self.frontend_builder.build(
+                candidate_worktree=candidate_path,
+                artifact_root=self.deployment_artifact_root,
+                card_id=claim.card_id,
+                card_revision=claim.card_revision,
+                deployment_run_id=claim.id,
+                approval_id=approved.approval_id,
+                implementation_run_id=approved.implementation_run_id,
+                candidate_commit=candidate_commit,
+                changed_files=approved.changed_files,
+            )
+            manifest["frontend_artifact"] = asdict(frontend_artifact)
+            attempt["frontend_artifact"] = asdict(frontend_artifact)
+            attempt["stage"] = (
+                "frontend_artifact_created"
+                if frontend_artifact.changed
+                else "frontend_not_changed"
+            )
             self._write_manifest(manifest_path, manifest)
         except DeploymentValidationError as exc:
             attempt["status"] = "failed_validation"
@@ -1273,12 +1869,40 @@ class GitBackendDeploymentManager:
             attempt["stage"] = "runtime_promoted"
             self._write_manifest(manifest_path, manifest)
 
+            if frontend_artifact.changed:
+                frontend_install_attempted = True
+                assert frontend_artifact.manifest_path is not None
+                assert frontend_artifact.archive_path is not None
+                assert frontend_artifact.artifact_identity is not None
+                install_evidence = self.runtime.frontend_install(
+                    artifact_manifest=frontend_artifact.manifest_path,
+                    artifact_archive=frontend_artifact.archive_path,
+                    artifact_identity=frontend_artifact.artifact_identity,
+                    candidate_commit=candidate_commit,
+                    card_id=claim.card_id,
+                    deployment_run_id=claim.id,
+                )
+                frontend_installed = True
+                attempt["frontend_install"] = install_evidence
+                attempt["stage"] = "frontend_installed"
+                self._write_manifest(manifest_path, manifest)
+
             self.runtime.start()
             service_stopped = False
             health = self.runtime.verify()
             attempt["health"] = asdict(health)
             attempt["stage"] = "health_verified"
             self._write_manifest(manifest_path, manifest)
+
+            if frontend_artifact.changed:
+                assert frontend_artifact.manifest_path is not None
+                assert frontend_artifact.artifact_identity is not None
+                attempt["frontend_verified"] = self.runtime.frontend_verify(
+                    artifact_manifest=frontend_artifact.manifest_path,
+                    artifact_identity=frontend_artifact.artifact_identity,
+                )
+                attempt["stage"] = "frontend_verified"
+                self._write_manifest(manifest_path, manifest)
 
             if self.environment == "qa":
                 self._record_and_require_migration_history(
@@ -1343,6 +1967,9 @@ class GitBackendDeploymentManager:
                 manifest_path=str(manifest_path),
                 rollback_ref=rollback_ref,
                 validation=asdict(validation),
+                frontend_artifact=(
+                    asdict(frontend_artifact) if frontend_artifact.changed else None
+                ),
                 service_restart_performed=True,
                 migrations_applied=migrations_applied,
                 database_backup=asdict(backup) if backup else None,
@@ -1405,6 +2032,13 @@ class GitBackendDeploymentManager:
                     runtime_promoted = False
                 except Exception as rollback_exc:
                     rollback_errors.append(f"runtime: {rollback_exc}")
+
+            if frontend_install_attempted or frontend_installed:
+                try:
+                    attempt["frontend_restored"] = self.runtime.frontend_restore()
+                    frontend_installed = False
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"frontend: {rollback_exc}")
 
             if migrations_applied:
                 try:
@@ -2072,6 +2706,7 @@ class GitBackendDeploymentManager:
                     f"Automatic deployment blocks protected control-plane file: {relative}"
                 )
             allowed = False
+            frontend_file = False
             if len(pure_path.parts) >= 2 and pure_path.parts[0] == "backend":
                 allowed = pure_path.suffix == ".py"
                 if pure_path.parts[:3] == (
@@ -2086,10 +2721,13 @@ class GitBackendDeploymentManager:
                 allowed = pure_path.suffix == ".py"
             elif len(pure_path.parts) >= 2 and pure_path.parts[0] == "docs":
                 allowed = pure_path.suffix.lower() == ".md"
+            elif len(pure_path.parts) >= 2 and pure_path.parts[0] == "frontend-web":
+                frontend_file = True
+                allowed = self._frontend_path_allowed(relative, pure_path)
             if not allowed:
                 raise AgentDeploymentError(
                     "Backend deployment permits only backend Python, tests, docs, "
-                    "and paired SQL migration files"
+                    "paired SQL migration files, and reviewed frontend-web source files"
                 )
 
             actual_path = worktree.joinpath(*pure_path.parts)
@@ -2103,14 +2741,43 @@ class GitBackendDeploymentManager:
                     raise AgentDeploymentError(
                         "Backend deployment permits only regular files"
                     )
+                mode = actual_path.stat(follow_symlinks=False).st_mode
+                if stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+                    raise AgentDeploymentError("Backend deployment rejects special files")
+                if frontend_file:
+                    if mode & 0o111:
+                        raise AgentDeploymentError(
+                            "Frontend deployment rejects unexpected executable files"
+                        )
+                    if actual_path.stat(follow_symlinks=False).st_size > 5_000_000:
+                        raise AgentDeploymentError(
+                            "Frontend deployment rejects unsafe oversized assets"
+                        )
                 try:
                     content = actual_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
-                    raise AgentDeploymentError(
-                        "Backend deployment requires UTF-8 text files"
-                    ) from exc
+                    if frontend_file and pure_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp"}:
+                        continue
+                    raise AgentDeploymentError("Backend deployment requires UTF-8 text files") from exc
                 if "\x00" in content:
                     raise AgentDeploymentError("Backend deployment rejects binary files")
+
+    def _frontend_path_allowed(self, relative: str, pure_path: PurePosixPath) -> bool:
+        name = pure_path.name
+        lowered = name.lower()
+        if lowered == ".env" or lowered.startswith(".env."):
+            raise AgentDeploymentError("Frontend deployment rejects environment files")
+        if self.FRONTEND_SECRET_NAME_RE.search(name):
+            raise AgentDeploymentError("Frontend deployment rejects secret-like files")
+        if relative in self.FRONTEND_FIXED_FILES:
+            return True
+        if len(pure_path.parts) < 3:
+            return False
+        if pure_path.parts[1] in {"dist", "node_modules"}:
+            raise AgentDeploymentError("Frontend deployment rejects generated dependency or dist paths")
+        if pure_path.parts[1] not in {"src", "public"}:
+            return False
+        return pure_path.suffix.lower() in self.FRONTEND_SOURCE_SUFFIXES
 
     @staticmethod
     def _reject_special_git_modes(patch: bytes) -> None:
@@ -2190,10 +2857,11 @@ class GitBackendDeploymentManager:
         candidate_commit: str,
         rollback_ref: str,
         migration_plan: MigrationPlan,
+        frontend_changed: bool,
     ) -> dict:
         manifest_path = self._manifest_path(claim)
         identity = {
-            "schema_version": 2,
+            "schema_version": 3,
             "environment": self.environment,
             "mode": "backend-qa-to-production",
             "card_id": claim.card_id,
@@ -2213,6 +2881,7 @@ class GitBackendDeploymentManager:
             "implementation_tests": list(approved.implementation_tests),
             "rollback_ref": rollback_ref,
             "migration_plan": asdict(migration_plan),
+            "frontend_changed": frontend_changed,
             "android_release_performed": False,
         }
         # Normalize tuples to the same JSON-native list representation used after reload.
@@ -2271,6 +2940,7 @@ class GitBackendDeploymentManager:
         manifest_path: Path,
         attempt: dict,
         health: RuntimeHealth,
+        frontend_artifact: FrontendArtifactEvidence | None,
     ) -> DeploymentCandidate:
         validation = attempt.get("validation") or {}
         backup = attempt.get("database_backup")
@@ -2290,6 +2960,9 @@ class GitBackendDeploymentManager:
             manifest_path=str(manifest_path),
             rollback_ref=rollback_ref,
             validation={**validation, "idempotent_health": asdict(health)},
+            frontend_artifact=(
+                asdict(frontend_artifact) if frontend_artifact is not None else None
+            ),
             service_restart_performed=True,
             migrations_applied=tuple(attempt.get("migrations_applied") or ()),
             database_backup=backup,

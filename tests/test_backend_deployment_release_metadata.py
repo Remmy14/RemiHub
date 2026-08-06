@@ -99,6 +99,7 @@ class BackendDeploymentRuntimeCleanlinessTests(unittest.TestCase):
             runtime=self.runtime,
             runtime_branch="main",
             runtime_user="root",
+            frontend_backup_root=self.root / "frontend-backups",
         )
 
     def test_clean_runtime_is_required(self):

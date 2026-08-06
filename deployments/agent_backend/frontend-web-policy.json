@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "frontend_root": "frontend-web",
+  "dist_root": "frontend-web/dist",
+  "node_version": "v22.22.2",
+  "npm_version": "10.9.7",
+  "dependency_command": ["npm", "ci", "--ignore-scripts"],
+  "lint_command": ["npm", "run", "lint"],
+  "build_command": ["npm", "run", "build"],
+  "dependency_lifecycle_scripts": "blocked",
+  "build_network": "denied",
+  "artifact_identity": "sha256 over canonical JSON manifest and file content hashes",
+  "archive_normalization": {
+    "entry_order": "manifest order sorted by relative path",
+    "mtime": 0,
+    "uid": 0,
+    "gid": 0,
+    "uname": "root",
+    "gname": "root",
+    "directory_mode": "0755",
+    "file_mode": "0644"
+  }
+}

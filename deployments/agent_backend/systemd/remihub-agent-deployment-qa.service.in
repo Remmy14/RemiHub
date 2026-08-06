@@ -10,11 +10,14 @@ ConditionPathIsDirectory=/opt/remihub-agent/deployment/qa/repository.git
 ConditionPathIsDirectory=/opt/remihub-agent/deployment/qa/worktrees
 ConditionPathIsDirectory=/opt/remihub-agent/deployment/qa/artifacts
 ConditionFileIsExecutable=/opt/remihub-agent/runtime/venv/bin/python
+ConditionFileIsExecutable=/usr/bin/node
+ConditionFileIsExecutable=/usr/bin/npm
 ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-validation-sandbox
 ConditionFileIsExecutable=/usr/local/libexec/remihub-backend-deployment-control
 ConditionFileIsExecutable=@PG_DUMP@
 ConditionFileIsExecutable=@PG_RESTORE@
 ConditionPathExists=/opt/remihub-agent/deployment/config/git-safe-directory.ini
+ConditionPathExists=/opt/remihub-agent/deployment/config/frontend-web-policy.json
 
 [Service]
 Type=oneshot
@@ -84,6 +87,7 @@ ReadWritePaths=/opt/remihub-agent/deployment/qa/repository.git
 ReadWritePaths=/opt/remihub-agent/deployment/qa/worktrees
 ReadWritePaths=/opt/remihub-agent/deployment/qa/artifacts
 ReadWritePaths=/opt/remihub-agent/deployment/qa/application
+ReadWritePaths=/opt/remihub-agent/deployment/qa/frontend-backups
 ReadWritePaths=/var/backups/remihub-agent/backend-deployments/qa
 
 [Install]

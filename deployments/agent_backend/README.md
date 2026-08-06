@@ -82,4 +82,35 @@ The complete QA proof now runs before production is stopped or promoted. A QA
 health failure preserves `systemctl status` and the last 200 journal entries in
 the protected verification record and prints them before installer rollback.
 
+Backend cards may now include reviewed `frontend-web/` React/Vite source
+changes. The backend deployment worker keeps the existing backend scope and
+creates a frontend artifact only when an approved candidate changes
+`frontend-web/`. The source-controlled frontend policy requires Node
+`v22.22.2`, npm `10.9.7`, `package-lock.json`, `npm ci --ignore-scripts`,
+`npm run lint`, and `npm run build`. Dependency lifecycle scripts are disabled
+during package preparation. Application secrets, deployment configs, service
+helpers, host sockets, and production environment files are not provided to
+frontend commands.
+
+The frontend artifact is stored below the existing protected deployment
+artifact root at
+`<artifact-root>/<card-id>/<deployment-run-id>/frontend-web/<candidate-commit>/`.
+It contains `manifest.json` and `dist.tar`. The canonical artifact identity is
+the SHA-256 of a canonical JSON manifest containing normalized relative paths,
+file types, modes, sizes, and file content SHA-256 values. Tar container bytes
+are recorded separately as packaging evidence. The archive itself must still be
+deterministic: entries are emitted in manifest order, timestamps are `0`,
+uid/gid are `0`, owner/group names are `root`, directories are `0755`, and
+files are `0644`.
+
+The root deployment helper verifies the packaged archive against the canonical
+manifest immediately before installation and verifies the installed
+`frontend-web/dist` content after service health succeeds. It preserves the
+current environment's exact frontend dist before mutation and restores it
+during rollback. QA uses
+`/opt/remihub-agent/deployment/qa/frontend-backups`; production uses
+`/var/backups/remihub-agent/frontend-web/production`. Frontend installation is
+inside the same protected stop/promote/start/verify boundary as backend source
+promotion and database rollback.
+
 The installer does not apply a production database migration.

@@ -94,7 +94,24 @@
     --setenv REMIHUB_ENV_FILE /dev/null
     --setenv REMIHUB_LOG_DIR /tmp/remihub-logs
     --chdir /workspace
-    /bin/bash -c '/opt/remihub/.venv/bin/python -m compileall -q backend tests && /opt/remihub/.venv/bin/python -m unittest discover -s tests -v'
+    /bin/bash -c '
+      set -euo pipefail
+      /opt/remihub/.venv/bin/python -m compileall -q backend tests
+      /opt/remihub/.venv/bin/python -m unittest discover -s tests -v
+      if git diff --name-only HEAD^ HEAD -- frontend-web | grep -q .; then
+        [[ "$(node --version)" == "v22.22.2" ]] || { echo "unsupported Node version" >&2; exit 1; }
+        [[ "$(npm --version)" == "10.9.7" ]] || { echo "unsupported npm version" >&2; exit 1; }
+        [[ -f frontend-web/package-lock.json ]] || { echo "missing frontend lockfile" >&2; exit 1; }
+        rm -rf /tmp/frontend-build
+        mkdir -p /tmp/frontend-build
+        cp -a frontend-web /tmp/frontend-build/frontend-web
+        rm -rf /tmp/frontend-build/frontend-web/dist /tmp/frontend-build/frontend-web/node_modules
+        cd /tmp/frontend-build/frontend-web
+        npm ci --ignore-scripts
+        npm run lint
+        npm run build
+      fi
+    '
   )
 
   exec /usr/bin/env -i "${args[@]}"

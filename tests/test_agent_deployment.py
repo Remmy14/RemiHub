@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from dataclasses import replace
@@ -18,12 +19,16 @@ from backend.core.agent_deployment import (
     DeploymentRollbackError,
     DeploymentRolledBackError,
     DeploymentValidationError,
+    FrontendArtifactEvidence,
     GitBackendDeploymentExecutor,
     GitBackendDeploymentManager,
     PostgresMigrationHistoryReader,
     PostgresDeploymentDatabase,
     RuntimeHealth,
     ValidationEvidence,
+    _frontend_artifact_manifest,
+    _write_deterministic_frontend_archive,
+    verify_frontend_archive,
     verify_distinct_database_identities,
 )
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
@@ -270,6 +275,7 @@ class FakeRuntime:
         self.current_commit = None
         self.sources_commit = None
         self.active = True
+        self.frontend_installed = None
 
     def stop(self):
         self.events.append("stop")
@@ -303,6 +309,35 @@ class FakeRuntime:
         if self.fail_restore:
             raise RuntimeError("restore failed")
         self.current_commit = rollback_commit
+
+    def frontend_install(
+        self,
+        *,
+        artifact_manifest,
+        artifact_archive,
+        artifact_identity,
+        candidate_commit,
+        card_id,
+        deployment_run_id,
+    ):
+        self.events.append(("frontend_install", artifact_identity, candidate_commit))
+        self.frontend_installed = artifact_identity
+        return {
+            "status": "installed",
+            "artifact_identity": artifact_identity,
+            "candidate_commit": candidate_commit,
+        }
+
+    def frontend_restore(self):
+        self.events.append("frontend_restore")
+        self.frontend_installed = None
+        return {"status": "restored"}
+
+    def frontend_verify(self, *, artifact_manifest, artifact_identity):
+        self.events.append(("frontend_verify", artifact_identity))
+        if self.frontend_installed != artifact_identity:
+            raise AgentDeploymentError("frontend artifact mismatch")
+        return {"status": "verified", "artifact_identity": artifact_identity}
 
     def synchronize_sources(
         self,
@@ -379,6 +414,148 @@ class FakeGitHubSynchronizer:
             "remote_after": candidate_commit,
             "push_return_code": "not_needed" if self.already_current else 0,
         }
+
+
+class FakeFrontendBuilder:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    def build(
+        self,
+        *,
+        candidate_worktree,
+        artifact_root,
+        card_id,
+        card_revision,
+        deployment_run_id,
+        approval_id,
+        implementation_run_id,
+        candidate_commit,
+        changed_files,
+    ):
+        self.calls.append(tuple(changed_files))
+        if not any(path.startswith("frontend-web/") for path in changed_files):
+            return FrontendArtifactEvidence(changed=False)
+        if self.fail:
+            raise DeploymentValidationError("frontend build failed")
+        artifact_dir = (
+            artifact_root
+            / card_id
+            / deployment_run_id
+            / "frontend-web"
+            / candidate_commit
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = artifact_dir / "manifest.json"
+        archive_path = artifact_dir / "dist.tar"
+        manifest_path.write_text("{}", encoding="utf-8")
+        archive_path.write_bytes(b"tar")
+        return FrontendArtifactEvidence(
+            changed=True,
+            artifact_directory=str(artifact_dir),
+            archive_path=str(archive_path),
+            archive_sha256="d" * 64,
+            manifest_path=str(manifest_path),
+            manifest_sha256="e" * 64,
+            artifact_identity="f" * 64,
+            lockfile_sha256="a" * 64,
+            node_version="v22.22.2",
+            npm_version="10.9.7",
+            commands=(
+                {"command": "npm ci --ignore-scripts", "return_code": 0},
+                {"command": "npm run lint", "return_code": 0},
+                {"command": "npm run build", "return_code": 0},
+            ),
+            reproducibility={"matched": True},
+        )
+
+
+class FrontendArtifactDeterminismTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.dist = self.root / "dist"
+        (self.dist / "assets").mkdir(parents=True)
+        (self.dist / "index.html").write_text("<script src=/assets/app.js></script>\n", encoding="utf-8")
+        (self.dist / "assets" / "app.js").write_text("console.log('ok')\n", encoding="utf-8")
+
+    def test_manifest_identity_is_sorted_and_content_based(self):
+        manifest = _frontend_artifact_manifest(
+            self.dist,
+            candidate_commit="a" * 40,
+            lockfile_sha256="b" * 64,
+        )
+
+        paths = [entry["path"] for entry in manifest["entries"]]
+        self.assertEqual(paths, sorted(paths))
+        self.assertEqual(len(manifest["artifact_identity"]), 64)
+        self.assertNotIn("mtime", json.dumps(manifest))
+        self.assertNotIn("uid", json.dumps(manifest))
+
+    def test_deterministic_archive_normalizes_metadata_and_verifies_identity(self):
+        manifest = _frontend_artifact_manifest(
+            self.dist,
+            candidate_commit="a" * 40,
+            lockfile_sha256="b" * 64,
+        )
+        manifest_path = self.root / "manifest.json"
+        archive_path = self.root / "dist.tar"
+        manifest_path.write_bytes(
+            (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                + "\n"
+            ).encode("utf-8")
+        )
+
+        _write_deterministic_frontend_archive(self.dist, archive_path, manifest)
+        verified = verify_frontend_archive(
+            archive_path=archive_path,
+            manifest_path=manifest_path,
+        )
+
+        self.assertEqual(verified["artifact_identity"], manifest["artifact_identity"])
+        with tarfile.open(archive_path) as archive:
+            members = archive.getmembers()
+        self.assertEqual([member.name for member in members], [entry["path"] for entry in manifest["entries"]])
+        self.assertTrue(all(member.mtime == 0 for member in members))
+        self.assertTrue(all(member.uid == 0 and member.gid == 0 for member in members))
+        self.assertTrue(all(member.uname == "root" and member.gname == "root" for member in members))
+
+    def test_archive_metadata_must_be_normalized_even_when_content_matches(self):
+        manifest = _frontend_artifact_manifest(
+            self.dist,
+            candidate_commit="a" * 40,
+            lockfile_sha256="b" * 64,
+        )
+        manifest_path = self.root / "manifest.json"
+        archive_path = self.root / "bad.tar"
+        manifest_path.write_bytes(
+            (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                + "\n"
+            ).encode("utf-8")
+        )
+        with tarfile.open(archive_path, "w") as archive:
+            for entry in manifest["entries"]:
+                source = self.dist / entry["path"]
+                info = archive.gettarinfo(str(source), arcname=entry["path"])
+                info.mtime = 123
+                if entry["type"] == "directory":
+                    archive.addfile(info)
+                else:
+                    with source.open("rb") as file_object:
+                        archive.addfile(info, file_object)
+
+        with self.assertRaisesRegex(
+            DeploymentValidationError,
+            "non-deterministic timestamps",
+        ):
+            verify_frontend_archive(
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
 
 
 class PostgresDeploymentDatabaseTests(unittest.TestCase):
@@ -656,6 +833,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         validator=None,
         database=None,
         runtime=None,
+        frontend_builder=None,
         qa_history_reader=None,
         environment="qa",
     ):
@@ -674,6 +852,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             validator=validator or self.validator,
             database=database or self.database,
             runtime=runtime or self.runtime,
+            frontend_builder=frontend_builder or FakeFrontendBuilder(),
             qa_history_reader=(
                 qa_history_reader
                 if qa_history_reader is not None
@@ -1051,6 +1230,88 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(AgentDeploymentError, "protected control-plane"):
             self._manager().deploy(claim)
+
+    def test_frontend_safe_source_file_is_accepted_and_installed(self):
+        frontend_builder = FakeFrontendBuilder()
+        claim = self._prepare_deployment(
+            {"frontend-web/src/NewScreen.tsx": "export const value = 1;\n"}
+        )
+
+        candidate = self._manager(frontend_builder=frontend_builder).deploy(claim)
+
+        self.assertEqual(frontend_builder.calls, [("frontend-web/src/NewScreen.tsx",)])
+        self.assertIsNotNone(candidate.frontend_artifact)
+        self.assertIn(("frontend_install", "f" * 64, candidate.candidate_commit), self.runtime.events)
+        self.assertIn(("frontend_verify", "f" * 64), self.runtime.events)
+        manifest = json.loads(Path(candidate.manifest_path).read_text())
+        self.assertTrue(manifest["frontend_artifact"]["changed"])
+        self.assertEqual(
+            manifest["attempts"][-1]["frontend_install"]["artifact_identity"],
+            "f" * 64,
+        )
+
+    def test_frontend_dist_and_node_modules_are_rejected(self):
+        for path in (
+            "frontend-web/dist/index.html",
+            "frontend-web/node_modules/react/index.js",
+        ):
+            with self.subTest(path=path):
+                claim = self._prepare_deployment({path: "generated\n"})
+                with self.assertRaisesRegex(
+                    AgentDeploymentError,
+                    "generated dependency or dist",
+                ):
+                    self._manager().deploy(claim)
+
+    def test_frontend_env_and_secret_like_files_are_rejected(self):
+        for path in (
+            "frontend-web/.env",
+            "frontend-web/src/firebase-token.txt",
+            "frontend-web/public/private-key.pem",
+        ):
+            with self.subTest(path=path):
+                claim = self._prepare_deployment({path: "secret\n"})
+                with self.assertRaisesRegex(
+                    AgentDeploymentError,
+                    "environment files|secret-like",
+                ):
+                    self._manager().deploy(claim)
+
+    def test_backend_only_candidate_does_not_require_frontend_artifact(self):
+        frontend_builder = FakeFrontendBuilder()
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+
+        candidate = self._manager(frontend_builder=frontend_builder).deploy(claim)
+
+        self.assertIsNone(candidate.frontend_artifact)
+        self.assertEqual(frontend_builder.calls, [("backend/example.py",)])
+        self.assertNotIn("frontend_install", [event for event in self.runtime.events if isinstance(event, str)])
+        manifest = json.loads(Path(candidate.manifest_path).read_text())
+        self.assertFalse(manifest["frontend_artifact"]["changed"])
+
+    def test_frontend_build_failure_occurs_before_runtime_mutation(self):
+        claim = self._prepare_deployment(
+            {"frontend-web/src/Broken.tsx": "export const broken = true;\n"}
+        )
+
+        with self.assertRaisesRegex(DeploymentValidationError, "frontend build failed"):
+            self._manager(frontend_builder=FakeFrontendBuilder(fail=True)).deploy(claim)
+
+        self.assertEqual(self.runtime.events, [])
+        self.assertEqual(_git(self.target, "rev-parse", "qa-main"), self.base_commit)
+
+    def test_frontend_failure_after_install_restores_backend_and_frontend(self):
+        claim = self._prepare_deployment(
+            {"frontend-web/src/NewScreen.tsx": "export const value = 1;\n"}
+        )
+        runtime = FakeRuntime(fail_verify_times=1)
+
+        with self.assertRaises(DeploymentRolledBackError):
+            self._manager(runtime=runtime).deploy(claim)
+
+        self.assertIn("frontend_restore", runtime.events)
+        self.assertEqual(runtime.current_commit, self.base_commit)
+        self.assertEqual(_git(self.target, "rev-parse", "qa-main"), self.base_commit)
 
     def test_failed_codex_test_evidence_runs_authoritative_validation(self):
         claim = self._prepare_deployment(
@@ -1600,6 +1861,7 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
                 runtime=runtime,
                 runtime_branch="qa-runtime",
                 runtime_user="root",
+                frontend_backup_root=root / "frontend-backups",
             )
             group = SimpleNamespace(gr_gid=os.getgid())
             with (
