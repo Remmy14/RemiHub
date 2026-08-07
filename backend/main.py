@@ -56,6 +56,7 @@ logger = logging.getLogger("remihub.main")
 BASE_DIR = Path(__file__).resolve().parent.parent  # /opt/remihub
 STATIC_DIR = BASE_DIR / 'backend' / 'static'
 WEB_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
+WEB_ASSETS_DIR = WEB_DIST_DIR / 'assets'
 
 # Load environment variables
 _ENV_PATH = resolve_environment_file_path()
@@ -155,16 +156,55 @@ app.mount(
     name='static',
 )
 
-# Serve React pages for race and draft
+app.mount(
+    '/assets',
+    StaticFiles(directory=str(WEB_ASSETS_DIR), check_dir=False),
+    name='web-assets',
+)
+
+
+def serve_web_index():
+    return FileResponse(WEB_DIST_DIR / "index.html")
+
+
+# Serve React pages for public Race and private portal routes.
+@app.get("/", include_in_schema=False)
+async def serve_portal_root():
+    return serve_web_index()
+
+
 @app.get("/race/draft", include_in_schema=False)
 @app.get("/race/draft/{full_path:path}", include_in_schema=False)
 async def serve_race_draft(full_path: str = ""):
-    return FileResponse(WEB_DIST_DIR / "index.html")
+    return serve_web_index()
 
 @app.get("/storage", include_in_schema=False)
 @app.get("/storage/{full_path:path}", include_in_schema=False)
 async def serve_storage_status(full_path: str = ""):
-    return FileResponse(WEB_DIST_DIR / "index.html")
+    return serve_web_index()
+
+
+@app.get("/agent", include_in_schema=False)
+@app.get("/agent/{full_path:path}", include_in_schema=False)
+async def serve_agent_portal(full_path: str = ""):
+    return serve_web_index()
+
+
+@app.get("/health", include_in_schema=False)
+@app.get("/health/{full_path:path}", include_in_schema=False)
+async def serve_health_portal(full_path: str = ""):
+    return serve_web_index()
+
+
+@app.get("/portal", include_in_schema=False)
+@app.get("/portal/{full_path:path}", include_in_schema=False)
+async def serve_portal(full_path: str = ""):
+    return serve_web_index()
+
+
+@app.get("/favicon.png", include_in_schema=False)
+async def web_favicon():
+    return FileResponse(WEB_DIST_DIR / "favicon.png")
 
 app.mount(
     '/race',

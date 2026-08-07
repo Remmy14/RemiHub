@@ -33,8 +33,6 @@ type RecentPick = {
 
 type Tab = "draft" | "field" | "available" | "saved" | "teams";
 
-const API_BASE = "https://remillard.duckdns.org";
-
 const getSavedDriversStorageKey = (poolId: number) =>
   `remihub-draft-saved-drivers-${poolId}`;
 
@@ -51,7 +49,7 @@ const DraftCompanionScreen: React.FC = () => {
   const [savedDriverNumbers, setSavedDriverNumbers] = useState<string[]>([]);
 
   const loadPools = async () => {
-    const res = await fetch(`${API_BASE}/race/getPools`);
+    const res = await fetch(`/race/getPools`);
     const data = await res.json();
 
     if (Array.isArray(data)) {
@@ -63,10 +61,10 @@ const DraftCompanionScreen: React.FC = () => {
   const loadDraftData = async (poolId: number) => {
     try {
       const [statusRes, gridRes, assignmentsRes, picksRes] = await Promise.all([
-        fetch(`${API_BASE}/race/getDraftStatus?pool_id=${poolId}`),
-        fetch(`${API_BASE}/race/getStartingGridStatus?pool_id=${poolId}`),
-        fetch(`${API_BASE}/race/getPoolAssignments?pool_id=${poolId}`),
-        fetch(`${API_BASE}/race/getRecentPicks?pool_id=${poolId}&limit=5`),
+        fetch(`/race/getDraftStatus?pool_id=${poolId}`),
+        fetch(`/race/getStartingGridStatus?pool_id=${poolId}`),
+        fetch(`/race/getPoolAssignments?pool_id=${poolId}`),
+        fetch(`/race/getRecentPicks?pool_id=${poolId}&limit=5`),
       ]);
 
       const statusData = await statusRes.json();
@@ -501,7 +499,7 @@ function DriverMiniCard({
 
       {driver.car_image_url && (
         <img
-          src={`${API_BASE}/${driver.car_image_url.replace(/^\/+/, "")}`}
+          src={`/${driver.car_image_url.replace(/^\/+/, "")}`}
           alt={driver.name}
           className="mx-auto my-1 h-10 object-contain"
         />

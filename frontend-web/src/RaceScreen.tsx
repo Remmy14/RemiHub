@@ -27,7 +27,7 @@ const RaceScreen: React.FC = () => {
 
   const fetchLeaderboard = async (poolId: number) => {
     try {
-      const res = await fetch(`https://remillard.duckdns.org/race/getLeaderboard?pool_id=${poolId}`);
+      const res = await fetch(`/race/getLeaderboard?pool_id=${poolId}`);
       const data = await res.json();
 
       if (data.success && Array.isArray(data.standings)) {
@@ -50,7 +50,7 @@ const RaceScreen: React.FC = () => {
   useEffect(() => {
     const loadPools = async () => {
       try {
-        const res = await fetch('https://remillard.duckdns.org/race/getPools');
+        const res = await fetch('/race/getPools');
         const data = await res.json();
         if (Array.isArray(data)) {
           setPools(data);

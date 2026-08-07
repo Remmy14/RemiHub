@@ -386,8 +386,15 @@ class RacePortalBoundaryTests(unittest.TestCase):
             if node.args and isinstance(node.args[0], ast.Constant):
                 static_mounts.add(node.args[0].value)
 
+        self.assertIn("/", route_paths)
         self.assertIn("/race/draft", route_paths)
         self.assertIn("/race/draft/{full_path:path}", route_paths)
+        self.assertIn("/storage", route_paths)
+        self.assertIn("/storage/{full_path:path}", route_paths)
+        self.assertIn("/agent", route_paths)
+        self.assertIn("/health", route_paths)
+        self.assertIn("/portal", route_paths)
+        self.assertIn("/assets", static_mounts)
         self.assertIn("/race", static_mounts)
 
 

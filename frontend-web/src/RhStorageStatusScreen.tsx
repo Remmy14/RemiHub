@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
+import { apiRequest } from "./api/authenticatedApi";
+
 type DriftSummary = {
   total: number;
   needs_repair: number;
@@ -78,8 +80,6 @@ type RhStorageStatusResponse = {
   pools: PoolStatus[];
   recent_jobs: RecentJob[];
 };
-
-const API_BASE = "https://remillard.duckdns.org";
 
 function formatGb(value: number | null | undefined): string {
   if (value === null || value === undefined) {
@@ -322,11 +322,10 @@ const RhStorageStatusScreen: React.FC = () => {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch(`${API_BASE}/rh-storage/status`);
-      const data = await res.json();
-
-      if (!res.ok || !data.success) {
-        throw new Error(data.detail || "RH-Storage status is unavailable.");
+      const data =
+        await apiRequest<RhStorageStatusResponse>("/rh-storage/status");
+      if (!data.success) {
+        throw new Error("RH-Storage status is unavailable.");
       }
 
       setStatus(data);
