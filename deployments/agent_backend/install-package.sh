@@ -18,12 +18,16 @@
   NEW_COMMIT=""
   OLD_QA=""
   OLD_PROD_TARGET=""
-  PROD_TARGET_EXISTED=0
-  PROD_DEPLOYMENT_EXISTED=0
+  PROD_TARGET_EXISTED="UNRECORDED"
+  PROD_DEPLOYMENT_EXISTED="UNRECORDED"
+  QA_REPOSITORY_EXISTED="UNRECORDED"
+  QA_APPLICATION_EXISTED="UNRECORDED"
   PROD_PROMOTED=0
   SOURCE_PROMOTED=0
   PLANNING_PROMOTED=0
-  SYSTEM_INSTALLED=0
+  SYSTEM_BACKUP_CAPTURED=0
+  SYSTEM_MUTATED=0
+  ROLLBACK_STATE_CAPTURED=0
   QA_REINITIALIZED=0
   DEPLOYER_USER_CREATED=0
   DEPLOYER_GROUP_CREATED=0
@@ -34,15 +38,21 @@
   PG_RESTORE_BINARY=""
   DEPLOYMENT_PARENT_OWNER=""
   DEPLOYMENT_PARENT_MODE=""
-  QA_PARENT_EXISTED=0
+  QA_PARENT_EXISTED="UNRECORDED"
   QA_PARENT_OWNER=""
   QA_PARENT_MODE=""
-  CONFIG_PARENT_EXISTED=0
+  CONFIG_PARENT_EXISTED="UNRECORDED"
   CONFIG_PARENT_OWNER=""
   CONFIG_PARENT_MODE=""
+  QA_FRONTEND_BOOTSTRAP_CARD="33333333-3333-4333-8333-333333333333"
+  QA_FRONTEND_BOOTSTRAP_RUN="44444444-4444-4444-8444-444444444444"
+  QA_FRONTEND_BOOTSTRAP_APPROVAL="55555555-5555-4555-8555-555555555555"
+  QA_FRONTEND_BOOTSTRAP_IMPLEMENTATION="66666666-6666-4666-8666-666666666666"
+  QA_FRONTEND_BOOTSTRAP_WORKTREE=""
+  QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT=""
 
   required_commands=(
-    git systemctl systemd-analyze runuser install sha256sum tar sed curl visudo
+    git systemctl systemd-analyze systemd-run runuser install sha256sum tar sed curl visudo
     getent groupadd useradd usermod userdel groupdel find seq sudo python3 psql
     stat journalctl node npm
   )
@@ -93,6 +103,7 @@
 
   SYSTEM_PATHS=(
     /usr/local/libexec/remihub-backend-deployment-control
+    /usr/local/libexec/remihub-backend-npm-cache-control
     /usr/local/libexec/remihub-backend-validation-sandbox
     /usr/local/libexec/remihub-backend-qa-server
     /usr/local/libexec/remihub-backend-validation-support
@@ -108,27 +119,159 @@
     /opt/remihub-agent/deployment/config/qa-application.ini
     /opt/remihub-agent/deployment/config/git-safe-directory.ini
     /opt/remihub-agent/deployment/config/frontend-web-policy.json
+    /var/cache/remihub-agent/npm
+    /var/lib/remihub-agent/npm-prep
   )
 
+  CRITICAL_PARENTS=(
+    /
+    /usr
+    /etc
+    /opt
+    /var
+    /home
+    /dev
+    /usr/local
+    /usr/local/libexec
+    /etc/systemd
+    /etc/systemd/system
+    /opt/remihub-agent
+    /opt/remihub-agent/deployment
+    /var/cache
+    /var/lib
+    /var/backups
+  )
+
+  capture_critical_parent_state() {
+    local path
+    : >"$BACKUP/critical-parent-state.tsv"
+    for path in "${CRITICAL_PARENTS[@]}"; do
+      [[ -d "$path" && ! -L "$path" ]] || {
+        echo "Critical parent is missing, not a directory, or is a symlink: $path" >&2
+        return 1
+      }
+      printf '%s\t%s\t%s\t%s\n' \
+        "$path" "$(stat -c '%u:%g' "$path")" \
+        "$(stat -c '%a' "$path")" "$(stat -c '%F' "$path")" \
+        >>"$BACKUP/critical-parent-state.tsv"
+    done
+    [[ -c /dev/null && ! -L /dev/null ]] || {
+      echo "/dev/null is not the expected character device." >&2
+      return 1
+    }
+    printf '/dev/null\t%s\t%s\t%s\t%s\n' \
+      "$(stat -c '%u:%g' /dev/null)" "$(stat -c '%a' /dev/null)" \
+      "$(stat -c '%t:%T' /dev/null)" "$(stat -c '%F' /dev/null)" \
+      >"$BACKUP/critical-device-state.tsv"
+  }
+
+  verify_critical_parent_state() {
+    local path owner mode kind observed device_path device_owner device_mode device_id device_kind
+    [[ -f "$BACKUP/critical-parent-state.tsv" ]] || {
+      echo "Critical parent state was not captured; refusing to infer it." >&2
+      return 1
+    }
+    while IFS=$'\t' read -r path owner mode kind; do
+      [[ -n "$path" ]] || continue
+      [[ -d "$path" && ! -L "$path" ]] || {
+        echo "Critical parent changed type or disappeared: $path" >&2
+        return 1
+      }
+      observed="$(stat -c '%u:%g|%a|%F' "$path")"
+      [[ "$observed" == "$owner|$mode|$kind" ]] || {
+        echo "Critical parent ownership/mode/type changed: $path expected=$owner|$mode|$kind observed=$observed" >&2
+        return 1
+      }
+    done <"$BACKUP/critical-parent-state.tsv"
+
+    [[ -f "$BACKUP/critical-device-state.tsv" ]] || {
+      echo "Critical device state was not captured." >&2
+      return 1
+    }
+    IFS=$'\t' read -r device_path device_owner device_mode device_id device_kind \
+      <"$BACKUP/critical-device-state.tsv"
+    [[ "$device_path" == "/dev/null" && -c /dev/null && ! -L /dev/null ]] || {
+      echo "/dev/null changed type." >&2
+      return 1
+    }
+    observed="$(stat -c '%u:%g|%a|%t:%T|%F' /dev/null)"
+    [[ "$observed" == "$device_owner|$device_mode|$device_id|$device_kind" ]] || {
+      echo "/dev/null ownership/mode/device identity changed." >&2
+      return 1
+    }
+  }
+
   backup_system_paths() {
-    mkdir -p "$BACKUP/system-root"
-    : >"$BACKUP/system-absent.txt"
+    local index=0 path parent base archive
+    mkdir -p "$BACKUP/system-leaves"
+    : >"$BACKUP/system-leaf-state.tsv"
     for path in "${SYSTEM_PATHS[@]}"; do
+      index=$((index + 1))
+      parent="$(dirname -- "$path")"
+      base="$(basename -- "$path")"
+      archive="$BACKUP/system-leaves/$(printf '%03d' "$index").tar"
+      [[ -d "$parent" && ! -L "$parent" ]] || {
+        echo "System leaf parent is missing or unsafe: $parent" >&2
+        return 1
+      }
       if [[ -e "$path" || -L "$path" ]]; then
-        cp -a --parents "$path" "$BACKUP/system-root"
+        tar -C "$parent" -cpf "$archive" -- "$base"
+        printf '%03d\tpresent\t%s\n' "$index" "$path" >>"$BACKUP/system-leaf-state.tsv"
       else
-        printf '%s\n' "$path" >>"$BACKUP/system-absent.txt"
+        printf '%03d\tabsent\t%s\n' "$index" "$path" >>"$BACKUP/system-leaf-state.tsv"
       fi
     done
+    SYSTEM_BACKUP_CAPTURED=1
   }
 
   restore_system_paths() {
+    local index=0 path manifest_index state expected_path parent base archive expected_index
+    [[ "$SYSTEM_BACKUP_CAPTURED" -eq 1 ]] || {
+      echo "System leaf backup was not fully captured; refusing restore." >&2
+      return 1
+    }
+    [[ -f "$BACKUP/system-leaf-state.tsv" ]] || {
+      echo "System leaf state manifest is missing; refusing restore." >&2
+      return 1
+    }
+
     for path in "${SYSTEM_PATHS[@]}"; do
+      index=$((index + 1))
+      expected_index="$(printf '%03d' "$index")"
+      IFS=$'\t' read -r manifest_index state expected_path < <(
+        sed -n "${index}p" "$BACKUP/system-leaf-state.tsv"
+      )
+      [[ "$manifest_index" == "$expected_index" && "$expected_path" == "$path" ]] || {
+        echo "System leaf backup manifest mismatch at index $expected_index." >&2
+        return 1
+      }
+      [[ "$state" == "present" || "$state" == "absent" ]] || {
+        echo "Invalid system leaf state for $path: $state" >&2
+        return 1
+      }
+
+      parent="$(dirname -- "$path")"
+      base="$(basename -- "$path")"
+      archive="$BACKUP/system-leaves/${expected_index}.tar"
+      [[ -d "$parent" && ! -L "$parent" ]] || {
+        echo "System leaf restore parent is missing or unsafe: $parent" >&2
+        return 1
+      }
+
       rm -rf -- "$path"
+      if [[ "$state" == "present" ]]; then
+        [[ -f "$archive" && ! -L "$archive" ]] || {
+          echo "System leaf archive is missing or unsafe: $archive" >&2
+          return 1
+        }
+        tar -C "$parent" -xpf "$archive" -- "$base"
+      else
+        [[ ! -e "$archive" && ! -L "$archive" ]] || {
+          echo "Unexpected archive exists for originally absent system leaf: $path" >&2
+          return 1
+        }
+      fi
     done
-    if [[ -d "$BACKUP/system-root" ]]; then
-      cp -a "$BACKUP/system-root/." /
-    fi
     systemctl daemon-reload || true
   }
 
@@ -209,90 +352,389 @@
 
   restore_parent_directory_state() {
     local path="${1:?path required}"
-    local existed="${2:?existence flag required}"
+    local existed="${2:?existence state required}"
     local owner="${3:-}"
     local mode="${4:-}"
 
-    if [[ "$existed" -eq 0 ]]; then
-      rm -rf -- "$path"
+    case "$existed" in
+      0)
+        rm -rf -- "$path"
+        ;;
+      1)
+        [[ -n "$owner" && -n "$mode" ]] || {
+          echo "Captured parent metadata is incomplete for $path; refusing restore." >&2
+          return 1
+        }
+        [[ -d "$path" && ! -L "$path" ]] || {
+          echo "Captured parent no longer exists safely: $path" >&2
+          return 1
+        }
+        chown "$owner" "$path"
+        chmod "$mode" "$path"
+        ;;
+      *)
+        echo "Parent existence state was not captured for $path; refusing restore." >&2
+        return 1
+        ;;
+    esac
+  }
+
+  cleanup_qa_frontend_bootstrap_worktree() {
+    local expected="/opt/remihub-agent/deployment/qa/worktrees/card-${QA_FRONTEND_BOOTSTRAP_CARD}-r1"
+
+    if [[ -z "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]]; then
       return 0
     fi
+    [[ "$QA_FRONTEND_BOOTSTRAP_WORKTREE" == "$expected" ]] || {
+      echo "QA frontend bootstrap worktree identity drifted; refusing broad cleanup." >&2
+      return 1
+    }
+    if [[ -L "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]]; then
+      echo "QA frontend bootstrap worktree became a symlink; refusing cleanup." >&2
+      return 1
+    fi
+    if [[ -e "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]]; then
+      [[ -d "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]] || {
+        echo "QA frontend bootstrap worktree is not a directory; refusing cleanup." >&2
+        return 1
+      }
+      runuser -u remihub-deployer -- env \
+        HOME=/nonexistent \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL="$GIT_SAFE_CONFIG" \
+        GIT_TERMINAL_PROMPT=0 \
+        git --git-dir=/opt/remihub-agent/deployment/qa/repository.git \
+        worktree remove --force "$QA_FRONTEND_BOOTSTRAP_WORKTREE" || return 1
+    fi
+    [[ ! -e "$QA_FRONTEND_BOOTSTRAP_WORKTREE" && \
+       ! -L "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]] || {
+      echo "Exact QA frontend bootstrap worktree remains after Git cleanup." >&2
+      return 1
+    }
+    QA_FRONTEND_BOOTSTRAP_WORKTREE=""
+  }
 
-    [[ -d "$path" ]] || mkdir -p "$path"
-    chown "$owner" "$path"
-    chmod "$mode" "$path"
+  bootstrap_qa_frontend() {
+    local qa_runtime="/opt/remihub-agent/deployment/qa/application"
+    local qa_repo="/opt/remihub-agent/deployment/qa/repository.git"
+    local worktree_root="/opt/remihub-agent/deployment/qa/worktrees"
+    local candidate_tree manifest archive identity builder_record
+
+    [[ -d "$qa_runtime" && ! -L "$qa_runtime" ]] || {
+      echo "Fresh QA runtime is missing or unsafe before frontend bootstrap." >&2
+      return 1
+    }
+    [[ -d "$qa_repo" && ! -L "$qa_repo" ]] || {
+      echo "Protected QA repository is missing or unsafe before frontend bootstrap." >&2
+      return 1
+    }
+    [[ -f "$qa_runtime/frontend-web/package.json" && \
+       ! -L "$qa_runtime/frontend-web/package.json" ]] || {
+      echo "Fresh QA runtime frontend package.json is missing or unsafe." >&2
+      return 1
+    }
+    [[ -f "$qa_runtime/frontend-web/package-lock.json" && \
+       ! -L "$qa_runtime/frontend-web/package-lock.json" ]] || {
+      echo "Fresh QA runtime frontend package-lock.json is missing or unsafe." >&2
+      return 1
+    }
+    [[ ! -e "$qa_runtime/frontend-web/dist" && \
+       ! -L "$qa_runtime/frontend-web/dist" ]] || {
+      echo "Fresh QA Git runtime unexpectedly already contains frontend dist." >&2
+      return 1
+    }
+
+    QA_FRONTEND_BOOTSTRAP_WORKTREE="$worktree_root/card-${QA_FRONTEND_BOOTSTRAP_CARD}-r1"
+    [[ ! -e "$QA_FRONTEND_BOOTSTRAP_WORKTREE" && \
+       ! -L "$QA_FRONTEND_BOOTSTRAP_WORKTREE" ]] || {
+      echo "QA frontend bootstrap worktree path already exists." >&2
+      return 1
+    }
+
+    runuser -u remihub-deployer -- env \
+      HOME=/nonexistent \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_GLOBAL="$GIT_SAFE_CONFIG" \
+      GIT_TERMINAL_PROMPT=0 \
+      git --git-dir="$qa_repo" \
+      worktree add --detach "$QA_FRONTEND_BOOTSTRAP_WORKTREE" "$NEW_COMMIT"
+    runuser -u remihub-deployer -- chmod 0700 "$QA_FRONTEND_BOOTSTRAP_WORKTREE"
+
+    candidate_tree="$(
+      runuser -u remihub-deployer -- env \
+        HOME=/nonexistent \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL="$GIT_SAFE_CONFIG" \
+        GIT_TERMINAL_PROMPT=0 \
+        git -C "$QA_FRONTEND_BOOTSTRAP_WORKTREE" rev-parse 'HEAD^{tree}'
+    )"
+    [[ "$(
+      runuser -u remihub-deployer -- env \
+        HOME=/nonexistent \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL="$GIT_SAFE_CONFIG" \
+        GIT_TERMINAL_PROMPT=0 \
+        git -C "$QA_FRONTEND_BOOTSTRAP_WORKTREE" rev-parse HEAD
+    )" == "$NEW_COMMIT" ]] || {
+      echo "QA frontend bootstrap worktree commit mismatch." >&2
+      return 1
+    }
+
+    /usr/local/libexec/remihub-backend-deployment-control \
+      frontend-prepare qa \
+      "$QA_FRONTEND_BOOTSTRAP_WORKTREE" \
+      "$NEW_COMMIT" \
+      "$candidate_tree"
+
+    QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT="/opt/remihub-agent/deployment/qa/artifacts/install-verification-$STAMP/frontend-bootstrap"
+    runuser -u remihub-deployer -- \
+      install -d -m 0750 "$QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT"
+
+    builder_record="$BACKUP/qa-frontend-bootstrap-builder.json"
+    runuser -u remihub-deployer -- env \
+      HOME=/nonexistent \
+      LANG=C.UTF-8 \
+      PATH=/opt/remihub/.venv/bin:/usr/bin:/bin \
+      PYTHONPATH="$RELEASE" \
+      PYTHONDONTWRITEBYTECODE=1 \
+      /opt/remihub/.venv/bin/python - \
+        "$QA_FRONTEND_BOOTSTRAP_WORKTREE" \
+        "$QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT" \
+        "$QA_FRONTEND_BOOTSTRAP_CARD" \
+        "$QA_FRONTEND_BOOTSTRAP_RUN" \
+        "$QA_FRONTEND_BOOTSTRAP_APPROVAL" \
+        "$QA_FRONTEND_BOOTSTRAP_IMPLEMENTATION" \
+        "$NEW_COMMIT" \
+        >"$builder_record" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from backend.core.agent_deployment import LocalFrontendArtifactBuilder
+
+(
+    worktree,
+    artifact_root,
+    card_id,
+    deployment_run_id,
+    approval_id,
+    implementation_run_id,
+    candidate_commit,
+) = sys.argv[1:]
+
+result = LocalFrontendArtifactBuilder(
+    timeout_seconds=900,
+    environment="qa",
+).build(
+    candidate_worktree=Path(worktree),
+    artifact_root=Path(artifact_root),
+    card_id=card_id,
+    card_revision=1,
+    deployment_run_id=deployment_run_id,
+    approval_id=approval_id,
+    implementation_run_id=implementation_run_id,
+    candidate_commit=candidate_commit,
+    # Explicit installer bootstrap signal. This is not a candidate diff.
+    changed_files=("frontend-web/package.json",),
+)
+
+if not result.changed:
+    raise SystemExit("QA frontend bootstrap builder unexpectedly reported unchanged")
+if not result.reproducibility.get("matched"):
+    raise SystemExit("QA frontend bootstrap deterministic builds did not match")
+if not all(
+    isinstance(value, str) and value
+    for value in (
+        result.manifest_path,
+        result.archive_path,
+        result.artifact_identity,
+    )
+):
+    raise SystemExit("QA frontend bootstrap artifact evidence is incomplete")
+
+print(
+    json.dumps(
+        {
+            "manifest_path": result.manifest_path,
+            "archive_path": result.archive_path,
+            "artifact_identity": result.artifact_identity,
+            "lockfile_sha256": result.lockfile_sha256,
+            "reproducibility": result.reproducibility,
+        },
+        sort_keys=True,
+    )
+)
+PY
+
+    manifest="$QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT/$QA_FRONTEND_BOOTSTRAP_CARD/$QA_FRONTEND_BOOTSTRAP_RUN/frontend-web/$NEW_COMMIT/manifest.json"
+    archive="$QA_FRONTEND_BOOTSTRAP_ARTIFACT_ROOT/$QA_FRONTEND_BOOTSTRAP_CARD/$QA_FRONTEND_BOOTSTRAP_RUN/frontend-web/$NEW_COMMIT/dist.tar"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || {
+      echo "QA frontend bootstrap manifest is missing or unsafe." >&2
+      return 1
+    }
+    [[ -f "$archive" && ! -L "$archive" ]] || {
+      echo "QA frontend bootstrap archive is missing or unsafe." >&2
+      return 1
+    }
+
+    identity="$(
+      /opt/remihub/.venv/bin/python - "$builder_record" <<'PY'
+import json
+import re
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+identity = payload.get("artifact_identity")
+if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+    raise SystemExit("invalid QA frontend bootstrap artifact identity")
+print(identity)
+PY
+    )"
+
+    /usr/local/libexec/remihub-backend-deployment-control \
+      frontend-install qa \
+      "$manifest" \
+      "$archive" \
+      "$identity" \
+      "$NEW_COMMIT" \
+      "$QA_FRONTEND_BOOTSTRAP_CARD" \
+      "$QA_FRONTEND_BOOTSTRAP_RUN"
+
+    /usr/local/libexec/remihub-backend-deployment-control \
+      frontend-verify qa \
+      "$manifest" \
+      "$identity"
+
+    [[ -f "$qa_runtime/frontend-web/dist/index.html" && \
+       ! -L "$qa_runtime/frontend-web/dist/index.html" ]] || {
+      echo "QA frontend bootstrap did not install a safe dist/index.html." >&2
+      return 1
+    }
+    runuser -u remihub-qa-app -- \
+      /usr/bin/test -r "$qa_runtime/frontend-web/dist/index.html" || {
+      echo "QA frontend index is not readable by remihub-qa-app." >&2
+      return 1
+    }
+
+    cleanup_qa_frontend_bootstrap_worktree
+    echo "QA_FRONTEND_BOOTSTRAP=PASS"
   }
 
   rollback() {
     local status=$?
     trap - EXIT
     if [[ "$COMPLETE" -eq 1 ]]; then exit "$status"; fi
-    echo "Installation failed; restoring the pre-install state from $BACKUP" >&2
+    echo "Installation failed; preserving or restoring only state explicitly captured in $BACKUP" >&2
     set +e
     systemctl stop remihub-agent-deployment-qa.service remihub-agent-deployment-production.service remihub-backend-qa.service
+
     if [[ "$PLANNING_PROMOTED" -eq 1 ]]; then
       runuser -u alex -- git -C "$PLANNING" reset --hard "$EXPECTED_BASE"
       /usr/local/libexec/remihub-backend-deployment-control \
         harden-planning production "$EXPECTED_BASE" 2>/dev/null || true
     fi
     if [[ "$SOURCE_PROMOTED" -eq 1 ]]; then
-      runuser -u remihub-agent -- git --git-dir="$SOURCE" update-ref refs/heads/main "$EXPECTED_BASE" "$NEW_COMMIT"
+      runuser -u remihub-agent -- git --git-dir="$SOURCE" \
+        update-ref refs/heads/main "$EXPECTED_BASE" "$NEW_COMMIT"
     fi
     if [[ "$PROD_PROMOTED" -eq 1 ]]; then
       systemctl stop remihub.service
       runuser -u alex -- git -C "$PROD" reset --hard "$EXPECTED_BASE"
     fi
-    if [[ -f "$BACKUP/qa-repository.tar" ]]; then
-      rm -rf /opt/remihub-agent/deployment/qa/repository.git
-      tar -C / -xf "$BACKUP/qa-repository.tar"
-    elif [[ -n "$OLD_QA" && -d /opt/remihub-agent/deployment/qa/repository.git ]]; then
-      runuser -u remihub-deployer -- git --git-dir=/opt/remihub-agent/deployment/qa/repository.git update-ref refs/heads/qa-main "$OLD_QA"
+
+    if [[ "$ROLLBACK_STATE_CAPTURED" -eq 1 ]]; then
+      cleanup_qa_frontend_bootstrap_worktree ||         echo "Exact QA frontend bootstrap worktree cleanup failed; no broad cleanup was attempted." >&2
+
+      case "$QA_REPOSITORY_EXISTED" in
+        1)
+          rm -rf -- /opt/remihub-agent/deployment/qa/repository.git
+          tar -C /opt/remihub-agent/deployment/qa \
+            -xpf "$BACKUP/qa-repository.tar" -- repository.git
+          ;;
+        0)
+          rm -rf -- /opt/remihub-agent/deployment/qa/repository.git
+          ;;
+        *)
+          echo "QA repository existence state is uncaptured; refusing rollback mutation." >&2
+          ;;
+      esac
+
+      case "$QA_APPLICATION_EXISTED" in
+        1)
+          rm -rf -- /opt/remihub-agent/deployment/qa/application
+          tar -C /opt/remihub-agent/deployment/qa \
+            -xpf "$BACKUP/qa-application.tar" -- application
+          ;;
+        0)
+          rm -rf -- /opt/remihub-agent/deployment/qa/application
+          ;;
+        *)
+          echo "QA application existence state is uncaptured; refusing rollback mutation." >&2
+          ;;
+      esac
+
+      case "$PROD_DEPLOYMENT_EXISTED" in
+        1)
+          rm -rf -- /opt/remihub-agent/deployment/production
+          tar -C /opt/remihub-agent/deployment \
+            -xpf "$BACKUP/production-deployment.tar" -- production
+          ;;
+        0)
+          rm -rf -- /opt/remihub-agent/deployment/production
+          ;;
+        *)
+          echo "Production deployment existence state is uncaptured; refusing rollback mutation." >&2
+          ;;
+      esac
+
+      rm -rf -- "/opt/remihub-agent/deployment/qa/artifacts/install-verification-$STAMP"
+      [[ -n "$RELEASE" ]] && rm -rf -- "$RELEASE"
+
+      if [[ "$SYSTEM_MUTATED" -eq 1 ]]; then
+        restore_system_paths || \
+          echo "System leaf rollback failed; no parent permission repair was attempted." >&2
+      fi
+
+      restore_parent_directory_state \
+        /opt/remihub-agent/deployment/config \
+        "$CONFIG_PARENT_EXISTED" \
+        "$CONFIG_PARENT_OWNER" \
+        "$CONFIG_PARENT_MODE" 2>/dev/null || true
+      restore_parent_directory_state \
+        /opt/remihub-agent/deployment/qa \
+        "$QA_PARENT_EXISTED" \
+        "$QA_PARENT_OWNER" \
+        "$QA_PARENT_MODE" 2>/dev/null || true
+      if [[ -n "$DEPLOYMENT_PARENT_OWNER" && -n "$DEPLOYMENT_PARENT_MODE" ]]; then
+        chown "$DEPLOYMENT_PARENT_OWNER" /opt/remihub-agent/deployment 2>/dev/null || true
+        chmod "$DEPLOYMENT_PARENT_MODE" /opt/remihub-agent/deployment 2>/dev/null || true
+      fi
+
+      verify_critical_parent_state || \
+        echo "CRITICAL: a critical parent/device identity changed; no recursive permission repair was attempted." >&2
+    else
+      echo "Rollback state was not fully captured; refusing deployment/system restore." >&2
     fi
-    rm -rf /opt/remihub-agent/deployment/qa/application
-    if [[ -f "$BACKUP/qa-application.tar" ]]; then
-      tar -C / -xf "$BACKUP/qa-application.tar"
-    fi
-    if [[ "$PROD_DEPLOYMENT_EXISTED" -eq 0 ]]; then
-      rm -rf /opt/remihub-agent/deployment/production
-    elif [[ -f "$BACKUP/production-deployment.tar" ]]; then
-      rm -rf /opt/remihub-agent/deployment/production
-      tar -C / -xf "$BACKUP/production-deployment.tar"
-    elif [[ -n "$OLD_PROD_TARGET" ]]; then
-      runuser -u remihub-deployer -- git --git-dir=/opt/remihub-agent/deployment/production/repository.git update-ref refs/heads/production-main "$OLD_PROD_TARGET"
-    fi
-    rm -rf "/opt/remihub-agent/deployment/qa/artifacts/install-verification-$STAMP"
-    [[ -n "$RELEASE" ]] && rm -rf "$RELEASE"
-    [[ "$SYSTEM_INSTALLED" -eq 1 ]] && restore_system_paths
-    chown -R remihub-agent:remihub-agent /opt/remihub-agent/deployment/qa/repository.git /opt/remihub-agent/deployment/qa/worktrees /opt/remihub-agent/deployment/qa/artifacts 2>/dev/null
-    restore_parent_directory_state \
-      /opt/remihub-agent/deployment/config \
-      "$CONFIG_PARENT_EXISTED" \
-      "$CONFIG_PARENT_OWNER" \
-      "$CONFIG_PARENT_MODE" 2>/dev/null || true
-    restore_parent_directory_state \
-      /opt/remihub-agent/deployment/qa \
-      "$QA_PARENT_EXISTED" \
-      "$QA_PARENT_OWNER" \
-      "$QA_PARENT_MODE" 2>/dev/null || true
-    if [[ -n "$DEPLOYMENT_PARENT_OWNER" && -n "$DEPLOYMENT_PARENT_MODE" ]]; then
-      chown "$DEPLOYMENT_PARENT_OWNER" /opt/remihub-agent/deployment 2>/dev/null || true
-      chmod "$DEPLOYMENT_PARENT_MODE" /opt/remihub-agent/deployment 2>/dev/null || true
-    fi
+
     if [[ "$QA_USER_CREATED" -eq 1 ]]; then userdel remihub-qa-app 2>/dev/null || true; fi
     if [[ "$QA_GROUP_CREATED" -eq 1 ]]; then groupdel remihub-qa-app 2>/dev/null || true; fi
     if [[ "$DEPLOYER_USER_CREATED" -eq 1 ]]; then userdel remihub-deployer 2>/dev/null || true; fi
     if [[ "$DEPLOYER_GROUP_CREATED" -eq 1 ]]; then groupdel remihub-deployer 2>/dev/null || true; fi
-    runuser -u remihub-agent -- git --git-dir="$SOURCE" update-ref -d "refs/remihub-install/$STAMP" 2>/dev/null || true
+    runuser -u remihub-agent -- git --git-dir="$SOURCE" \
+      update-ref -d "refs/remihub-install/$STAMP" 2>/dev/null || true
     if [[ -d "$STAGING" ]]; then
       runuser -u alex -- git -C "$PROD" worktree remove --force "$STAGING" 2>/dev/null || true
     fi
     runuser -u alex -- git -C "$PROD" worktree prune 2>/dev/null || true
     runuser -u alex -- git -C "$PROD" branch -D "$INSTALL_BRANCH" 2>/dev/null || true
     restart_original_services
-    rm -rf "$STAGING"
+    rm -rf -- "$STAGING"
     echo "Rollback attempted. Review $BACKUP and service status before retrying." >&2
     exit "$status"
   }
+
   trap rollback EXIT
 
   echo "[1/10] Preflight exact production state"
@@ -371,48 +813,95 @@
   printf '%s\n' "$NEW_COMMIT" >"$BACKUP/new-commit.txt"
 
   echo "[3/10] Back up current deployment/runtime configuration"
+  capture_critical_parent_state
+
   DEPLOYMENT_PARENT_OWNER="$(stat -c '%u:%g' /opt/remihub-agent/deployment)"
   DEPLOYMENT_PARENT_MODE="$(stat -c '%a' /opt/remihub-agent/deployment)"
   printf 'owner=%s\nmode=%s\n' \
     "$DEPLOYMENT_PARENT_OWNER" "$DEPLOYMENT_PARENT_MODE" \
     >"$BACKUP/deployment-parent-before.txt"
 
-  if [[ -d /opt/remihub-agent/deployment/qa ]]; then
+  if [[ -d /opt/remihub-agent/deployment/qa && ! -L /opt/remihub-agent/deployment/qa ]]; then
     QA_PARENT_EXISTED=1
     QA_PARENT_OWNER="$(stat -c '%u:%g' /opt/remihub-agent/deployment/qa)"
     QA_PARENT_MODE="$(stat -c '%a' /opt/remihub-agent/deployment/qa)"
+  else
+    QA_PARENT_EXISTED=0
   fi
   printf 'existed=%s\nowner=%s\nmode=%s\n' \
     "$QA_PARENT_EXISTED" "$QA_PARENT_OWNER" "$QA_PARENT_MODE" \
     >"$BACKUP/qa-parent-before.txt"
 
-  if [[ -d /opt/remihub-agent/deployment/config ]]; then
+  if [[ -d /opt/remihub-agent/deployment/config && ! -L /opt/remihub-agent/deployment/config ]]; then
     CONFIG_PARENT_EXISTED=1
     CONFIG_PARENT_OWNER="$(stat -c '%u:%g' /opt/remihub-agent/deployment/config)"
     CONFIG_PARENT_MODE="$(stat -c '%a' /opt/remihub-agent/deployment/config)"
+  else
+    CONFIG_PARENT_EXISTED=0
   fi
   printf 'existed=%s\nowner=%s\nmode=%s\n' \
     "$CONFIG_PARENT_EXISTED" "$CONFIG_PARENT_OWNER" "$CONFIG_PARENT_MODE" \
     >"$BACKUP/config-parent-before.txt"
-  backup_system_paths
-  SYSTEM_INSTALLED=1
-  if [[ -d /opt/remihub-agent/deployment/qa/application ]]; then
-    tar -C / -cf "$BACKUP/qa-application.tar" opt/remihub-agent/deployment/qa/application
-  fi
-  OLD_QA="$(git --git-dir=/opt/remihub-agent/deployment/qa/repository.git rev-parse qa-main^{commit})"
+
+  [[ "$QA_PARENT_EXISTED" -eq 1 ]] || {
+    echo "Existing QA deployment parent is required for guarded upgrade." >&2
+    exit 1
+  }
+  [[ -d /opt/remihub-agent/deployment/qa/repository.git && \
+     ! -L /opt/remihub-agent/deployment/qa/repository.git ]] || {
+    echo "Existing protected QA repository is required for guarded upgrade." >&2
+    exit 1
+  }
+
+  QA_REPOSITORY_EXISTED=1
+  OLD_QA="$(
+    git --git-dir=/opt/remihub-agent/deployment/qa/repository.git \
+      rev-parse qa-main^{commit}
+  )"
   printf '%s\n' "$OLD_QA" >"$BACKUP/qa-target-before.txt"
-  git --git-dir=/opt/remihub-agent/deployment/qa/repository.git bundle create "$BACKUP/qa-target.bundle" --all
-  tar -C / -cf "$BACKUP/qa-repository.tar" opt/remihub-agent/deployment/qa/repository.git
-  if [[ -d /opt/remihub-agent/deployment/production ]]; then
-    PROD_DEPLOYMENT_EXISTED=1
-    tar -C / -cf "$BACKUP/production-deployment.tar" opt/remihub-agent/deployment/production
-  fi
-  if [[ -d /opt/remihub-agent/deployment/production/repository.git ]]; then
-    PROD_TARGET_EXISTED=1
-    OLD_PROD_TARGET="$(git --git-dir=/opt/remihub-agent/deployment/production/repository.git rev-parse production-main^{commit})"
-    git --git-dir=/opt/remihub-agent/deployment/production/repository.git bundle create "$BACKUP/production-target.bundle" --all
+  git --git-dir=/opt/remihub-agent/deployment/qa/repository.git \
+    bundle create "$BACKUP/qa-target.bundle" --all
+  tar -C /opt/remihub-agent/deployment/qa \
+    -cpf "$BACKUP/qa-repository.tar" -- repository.git
+
+  if [[ -d /opt/remihub-agent/deployment/qa/application && \
+        ! -L /opt/remihub-agent/deployment/qa/application ]]; then
+    QA_APPLICATION_EXISTED=1
+    tar -C /opt/remihub-agent/deployment/qa \
+      -cpf "$BACKUP/qa-application.tar" -- application
+  else
+    QA_APPLICATION_EXISTED=0
   fi
 
+  if [[ -d /opt/remihub-agent/deployment/production && \
+        ! -L /opt/remihub-agent/deployment/production ]]; then
+    PROD_DEPLOYMENT_EXISTED=1
+    tar -C /opt/remihub-agent/deployment \
+      -cpf "$BACKUP/production-deployment.tar" -- production
+  else
+    PROD_DEPLOYMENT_EXISTED=0
+  fi
+
+  if [[ -d /opt/remihub-agent/deployment/production/repository.git && \
+        ! -L /opt/remihub-agent/deployment/production/repository.git ]]; then
+    PROD_TARGET_EXISTED=1
+    OLD_PROD_TARGET="$(
+      git --git-dir=/opt/remihub-agent/deployment/production/repository.git \
+        rev-parse production-main^{commit}
+    )"
+    git --git-dir=/opt/remihub-agent/deployment/production/repository.git \
+      bundle create "$BACKUP/production-target.bundle" --all
+  else
+    PROD_TARGET_EXISTED=0
+  fi
+
+  backup_system_paths
+  verify_critical_parent_state
+  ROLLBACK_STATE_CAPTURED=1
+  echo "ROLLBACK_STATE_CAPTURED=PASS"
+
+  echo "[4/10] Install least-privilege accounts, configs, helpers, and immutable release"
+  SYSTEM_MUTATED=1
   echo "[4/10] Install least-privilege accounts, configs, helpers, and immutable release"
   if ! getent group remihub-deployer >/dev/null; then
     groupadd --system remihub-deployer
@@ -448,7 +937,7 @@
   install -d -o remihub-deployer -g remihub-agent -m 0750 \
     /opt/remihub-agent/deployment/qa/worktrees \
     /opt/remihub-agent/deployment/qa/artifacts
-  chown -R remihub-deployer:remihub-agent \
+  chown remihub-deployer:remihub-agent \
     /opt/remihub-agent/deployment/qa/repository.git \
     /opt/remihub-agent/deployment/qa/worktrees \
     /opt/remihub-agent/deployment/qa/artifacts
@@ -460,6 +949,9 @@
     /var/backups/remihub-agent/backend-deployments/qa \
     /var/backups/remihub-agent/backend-deployments/production \
     /var/backups/remihub-agent/frontend-web/production
+  install -d -o root -g remihub-deployer -m 0750 \
+    /var/cache/remihub-agent/npm \
+    /var/lib/remihub-agent/npm-prep
 
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/qa-worker.ini /opt/remihub-agent/deployment/config/qa-worker.ini
   install -o root -g remihub-deployer -m 0640 /opt/remihub-agent/worker-config/prod-worker.ini /opt/remihub-agent/deployment/config/prod-worker.ini
@@ -483,6 +975,8 @@
   require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/qa-migrator.ini
   require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/qa-parity-reader.ini
   require_account_path remihub-deployer -r /opt/remihub-agent/deployment/config/prod-migrator.ini
+  require_account_path remihub-deployer -x /var/cache/remihub-agent/npm
+  require_account_path remihub-deployer -x /var/lib/remihub-agent/npm-prep
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment/qa
   require_account_path remihub-qa-app -x /opt/remihub-agent/deployment/config
@@ -496,6 +990,7 @@
   echo "Isolation probe passed: remihub-qa-app cannot read repository.git"
 
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-deployment-control" /usr/local/libexec/remihub-backend-deployment-control
+  install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-npm-cache-control" /usr/local/libexec/remihub-backend-npm-cache-control
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-validation-sandbox" /usr/local/libexec/remihub-backend-validation-sandbox
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-qa-server" /usr/local/libexec/remihub-backend-qa-server
   rm -rf /usr/local/libexec/remihub-backend-validation-support
@@ -503,6 +998,17 @@
   install -o root -g root -m 0644 "$ASSETS/validation-support/"* /usr/local/libexec/remihub-backend-validation-support/
   install -o root -g root -m 0440 "$ASSETS/sudoers/remihub-backend-deployment" /etc/sudoers.d/remihub-backend-deployment
   visudo -cf /etc/sudoers.d/remihub-backend-deployment
+
+  [[ "$(stat -c '%U:%G:%a' /usr/local/libexec/remihub-backend-npm-cache-control)" == "root:root:755" ]] || {
+    echo "Installed npm cache control ownership or mode is unsafe." >&2
+    exit 1
+  }
+  for npm_root in /var/cache/remihub-agent/npm /var/lib/remihub-agent/npm-prep; do
+    [[ "$(stat -c '%U:%G:%a' "$npm_root")" == "root:remihub-deployer:750" ]] || {
+      echo "Installed npm cache root ownership or mode is unsafe: $npm_root" >&2
+      exit 1
+    }
+  done
 
   rm -rf "$RELEASE"
   install -d -o root -g remihub-agent -m 0750 "$RELEASE"
@@ -529,7 +1035,7 @@
   if [[ ! -d /opt/remihub-agent/deployment/production/repository.git ]]; then
     runuser -u remihub-deployer -- git init --bare /opt/remihub-agent/deployment/production/repository.git >/dev/null
   fi
-  chown -R remihub-deployer:remihub-agent /opt/remihub-agent/deployment/production/repository.git
+  chown remihub-deployer:remihub-agent /opt/remihub-agent/deployment/production/repository.git
   if [[ -n "$(runuser -u remihub-deployer -- git --git-dir=/opt/remihub-agent/deployment/production/repository.git remote)" ]]; then
     echo "Production deployment repository unexpectedly has remotes." >&2
     exit 1
@@ -573,6 +1079,9 @@
       git --git-dir=/opt/remihub-agent/deployment/qa/repository.git \
       rev-parse 'qa-main^{commit}'
   )" == "$NEW_COMMIT" ]]
+
+  echo "Bootstrap deterministic frontend artifact into fresh QA runtime"
+  bootstrap_qa_frontend
 
   echo "[6/10] Install static systemd workers and QA runtime"
   install -o root -g root -m 0644 "$ASSETS/systemd/remihub-backend-qa.service" /etc/systemd/system/remihub-backend-qa.service
@@ -676,9 +1185,12 @@
   fi
   ! systemctl is-active --quiet remihub-agent-deployment-qa.service
   ! systemctl is-active --quiet remihub-agent-deployment-production.service
+  cleanup_qa_frontend_bootstrap_worktree
   runuser -u alex -- git -C "$PROD" worktree remove --force "$STAGING"
   runuser -u alex -- git -C "$PROD" branch -D "$INSTALL_BRANCH" >/dev/null
   rm -rf "$STAGING"
+  verify_critical_parent_state
+  echo "CRITICAL_PARENT_POSTCHECK=PASS"
   printf 'installed_commit=%s\nrelease=%s\nbackup=%s\n' "$NEW_COMMIT" "$RELEASE" "$BACKUP" >"$BACKUP/INSTALL-SUCCEEDED.txt"
   COMPLETE=1
   trap - EXIT

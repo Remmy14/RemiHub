@@ -607,12 +607,24 @@ class LocalFrontendArtifactBuilder:
         timeout_seconds: int = 900,
         node_binary: str | Path = "/usr/bin/node",
         npm_binary: str | Path = "/usr/bin/npm",
+        cache_root: str | Path = "/var/cache/remihub-agent/npm",
+        deployment_control: str | Path = "/usr/local/libexec/remihub-backend-deployment-control",
+        sudo_binary: str | Path = "/usr/bin/sudo",
+        environment: str | None = None,
     ):
         if timeout_seconds < 1:
             raise ValueError("timeout_seconds must be at least 1")
         self.timeout_seconds = timeout_seconds
         self.node_binary = Path(node_binary)
         self.npm_binary = Path(npm_binary)
+        self.cache_root = Path(cache_root)
+        self.deployment_control = Path(deployment_control)
+        self.sudo_binary = Path(sudo_binary)
+        self.environment = environment or os.environ.get(
+            "REMIHUB_AGENT_ENVIRONMENT", ""
+        )
+        if self.environment not in {"qa", "production"}:
+            raise ValueError("environment must be qa or production")
 
     def build(
         self,
@@ -706,13 +718,34 @@ class LocalFrontendArtifactBuilder:
                 frontend_root,
                 source / "frontend-web",
                 ignore=shutil.ignore_patterns("dist", "node_modules", ".env", ".env.*"),
-                symlinks=False,
+                symlinks=True,
             )
+            self._reject_unsafe_tree(
+                source / "frontend-web",
+                context="Frontend source snapshot",
+            )
+            cache_verification = self._verify_prepared_cache(lockfile_sha256)
+            cache_source = self.cache_root / lockfile_sha256
+            if cache_source.is_symlink() or not cache_source.is_dir():
+                raise DeploymentValidationError(
+                    "Prepared frontend npm cache is missing or unsafe"
+                )
+            shutil.copytree(
+                cache_source,
+                source / ".npm-cache",
+                symlinks=True,
+            )
+            self._reject_unsafe_tree(
+                source / ".npm-cache",
+                context="Prepared frontend npm cache",
+            )
+            (source / ".npm-home").mkdir(mode=0o700)
             commands = [
+                cache_verification,
                 self._run_command(
                     [str(self.npm_binary), "ci", "--ignore-scripts"],
                     cwd=source / "frontend-web",
-                    network="package-manager-preparation",
+                    network="offline-prepared-cache",
                 ),
                 self._run_command(
                     [str(self.npm_binary), "run", "lint"],
@@ -763,8 +796,121 @@ class LocalFrontendArtifactBuilder:
             shutil.rmtree(staging, ignore_errors=True)
 
     def _run_version(self, command: list[str]) -> str:
-        evidence = self._run_command(command, cwd=Path("/tmp"), network="not_required")
+        evidence = self._run_command(
+            command,
+            cwd=Path(tempfile.gettempdir()),
+            network="not_required",
+        )
         return str(evidence["stdout_tail"]).strip()
+
+    @staticmethod
+    def _reject_unsafe_tree(path: Path, *, context: str) -> None:
+        for directory, names, files in os.walk(
+            path, topdown=True, followlinks=False
+        ):
+            current = Path(directory)
+            try:
+                current_mode = current.lstat().st_mode
+            except OSError as exc:
+                raise DeploymentValidationError(
+                    f"{context} cannot be inspected"
+                ) from exc
+            if current.is_symlink() or not stat.S_ISDIR(current_mode):
+                raise DeploymentValidationError(
+                    f"{context} contains a symbolic link or special file"
+                )
+            for name in names + files:
+                child = current / name
+                try:
+                    metadata = child.lstat()
+                except OSError as exc:
+                    raise DeploymentValidationError(
+                        f"{context} cannot be inspected"
+                    ) from exc
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise DeploymentValidationError(
+                        f"{context} contains a symbolic link or special file"
+                    )
+
+    def _verify_prepared_cache(self, lockfile_sha256: str) -> dict[str, Any]:
+        command = [
+            str(self.sudo_binary),
+            "-n",
+            str(self.deployment_control),
+            "frontend-cache-verify",
+            self.environment,
+            lockfile_sha256,
+        ]
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                env={
+                    "HOME": "/nonexistent",
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                },
+                timeout=self.timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DeploymentValidationError(
+                "Prepared frontend npm cache could not be verified"
+            ) from exc
+        duration_ms = round((time.monotonic() - started) * 1000)
+        if result.returncode != 0:
+            detail = _tail(result.stderr or result.stdout, 3000)
+            raise DeploymentValidationError(
+                "Prepared frontend npm cache verification failed"
+                + (f": {detail}" if detail else "")
+            )
+        return {
+            "command": " ".join(command),
+            "duration_ms": duration_ms,
+            "return_code": result.returncode,
+            "stdout_sha256": hashlib.sha256(
+                result.stdout.encode("utf-8")
+            ).hexdigest(),
+            "stdout_tail": _tail(result.stdout, 3000),
+            "stderr_tail": _tail(result.stderr, 3000),
+            "network": "not_required",
+        }
+
+    @staticmethod
+    def _frontend_command_environment(cwd: Path) -> dict[str, str]:
+        environment = {
+            "HOME": "/nonexistent",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "PATH": "/usr/bin:/bin",
+            "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+            "NPM_CONFIG_AUDIT": "false",
+            "NPM_CONFIG_FUND": "false",
+            "SOURCE_DATE_EPOCH": "0",
+        }
+        prepared_cache = cwd.parent / ".npm-cache"
+        prepared_home = cwd.parent / ".npm-home"
+        if prepared_cache.is_dir():
+            prepared_home.mkdir(mode=0o700, exist_ok=True)
+            environment.update(
+                {
+                    "HOME": str(prepared_home),
+                    "NPM_CONFIG_CACHE": str(prepared_cache),
+                    "NPM_CONFIG_OFFLINE": "true",
+                    "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+                    "NPM_CONFIG_LOGS_MAX": "0",
+                    "NPM_CONFIG_USERCONFIG": "/dev/null",
+                    "NPM_CONFIG_GLOBALCONFIG": "/nonexistent/remihub-global-npmrc",
+                }
+            )
+        return environment
 
     def _run_command(self, command: list[str], *, cwd: Path, network: str) -> dict[str, Any]:
         started = time.monotonic()
@@ -776,15 +922,7 @@ class LocalFrontendArtifactBuilder:
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
-                env={
-                    "HOME": "/nonexistent",
-                    "LANG": os.environ.get("LANG", "C.UTF-8"),
-                    "PATH": "/usr/bin:/bin",
-                    "NPM_CONFIG_IGNORE_SCRIPTS": "true",
-                    "NPM_CONFIG_AUDIT": "false",
-                    "NPM_CONFIG_FUND": "false",
-                    "SOURCE_DATE_EPOCH": "0",
-                },
+                env=self._frontend_command_environment(cwd),
                 timeout=self.timeout_seconds,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1494,7 +1632,8 @@ class GitBackendDeploymentManager:
         self.database = database
         self.runtime = runtime
         self.frontend_builder = frontend_builder or LocalFrontendArtifactBuilder(
-            timeout_seconds=command_timeout_seconds
+            timeout_seconds=command_timeout_seconds,
+            environment=normalized_environment,
         )
         self.qa_history_reader = qa_history_reader
 

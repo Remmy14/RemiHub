@@ -1,0 +1,1070 @@
+#!/usr/bin/python3
+"""Root-only preparation and verification for RemiHub frontend npm caches."""
+from __future__ import annotations
+
+import base64
+import binascii
+import fcntl
+import hashlib
+import io
+import json
+import os
+import pwd
+import grp
+import re
+import resource
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+GIT = "/usr/bin/git"
+NODE = "/usr/bin/node"
+NPM = "/usr/bin/npm"
+RUNUSER = "/usr/sbin/runuser"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+GIT_SAFE_CONFIG = Path(
+    "/opt/remihub-agent/deployment/config/git-safe-directory.ini"
+)
+FRONTEND_POLICY_PATH = Path(
+    "/opt/remihub-agent/deployment/config/frontend-web-policy.json"
+)
+NPM_CACHE_ROOT = Path("/var/cache/remihub-agent/npm")
+NPM_PREP_ROOT = Path("/var/lib/remihub-agent/npm-prep")
+ENVIRONMENT_WORKTREE_ROOTS = {
+    "qa": Path("/opt/remihub-agent/deployment/qa/worktrees"),
+    "production": Path("/opt/remihub-agent/deployment/production/worktrees"),
+}
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+IDENTITY_RE = re.compile(r"[0-9a-f]{64}")
+WORKTREE_RE = re.compile(
+    r"card-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}-r[1-9][0-9]*"
+)
+SEMVER_SPEC_RE = re.compile(r"[0-9A-Za-z*^~<>=| .xX+\-]+")
+CACHE_DIRECTORY_MODE = 0o750
+CACHE_FILE_MODE = 0o640
+CACHE_OWNER_UID = 0
+CACHE_GROUP_NAME = "remihub-deployer"
+MANIFEST_NAME = "remihub-cache-manifest.json"
+LOCKFILE_SNAPSHOT_NAME = "remihub-package-lock.json"
+POLICY_SNAPSHOT_NAME = "remihub-frontend-policy.json"
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"remihub-backend-npm-cache-control: {message}", file=sys.stderr)
+    raise SystemExit(64)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _read_regular_file_nofollow(path: Path, *, maximum_bytes: int) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        fail("protected regular file is missing or unsafe")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > maximum_bytes
+        ):
+            fail("protected regular file is missing or unsafe")
+        chunks = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                fail("protected regular file changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            fail("protected regular file changed while being read")
+        final = os.fstat(descriptor)
+        if (
+            final.st_size != metadata.st_size
+            or final.st_mtime_ns != metadata.st_mtime_ns
+            or final.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            fail("protected regular file changed while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _safe_relative_path(raw: str, *, prefix: str | None = None) -> PurePosixPath:
+    if not raw or raw.startswith("/") or "\\" in raw:
+        fail("archive or cache contains an unsafe path")
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        fail("archive or cache contains an unsafe path")
+    relative = PurePosixPath(raw)
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        fail("archive or cache contains an unsafe path")
+    if prefix is not None and (not relative.parts or relative.parts[0] != prefix):
+        fail("Git snapshot contains a path outside frontend-web")
+    return relative
+
+
+def _load_policy(path: Path = FRONTEND_POLICY_PATH) -> tuple[dict[str, Any], bytes]:
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        fail("protected frontend policy is missing or invalid")
+    if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_mode & 0o022:
+        fail("protected frontend policy ownership or mode is unsafe")
+    if path == FRONTEND_POLICY_PATH and path_stat.st_uid != 0:
+        fail("protected frontend policy ownership or mode is unsafe")
+    payload = _read_regular_file_nofollow(path, maximum_bytes=1024 * 1024)
+    try:
+        policy = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("protected frontend policy is missing or invalid")
+    if not isinstance(policy, dict) or policy.get("schema_version") != 1:
+        fail("protected frontend policy schema is unsupported")
+    if policy.get("node_version") != "v22.22.2":
+        fail("protected frontend Node policy is unsupported")
+    if policy.get("npm_version") != "10.9.7":
+        fail("protected frontend npm policy is unsupported")
+    if policy.get("registry_url") != "https://registry.npmjs.org/":
+        fail("protected frontend registry policy is unsupported")
+    if policy.get("allowed_lockfile_versions") != [3]:
+        fail("protected frontend lockfile policy is unsupported")
+    if policy.get("dependency_integrity_algorithm") != "sha512":
+        fail("protected frontend integrity policy is unsupported")
+    if policy.get("dependency_lifecycle_scripts") != "blocked":
+        fail("protected frontend lifecycle policy is unsupported")
+    if policy.get("dependency_command") != ["npm", "ci", "--ignore-scripts"]:
+        fail("protected frontend dependency command is unsupported")
+    cache = policy.get("npm_cache")
+    expected_cache_values = {
+        "schema_version": 1,
+        "cache_root": str(NPM_CACHE_ROOT),
+        "staging_root": str(NPM_PREP_ROOT),
+        "manifest_name": MANIFEST_NAME,
+        "lockfile_snapshot_name": LOCKFILE_SNAPSHOT_NAME,
+        "policy_snapshot_name": POLICY_SNAPSHOT_NAME,
+    }
+    if not isinstance(cache, dict) or any(
+        cache.get(key) != value for key, value in expected_cache_values.items()
+    ):
+        fail("protected frontend cache policy is unsupported")
+    for key in (
+        "maximum_source_archive_bytes",
+        "maximum_source_entries",
+        "maximum_source_file_bytes",
+        "maximum_cache_entries",
+        "maximum_cache_file_bytes",
+        "maximum_cache_total_bytes",
+    ):
+        if not isinstance(cache.get(key), int) or cache[key] < 1:
+            fail("protected frontend cache limit is invalid")
+    return policy, payload
+
+
+def _validate_dependency_spec(value: Any) -> None:
+    if not isinstance(value, str) or not SEMVER_SPEC_RE.fullmatch(value):
+        fail("frontend dependency specification is unsupported")
+
+
+def _validate_dependency_map(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        fail("frontend dependency map is malformed")
+    normalized: dict[str, str] = {}
+    for name, specification in value.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(ord(character) < 32 for character in name)
+        ):
+            fail("frontend dependency name is malformed")
+        _validate_dependency_spec(specification)
+        normalized[name] = specification
+    return normalized
+
+
+def _validate_registry_url(raw: Any, *, registry_url: str) -> None:
+    if not isinstance(raw, str):
+        fail("frontend dependency resolution URL is missing")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        fail("frontend dependency resolution URL is malformed")
+    expected = urllib.parse.urlsplit(registry_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != expected.hostname
+        or parsed.netloc != expected.netloc
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or not parsed.path.endswith(".tgz")
+    ):
+        fail("frontend dependency resolution URL violates registry policy")
+    decoded_path = urllib.parse.unquote(parsed.path)
+    if any(ord(character) < 32 for character in decoded_path):
+        fail("frontend dependency resolution URL is malformed")
+
+
+def _validate_integrity(raw: Any, *, algorithm: str) -> None:
+    if not isinstance(raw, str) or not raw.startswith(f"{algorithm}-"):
+        fail("frontend dependency integrity metadata is missing or unsupported")
+    encoded = raw.split("-", 1)[1]
+    try:
+        digest = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        fail("frontend dependency integrity metadata is malformed")
+    if algorithm == "sha512" and len(digest) != 64:
+        fail("frontend dependency integrity metadata is malformed")
+
+
+def validate_frontend_inputs(
+    *,
+    package_json_bytes: bytes,
+    lockfile_bytes: bytes,
+    policy: dict[str, Any],
+) -> str:
+    try:
+        package = json.loads(package_json_bytes.decode("utf-8"))
+        lockfile = json.loads(lockfile_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("frontend package metadata is invalid")
+    if not isinstance(package, dict) or not isinstance(lockfile, dict):
+        fail("frontend package metadata is invalid")
+    if lockfile.get("lockfileVersion") not in policy["allowed_lockfile_versions"]:
+        fail("frontend package-lock.json version is unsupported")
+    packages = lockfile.get("packages")
+    if not isinstance(packages, dict) or "" not in packages:
+        fail("frontend package-lock.json packages object is missing")
+    root = packages.get("")
+    if not isinstance(root, dict):
+        fail("frontend package-lock.json root package is malformed")
+    for section in (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ):
+        package_dependencies = _validate_dependency_map(package.get(section))
+        lock_dependencies = _validate_dependency_map(root.get(section))
+        if package_dependencies != lock_dependencies:
+            fail("frontend package.json and package-lock.json dependency maps differ")
+    registry_url = policy["registry_url"]
+    integrity_algorithm = policy["dependency_integrity_algorithm"]
+    for package_path, metadata in packages.items():
+        if not isinstance(package_path, str) or not isinstance(metadata, dict):
+            fail("frontend package-lock.json contains malformed package metadata")
+        if package_path == "":
+            if "resolved" in metadata or "integrity" in metadata or metadata.get("link"):
+                fail("frontend package-lock.json root package is malformed")
+            continue
+        relative = _safe_relative_path(package_path)
+        if relative.parts[0] != "node_modules":
+            fail("frontend package-lock.json contains an unsupported package path")
+        if "link" in metadata or metadata.get("inBundle") is True:
+            fail("frontend package-lock.json contains a link or bundled dependency")
+        _validate_registry_url(metadata.get("resolved"), registry_url=registry_url)
+        _validate_integrity(metadata.get("integrity"), algorithm=integrity_algorithm)
+        if not isinstance(metadata.get("version"), str) or not metadata["version"]:
+            fail("frontend package-lock.json dependency version is missing")
+    return _sha256_bytes(lockfile_bytes)
+
+
+def _git_environment() -> dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(GIT_SAFE_CONFIG),
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+
+
+def _run_as_deployer(command: list[str], *, binary: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [RUNUSER, "--user", "remihub-deployer", "--", *command],
+        check=False,
+        capture_output=True,
+        text=not binary,
+        encoding=None if binary else "utf-8",
+        errors=None if binary else "replace",
+        env=_git_environment(),
+        timeout=120,
+    )
+
+
+def _candidate_path(environment: str, raw: str) -> Path:
+    root = ENVIRONMENT_WORKTREE_ROOTS.get(environment)
+    if root is None:
+        fail("environment must be qa or production")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        fail("frontend candidate must be absolute")
+    try:
+        candidate_stat = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        fail("frontend candidate does not exist")
+    if not stat.S_ISDIR(candidate_stat.st_mode) or candidate != resolved:
+        fail("frontend candidate path is symlinked or non-canonical")
+    if candidate.parent != root or not WORKTREE_RE.fullmatch(candidate.name):
+        fail("frontend candidate is outside the fixed worktree root")
+    status = _run_as_deployer(
+        [GIT, "-C", str(candidate), "status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    if status.returncode != 0 or status.stdout:
+        fail("frontend candidate must be a clean deployer-owned Git worktree")
+    return candidate
+
+
+def _git_identity(candidate: Path) -> tuple[str, str]:
+    result = _run_as_deployer(
+        [GIT, "-C", str(candidate), "rev-parse", "HEAD^{commit}", "HEAD^{tree}"]
+    )
+    values = result.stdout.splitlines() if result.returncode == 0 else []
+    if (
+        len(values) != 2
+        or not COMMIT_RE.fullmatch(values[0])
+        or not COMMIT_RE.fullmatch(values[1])
+    ):
+        fail("frontend candidate Git identity cannot be resolved")
+    return values[0], values[1]
+
+
+def _git_frontend_archive(
+    candidate: Path,
+    *,
+    candidate_commit: str,
+    maximum_bytes: int,
+) -> bytes:
+    command = [
+        RUNUSER,
+        "--user",
+        "remihub-deployer",
+        "--",
+        GIT,
+        "-C",
+        str(candidate),
+        "archive",
+        "--format=tar",
+        candidate_commit,
+        "--",
+        "frontend-web",
+    ]
+
+    def limit_output() -> None:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (maximum_bytes + 1, maximum_bytes + 1))
+
+    with tempfile.TemporaryFile() as output:
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=output,
+                stderr=subprocess.PIPE,
+                text=False,
+                env=_git_environment(),
+                timeout=120,
+                preexec_fn=limit_output,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            fail("exact frontend Git snapshot could not be exported")
+        size = output.tell()
+        if result.returncode != 0 or size < 1 or size > maximum_bytes:
+            fail("exact frontend Git snapshot could not be exported within policy")
+        output.seek(0)
+        return output.read()
+
+
+def _extract_frontend_archive(
+    archive_bytes: bytes,
+    destination: Path,
+    *,
+    maximum_entries: int,
+    maximum_file_bytes: int,
+) -> None:
+    destination.mkdir(mode=0o700)
+    seen: set[str] = set()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            members = archive.getmembers()
+            if not members or len(members) > maximum_entries:
+                fail("frontend Git snapshot entry count violates policy")
+            for member in members:
+                relative = _safe_relative_path(member.name, prefix="frontend-web")
+                normalized = relative.as_posix()
+                if normalized in seen:
+                    fail("frontend Git snapshot contains duplicate paths")
+                seen.add(normalized)
+                target = destination.joinpath(*relative.parts)
+                if member.isdir():
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    continue
+                if not member.isfile() or member.size < 0 or member.size > maximum_file_bytes:
+                    fail("frontend Git snapshot contains an unsupported entry")
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    fail("frontend Git snapshot file cannot be read")
+                with target.open("xb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            fail("frontend Git snapshot file is truncated")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                    if source.read(1):
+                        fail("frontend Git snapshot file exceeds declared size")
+    except tarfile.TarError:
+        fail("frontend Git snapshot archive is invalid")
+
+
+def _chown_regular_tree(path: Path, *, uid: int, gid: int) -> None:
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        root_stat = root_path.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            fail("frontend staging tree contains an unsupported entry")
+        os.chown(root_path, uid, gid, follow_symlinks=False)
+        os.chmod(root_path, 0o700, follow_symlinks=False)
+        for name in directories + files:
+            child = root_path / name
+            child_stat = child.lstat()
+            if not (stat.S_ISDIR(child_stat.st_mode) or stat.S_ISREG(child_stat.st_mode)):
+                fail("frontend staging tree contains an unsupported entry")
+            if stat.S_ISREG(child_stat.st_mode) and child_stat.st_nlink != 1:
+                fail("frontend staging tree contains a hard-linked file")
+            os.chown(child, uid, gid, follow_symlinks=False)
+            os.chmod(
+                child,
+                0o700 if stat.S_ISDIR(child_stat.st_mode) else 0o600,
+                follow_symlinks=False,
+            )
+
+
+def _frontend_tool_versions(policy: dict[str, Any]) -> tuple[str, str]:
+    environment = {"HOME": "/nonexistent", "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    values = []
+    for command, expected, label in (
+        ([NODE, "--version"], policy["node_version"], "Node"),
+        ([NPM, "--version"], policy["npm_version"], "npm"),
+    ):
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            timeout=30,
+        )
+        value = result.stdout.strip()
+        if result.returncode != 0 or value != expected:
+            fail(f"frontend {label} version does not match protected policy")
+        values.append(value)
+    return values[0], values[1]
+
+
+def _run_preparation_unit(
+    *,
+    staging: Path,
+    source: Path,
+    home: Path,
+    cache: Path,
+    registry_url: str,
+) -> None:
+    unit = f"remihub-npm-prep-{os.getpid()}-{secrets.token_hex(6)}"
+    command = [
+        SYSTEMD_RUN,
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--quiet",
+        f"--unit={unit}",
+        "--property=User=remihub-deployer",
+        "--property=Group=remihub-deployer",
+        "--property=UMask=0077",
+        "--property=KillMode=control-group",
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateDevices=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=RestrictRealtime=yes",
+        "--property=LockPersonality=yes",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        f"--property=ReadWritePaths={staging}",
+        f"--property=WorkingDirectory={source}",
+        "--property=InaccessiblePaths=/opt/remihub-agent/deployment/config",
+        "--property=InaccessiblePaths=/opt/remihub-agent/config",
+        "--property=InaccessiblePaths=/opt/remihub-agent/worker-config",
+        "--property=InaccessiblePaths=/opt/remihub",
+        "--property=InaccessiblePaths=/home",
+        "--property=InaccessiblePaths=/root",
+        "--property=TimeoutStartSec=900",
+        f"--setenv=HOME={home}",
+        "--setenv=PATH=/usr/bin:/bin",
+        f"--setenv=NPM_CONFIG_CACHE={cache}",
+        f"--setenv=NPM_CONFIG_REGISTRY={registry_url}",
+        "--setenv=NPM_CONFIG_OFFLINE=false",
+        "--setenv=NPM_CONFIG_IGNORE_SCRIPTS=true",
+        "--setenv=NPM_CONFIG_AUDIT=false",
+        "--setenv=NPM_CONFIG_FUND=false",
+        "--setenv=NPM_CONFIG_UPDATE_NOTIFIER=false",
+        "--setenv=NPM_CONFIG_LOGS_MAX=0",
+        "--setenv=NPM_CONFIG_USERCONFIG=/dev/null",
+        "--setenv=NPM_CONFIG_GLOBALCONFIG=/nonexistent/remihub-global-npmrc",
+        NPM,
+        "ci",
+        "--ignore-scripts",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=930,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        fail("trusted frontend dependency preparation could not be executed")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-3000:]
+        fail(
+            "trusted frontend dependency preparation failed"
+            + (f": {detail}" if detail else "")
+        )
+
+
+class _CopyLimits:
+    def __init__(self, *, maximum_entries: int, maximum_file_bytes: int, maximum_total_bytes: int):
+        self.maximum_entries = maximum_entries
+        self.maximum_file_bytes = maximum_file_bytes
+        self.maximum_total_bytes = maximum_total_bytes
+        self.entries = 0
+        self.total_bytes = 0
+
+    def account(self, *, size: int = 0) -> None:
+        self.entries += 1
+        self.total_bytes += size
+        if (
+            self.entries > self.maximum_entries
+            or size > self.maximum_file_bytes
+            or self.total_bytes > self.maximum_total_bytes
+        ):
+            fail("prepared npm cache exceeds protected limits")
+
+
+def _copy_directory_fd(source_fd: int, destination: Path, limits: _CopyLimits) -> None:
+    for name in sorted(os.listdir(source_fd)):
+        _safe_relative_path(name)
+        if name in {MANIFEST_NAME, LOCKFILE_SNAPSHOT_NAME, POLICY_SNAPSHOT_NAME}:
+            fail("prepared npm cache collides with protected metadata")
+        metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        target = destination / name
+        if stat.S_ISDIR(metadata.st_mode):
+            limits.account()
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=source_fd,
+            )
+            try:
+                observed = os.fstat(child_fd)
+                if (observed.st_dev, observed.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    fail("prepared npm cache changed during safe copy")
+                target.mkdir(mode=0o700)
+                _copy_directory_fd(child_fd, target, limits)
+            finally:
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            fail("prepared npm cache contains a link or special file")
+        limits.account(size=metadata.st_size)
+        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd)
+        try:
+            observed = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink != 1
+                or (observed.st_dev, observed.st_ino, observed.st_size)
+                != (metadata.st_dev, metadata.st_ino, metadata.st_size)
+            ):
+                fail("prepared npm cache changed during safe copy")
+            with os.fdopen(os.dup(file_fd), "rb") as source, target.open("xb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+            final = os.fstat(file_fd)
+            if (
+                final.st_size != observed.st_size
+                or final.st_mtime_ns != observed.st_mtime_ns
+                or final.st_ctime_ns != observed.st_ctime_ns
+            ):
+                fail("prepared npm cache changed during safe copy")
+        finally:
+            os.close(file_fd)
+
+
+def _safe_copy_cache(source: Path, destination: Path, policy: dict[str, Any]) -> None:
+    destination.mkdir(mode=0o700)
+    cache_policy = policy["npm_cache"]
+    limits = _CopyLimits(
+        maximum_entries=cache_policy["maximum_cache_entries"],
+        maximum_file_bytes=cache_policy["maximum_cache_file_bytes"],
+        maximum_total_bytes=cache_policy["maximum_cache_total_bytes"],
+    )
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _copy_directory_fd(source_fd, destination, limits)
+    finally:
+        os.close(source_fd)
+
+
+def _harden_cache_tree(path: Path) -> None:
+    gid = grp.getgrnam(CACHE_GROUP_NAME).gr_gid
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        root_stat = root_path.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            fail("published npm cache contains an unsupported entry")
+        os.chown(root_path, CACHE_OWNER_UID, gid, follow_symlinks=False)
+        os.chmod(root_path, CACHE_DIRECTORY_MODE, follow_symlinks=False)
+        for name in directories + files:
+            child = root_path / name
+            child_stat = child.lstat()
+            if stat.S_ISREG(child_stat.st_mode):
+                if child_stat.st_nlink != 1:
+                    fail("published npm cache contains a hard-linked file")
+                mode = CACHE_FILE_MODE
+            elif stat.S_ISDIR(child_stat.st_mode):
+                mode = CACHE_DIRECTORY_MODE
+            else:
+                fail("published npm cache contains a link or special file")
+            os.chown(child, CACHE_OWNER_UID, gid, follow_symlinks=False)
+            os.chmod(child, mode, follow_symlinks=False)
+
+
+def _hash_regular_file(path: Path, expected: os.stat_result | None = None) -> str:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            fail("prepared npm cache contains an unsafe file")
+        if expected is not None and (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+        ) != (expected.st_dev, expected.st_ino, expected.st_size):
+            fail("prepared npm cache changed during verification")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        final = os.fstat(descriptor)
+        if final.st_size != observed.st_size or final.st_mtime_ns != observed.st_mtime_ns:
+            fail("prepared npm cache changed during verification")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _cache_entries(path: Path, *, deployer_gid: int) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        directories.sort()
+        files.sort()
+        root_path = Path(root)
+        for name in directories:
+            child = root_path / name
+            metadata = child.lstat()
+            relative = child.relative_to(path).as_posix()
+            _safe_relative_path(relative)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != CACHE_OWNER_UID
+                or metadata.st_gid != deployer_gid
+                or stat.S_IMODE(metadata.st_mode) != CACHE_DIRECTORY_MODE
+            ):
+                fail("prepared npm cache directory metadata is unsafe")
+            entries.append({"path": relative, "type": "directory", "mode": "0750"})
+        for name in files:
+            if name == MANIFEST_NAME and root_path == path:
+                continue
+            child = root_path / name
+            metadata = child.lstat()
+            relative = child.relative_to(path).as_posix()
+            _safe_relative_path(relative)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != CACHE_OWNER_UID
+                or metadata.st_gid != deployer_gid
+                or stat.S_IMODE(metadata.st_mode) != CACHE_FILE_MODE
+            ):
+                fail("prepared npm cache file metadata is unsafe")
+            entries.append(
+                {
+                    "path": relative,
+                    "type": "file",
+                    "mode": "0640",
+                    "size": metadata.st_size,
+                    "sha256": _hash_regular_file(child, metadata),
+                }
+            )
+    entries.sort(key=lambda entry: (entry["path"], entry["type"]))
+    return entries
+
+
+def _write_cache_manifest(
+    path: Path,
+    *,
+    lockfile_sha256: str,
+    candidate_commit: str,
+    candidate_tree: str,
+    node_version: str,
+    npm_version: str,
+    policy: dict[str, Any],
+    policy_bytes: bytes,
+) -> dict[str, Any]:
+    deployer_gid = grp.getgrnam(CACHE_GROUP_NAME).gr_gid
+    manifest = {
+        "schema_version": policy["npm_cache"]["schema_version"],
+        "lockfile_sha256": lockfile_sha256,
+        "candidate_commit": candidate_commit,
+        "candidate_tree": candidate_tree,
+        "node_version": node_version,
+        "npm_version": npm_version,
+        "registry_url": policy["registry_url"],
+        "dependency_lifecycle_scripts": policy["dependency_lifecycle_scripts"],
+        "dependency_command": policy["dependency_command"],
+        "policy_sha256": _sha256_bytes(policy_bytes),
+        "entries": _cache_entries(path, deployer_gid=deployer_gid),
+    }
+    manifest["manifest_identity"] = _sha256_bytes(_canonical_json_bytes(manifest))
+    manifest_path = path / MANIFEST_NAME
+    manifest_path.write_bytes(_canonical_json_bytes(manifest))
+    os.chown(manifest_path, CACHE_OWNER_UID, deployer_gid)
+    os.chmod(manifest_path, CACHE_FILE_MODE)
+    return manifest
+
+
+def verify_cache(
+    path: Path,
+    *,
+    lockfile_sha256: str,
+    node_version: str,
+    npm_version: str,
+    policy: dict[str, Any],
+    policy_bytes: bytes,
+) -> dict[str, Any]:
+    deployer_gid = grp.getgrnam(CACHE_GROUP_NAME).gr_gid
+    try:
+        root_stat = path.lstat()
+    except OSError:
+        fail("prepared npm cache is missing")
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != CACHE_OWNER_UID
+        or root_stat.st_gid != deployer_gid
+        or stat.S_IMODE(root_stat.st_mode) != CACHE_DIRECTORY_MODE
+    ):
+        fail("prepared npm cache root metadata is unsafe")
+    manifest_path = path / MANIFEST_NAME
+    try:
+        manifest_stat = manifest_path.lstat()
+    except OSError:
+        fail("prepared npm cache manifest is missing or invalid")
+    if (
+        not stat.S_ISREG(manifest_stat.st_mode)
+        or manifest_stat.st_nlink != 1
+        or manifest_stat.st_uid != CACHE_OWNER_UID
+        or manifest_stat.st_gid != deployer_gid
+        or stat.S_IMODE(manifest_stat.st_mode) != CACHE_FILE_MODE
+    ):
+        fail("prepared npm cache manifest metadata is unsafe")
+    manifest_bytes = _read_regular_file_nofollow(
+        manifest_path,
+        maximum_bytes=16 * 1024 * 1024,
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("prepared npm cache manifest is missing or invalid")
+    if not isinstance(manifest, dict):
+        fail("prepared npm cache manifest is missing or invalid")
+    expected_identity = manifest.pop("manifest_identity", None)
+    if not isinstance(expected_identity, str) or not IDENTITY_RE.fullmatch(expected_identity):
+        fail("prepared npm cache manifest identity is invalid")
+    if _sha256_bytes(_canonical_json_bytes(manifest)) != expected_identity:
+        fail("prepared npm cache manifest identity does not verify")
+    required_manifest_keys = {
+        "schema_version",
+        "lockfile_sha256",
+        "candidate_commit",
+        "candidate_tree",
+        "node_version",
+        "npm_version",
+        "registry_url",
+        "dependency_lifecycle_scripts",
+        "dependency_command",
+        "policy_sha256",
+        "entries",
+    }
+    if set(manifest) != required_manifest_keys:
+        fail("prepared npm cache manifest structure is invalid")
+    if (
+        not COMMIT_RE.fullmatch(str(manifest.get("candidate_commit", "")))
+        or not COMMIT_RE.fullmatch(str(manifest.get("candidate_tree", "")))
+    ):
+        fail("prepared npm cache Git provenance is invalid")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        fail("prepared npm cache manifest entries are invalid")
+    expected_metadata = {
+        "schema_version": policy["npm_cache"]["schema_version"],
+        "lockfile_sha256": lockfile_sha256,
+        "node_version": node_version,
+        "npm_version": npm_version,
+        "registry_url": policy["registry_url"],
+        "dependency_lifecycle_scripts": policy["dependency_lifecycle_scripts"],
+        "dependency_command": policy["dependency_command"],
+        "policy_sha256": _sha256_bytes(policy_bytes),
+    }
+    if any(manifest.get(key) != value for key, value in expected_metadata.items()):
+        fail("prepared npm cache identity does not match protected policy")
+    observed_entries = _cache_entries(path, deployer_gid=deployer_gid)
+    if entries != observed_entries:
+        fail("prepared npm cache content does not match its manifest")
+    lock_snapshot = path / LOCKFILE_SNAPSHOT_NAME
+    policy_snapshot = path / POLICY_SNAPSHOT_NAME
+    if _hash_regular_file(lock_snapshot) != lockfile_sha256:
+        fail("prepared npm cache lockfile snapshot does not match")
+    if _hash_regular_file(policy_snapshot) != _sha256_bytes(policy_bytes):
+        fail("prepared npm cache policy snapshot does not match")
+    return {
+        "status": "verified",
+        "cache_path": str(path),
+        "lockfile_sha256": lockfile_sha256,
+        "manifest_identity": expected_identity,
+        "entry_count": len(entries),
+    }
+
+
+def _prepare_roots() -> None:
+    deployer_gid = grp.getgrnam(CACHE_GROUP_NAME).gr_gid
+    for path in (NPM_CACHE_ROOT, NPM_PREP_ROOT):
+        path.mkdir(mode=CACHE_DIRECTORY_MODE, parents=True, exist_ok=True)
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail("npm cache or staging root is unsafe")
+        os.chown(path, CACHE_OWNER_UID, deployer_gid, follow_symlinks=False)
+        os.chmod(path, CACHE_DIRECTORY_MODE, follow_symlinks=False)
+
+
+def _secure_rmtree(path: Path, *, parent: Path) -> None:
+    if path.parent != parent or path == parent:
+        fail("refusing unsafe npm staging cleanup")
+    if path.exists() or path.is_symlink():
+        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            fail("platform lacks symlink-safe staging cleanup")
+        if path.is_symlink():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+
+def prepare(
+    environment: str,
+    candidate_raw: str,
+    expected_commit: str,
+    expected_tree: str,
+) -> dict[str, Any]:
+    if not COMMIT_RE.fullmatch(expected_commit) or not COMMIT_RE.fullmatch(expected_tree):
+        fail("expected frontend Git identity is invalid")
+    policy, policy_bytes = _load_policy()
+    candidate = _candidate_path(environment, candidate_raw)
+    candidate_commit, candidate_tree = _git_identity(candidate)
+    if candidate_commit != expected_commit or candidate_tree != expected_tree:
+        fail("frontend candidate Git identity changed")
+    cache_policy = policy["npm_cache"]
+    archive_bytes = _git_frontend_archive(
+        candidate,
+        candidate_commit=candidate_commit,
+        maximum_bytes=cache_policy["maximum_source_archive_bytes"],
+    )
+    node_version, npm_version = _frontend_tool_versions(policy)
+    _prepare_roots()
+    lock_path = NPM_CACHE_ROOT / ".prepare.lock"
+    with lock_path.open("a+b") as lock_file:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        staging = Path(tempfile.mkdtemp(prefix="prepare-", dir=NPM_PREP_ROOT))
+        final_staging = Path(tempfile.mkdtemp(prefix=".publish-", dir=NPM_CACHE_ROOT))
+        try:
+            os.chmod(staging, 0o711)
+            source_root = staging / "source"
+            _extract_frontend_archive(
+                archive_bytes,
+                source_root,
+                maximum_entries=cache_policy["maximum_source_entries"],
+                maximum_file_bytes=cache_policy["maximum_source_file_bytes"],
+            )
+            frontend = source_root / "frontend-web"
+            package_path = frontend / "package.json"
+            lockfile_path = frontend / "package-lock.json"
+            try:
+                package_json_bytes = package_path.read_bytes()
+                lockfile_bytes = lockfile_path.read_bytes()
+            except OSError:
+                fail("exact frontend Git snapshot lacks package metadata")
+            lockfile_sha256 = validate_frontend_inputs(
+                package_json_bytes=package_json_bytes,
+                lockfile_bytes=lockfile_bytes,
+                policy=policy,
+            )
+            final_cache = NPM_CACHE_ROOT / lockfile_sha256
+            if final_cache.exists() or final_cache.is_symlink():
+                return verify_cache(
+                    final_cache,
+                    lockfile_sha256=lockfile_sha256,
+                    node_version=node_version,
+                    npm_version=npm_version,
+                    policy=policy,
+                    policy_bytes=policy_bytes,
+                ) | {"status": "cached"}
+            deployer = pwd.getpwnam("remihub-deployer")
+            _chown_regular_tree(source_root, uid=deployer.pw_uid, gid=deployer.pw_gid)
+            home = staging / "home"
+            cache = staging / "cache"
+            for path in (home, cache):
+                path.mkdir(mode=0o700)
+                os.chown(path, deployer.pw_uid, deployer.pw_gid)
+            _run_preparation_unit(
+                staging=staging,
+                source=frontend,
+                home=home,
+                cache=cache,
+                registry_url=policy["registry_url"],
+            )
+            os.chown(
+                staging,
+                CACHE_OWNER_UID,
+                grp.getgrnam(CACHE_GROUP_NAME).gr_gid,
+                follow_symlinks=False,
+            )
+            os.chmod(staging, 0o700, follow_symlinks=False)
+            try:
+                observed_lockfile = _read_regular_file_nofollow(
+                    lockfile_path,
+                    maximum_bytes=cache_policy["maximum_source_file_bytes"],
+                )
+            except SystemExit:
+                fail("frontend lockfile became unsafe during preparation")
+            if observed_lockfile != lockfile_bytes:
+                fail("frontend lockfile changed during dependency preparation")
+            _secure_rmtree(final_staging, parent=NPM_CACHE_ROOT)
+            _safe_copy_cache(cache, final_staging, policy)
+            (final_staging / LOCKFILE_SNAPSHOT_NAME).write_bytes(lockfile_bytes)
+            (final_staging / POLICY_SNAPSHOT_NAME).write_bytes(policy_bytes)
+            _harden_cache_tree(final_staging)
+            manifest = _write_cache_manifest(
+                final_staging,
+                lockfile_sha256=lockfile_sha256,
+                candidate_commit=candidate_commit,
+                candidate_tree=candidate_tree,
+                node_version=node_version,
+                npm_version=npm_version,
+                policy=policy,
+                policy_bytes=policy_bytes,
+            )
+            verified = verify_cache(
+                final_staging,
+                lockfile_sha256=lockfile_sha256,
+                node_version=node_version,
+                npm_version=npm_version,
+                policy=policy,
+                policy_bytes=policy_bytes,
+            )
+            if final_cache.exists() or final_cache.is_symlink():
+                fail("prepared npm cache appeared unexpectedly during publication")
+            os.rename(final_staging, final_cache)
+            return {
+                **verified,
+                "status": "prepared",
+                "cache_path": str(final_cache),
+                "candidate_commit": candidate_commit,
+                "candidate_tree": candidate_tree,
+                "manifest_identity": manifest["manifest_identity"],
+            }
+        finally:
+            _secure_rmtree(staging, parent=NPM_PREP_ROOT)
+            _secure_rmtree(final_staging, parent=NPM_CACHE_ROOT)
+
+
+def verify(lockfile_sha256: str) -> dict[str, Any]:
+    if not IDENTITY_RE.fullmatch(lockfile_sha256):
+        fail("lockfile identity is invalid")
+    policy, policy_bytes = _load_policy()
+    node_version, npm_version = _frontend_tool_versions(policy)
+    _prepare_roots()
+    return verify_cache(
+        NPM_CACHE_ROOT / lockfile_sha256,
+        lockfile_sha256=lockfile_sha256,
+        node_version=node_version,
+        npm_version=npm_version,
+        policy=policy,
+        policy_bytes=policy_bytes,
+    )
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail("must run as root through the protected deployment control")
+    os.umask(0o027)
+    if len(sys.argv) < 2:
+        fail("usage: ACTION [validated arguments]")
+    action = sys.argv[1]
+    if action == "prepare" and len(sys.argv) == 6:
+        result = prepare(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif action == "verify" and len(sys.argv) == 3:
+        result = verify(sys.argv[2])
+    else:
+        fail("unsupported action or arguments")
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

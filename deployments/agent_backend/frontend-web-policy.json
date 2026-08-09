@@ -8,6 +8,23 @@
   "lint_command": ["npm", "run", "lint"],
   "build_command": ["npm", "run", "build"],
   "dependency_lifecycle_scripts": "blocked",
+  "registry_url": "https://registry.npmjs.org/",
+  "allowed_lockfile_versions": [3],
+  "dependency_integrity_algorithm": "sha512",
+  "npm_cache": {
+    "schema_version": 1,
+    "cache_root": "/var/cache/remihub-agent/npm",
+    "staging_root": "/var/lib/remihub-agent/npm-prep",
+    "manifest_name": "remihub-cache-manifest.json",
+    "lockfile_snapshot_name": "remihub-package-lock.json",
+    "policy_snapshot_name": "remihub-frontend-policy.json",
+    "maximum_source_archive_bytes": 52428800,
+    "maximum_source_entries": 10000,
+    "maximum_source_file_bytes": 10485760,
+    "maximum_cache_entries": 100000,
+    "maximum_cache_file_bytes": 268435456,
+    "maximum_cache_total_bytes": 2147483648
+  },
   "build_network": "denied",
   "artifact_identity": "sha256 over canonical JSON manifest and file content hashes",
   "archive_normalization": {

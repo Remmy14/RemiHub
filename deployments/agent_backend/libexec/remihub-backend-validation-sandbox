@@ -13,17 +13,65 @@
   BWRAP="/usr/local/libexec/remihub-codex-bwrap/bwrap"
   VENV="/opt/remihub/.venv"
   SUPPORT="/usr/local/libexec/remihub-backend-validation-support"
+  DEPLOYMENT_CONTROL="/usr/local/libexec/remihub-backend-deployment-control"
+  NPM_CACHE_ROOT="/var/cache/remihub-agent/npm"
   candidate="$(realpath -e -- "$1")"
 
   case "$candidate" in
-    /opt/remihub-agent/deployment/qa/worktrees/card-*-r*|\
-    /opt/remihub-agent/deployment/production/worktrees/card-*-r*) ;;
+    /opt/remihub-agent/deployment/qa/worktrees/card-*-r*)
+      environment="qa"
+      ;;
+    /opt/remihub-agent/deployment/production/worktrees/card-*-r*)
+      environment="production"
+      ;;
     *) fail "candidate is outside an approved deployment worktree root" ;;
   esac
   [[ -d "$candidate" && ! -L "$candidate" ]] || fail "candidate must be a real directory"
   [[ -x "$BWRAP" && ! -L "$BWRAP" ]] || fail "dedicated Bubblewrap is unavailable"
   [[ -x "$VENV/bin/python" ]] || fail "production Python environment is unavailable"
   [[ -d "$SUPPORT" && ! -L "$SUPPORT" ]] || fail "validation support is unavailable"
+  [[ -x "$DEPLOYMENT_CONTROL" && ! -L "$DEPLOYMENT_CONTROL" ]] || fail "deployment control helper is unavailable"
+
+  frontend_cache=""
+  candidate_commit="$(
+    /usr/bin/git -C "$candidate" rev-parse --verify 'HEAD^{commit}'
+  )"
+  candidate_tree="$(
+    /usr/bin/git -C "$candidate" rev-parse --verify 'HEAD^{tree}'
+  )"
+  frontend_changes="$(
+    /usr/bin/git -C "$candidate" diff --name-only HEAD^ HEAD -- frontend-web
+  )"
+
+  if [[ -n "$frontend_changes" ]]; then
+    frontend_changed=1
+
+    /usr/bin/sudo -n \
+      "$DEPLOYMENT_CONTROL" \
+      frontend-prepare \
+      "$environment" \
+      "$candidate" \
+      "$candidate_commit" \
+      "$candidate_tree" \
+      >/dev/null
+
+    lock_sha="$(
+      /usr/bin/sha256sum "$candidate/frontend-web/package-lock.json" |
+        /usr/bin/awk '{print $1}'
+    )"
+
+    frontend_cache="$NPM_CACHE_ROOT/$lock_sha"
+
+    [[ -d "$frontend_cache" && ! -L "$frontend_cache" ]] || fail "prepared frontend npm cache is unavailable"
+    /usr/bin/sudo -n \
+      "$DEPLOYMENT_CONTROL" \
+      frontend-cache-verify \
+      "$environment" \
+      "$lock_sha" \
+      >/dev/null
+  else
+    frontend_changed=0
+  fi
 
   args=(
     "$BWRAP"
@@ -62,6 +110,9 @@
     --ro-bind "$candidate" /workspace
     --ro-bind "$SUPPORT" /validator-support
   )
+  if [[ -n "$frontend_cache" ]]; then
+    args+=(--ro-bind "$frontend_cache" /npm-cache-source)
+  fi
   for path in /etc/ld.so.cache /etc/localtime /etc/nsswitch.conf /etc/os-release; do
     [[ -f "$path" ]] && args+=(--ro-bind "$path" "$path")
   done
@@ -84,6 +135,7 @@
     --setenv PYTHONPYCACHEPREFIX /tmp/pycache
     --setenv PYTHONDONTWRITEBYTECODE 1
     --setenv PYTHONUNBUFFERED 1
+    --setenv REMIHUB_FRONTEND_CHANGED "$frontend_changed"
     --setenv LANG C.UTF-8
     --setenv LC_ALL C.UTF-8
     --setenv GIT_CONFIG_NOSYSTEM 1
@@ -96,14 +148,45 @@
     --chdir /workspace
     /bin/bash -c '
       set -euo pipefail
+      /opt/remihub/.venv/bin/python - <<"PY"
+import socket
+
+with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE):
+    pass
+
+try:
+    with socket.create_connection(("1.1.1.1", 443), timeout=1):
+        raise SystemExit("validation namespace unexpectedly reached an external IP")
+except OSError:
+    pass
+PY
       /opt/remihub/.venv/bin/python -m compileall -q backend tests
       /opt/remihub/.venv/bin/python -m unittest discover -s tests -v
-      if git diff --name-only HEAD^ HEAD -- frontend-web | grep -q .; then
+      if [[ "$REMIHUB_FRONTEND_CHANGED" == "1" ]]; then
         [[ "$(node --version)" == "v22.22.2" ]] || { echo "unsupported Node version" >&2; exit 1; }
         [[ "$(npm --version)" == "10.9.7" ]] || { echo "unsupported npm version" >&2; exit 1; }
         [[ -f frontend-web/package-lock.json ]] || { echo "missing frontend lockfile" >&2; exit 1; }
-        rm -rf /tmp/frontend-build
-        mkdir -p /tmp/frontend-build
+        rm -rf /tmp/frontend-build /tmp/npm-cache
+        mkdir -p /tmp/frontend-build /tmp/npm-cache /tmp/home
+        cp -a /npm-cache-source/. /tmp/npm-cache/
+        if find /tmp/npm-cache \
+          \( -type l -o -type b -o -type c -o -type p -o -type s \) \
+          -print -quit | grep -q .; then
+          echo "prepared npm cache contains an unsupported entry" >&2
+          exit 1
+        fi
+
+        export HOME=/tmp/home
+        export NPM_CONFIG_CACHE=/tmp/npm-cache
+        export NPM_CONFIG_OFFLINE=true
+        export NPM_CONFIG_IGNORE_SCRIPTS=true
+        export NPM_CONFIG_AUDIT=false
+        export NPM_CONFIG_FUND=false
+        export NPM_CONFIG_UPDATE_NOTIFIER=false
+        export NPM_CONFIG_LOGS_MAX=0
+        export NPM_CONFIG_USERCONFIG=/dev/null
+        export NPM_CONFIG_GLOBALCONFIG=/nonexistent/remihub-global-npmrc
+
         cp -a frontend-web /tmp/frontend-build/frontend-web
         rm -rf /tmp/frontend-build/frontend-web/dist /tmp/frontend-build/frontend-web/node_modules
         cd /tmp/frontend-build/frontend-web

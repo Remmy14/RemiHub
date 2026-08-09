@@ -92,6 +92,18 @@ during package preparation. Application secrets, deployment configs, service
 helpers, host sockets, and production environment files are not provided to
 frontend commands.
 
+When an approved candidate changes `frontend-web/`, the validator resolves the
+exact candidate commit and tree as `remihub-deployer`. The protected npm cache
+control exports `frontend-web/` from those Git objects, rejects links and
+special files, parses the lockfile against the installed registry policy, and
+runs `npm ci --ignore-scripts` in a network-enabled transient unit. Ordinary QA
+and production workers remain externally network denied. Prepared content is
+published below `/var/cache/remihub-agent/npm/<lockfile-sha256>` only after a
+root-owned cryptographic manifest covers every cache entry plus the exact
+lockfile, policy, Node, npm, registry, and lifecycle identities. Every offline
+validator or artifact build verifies that complete manifest before use;
+corrupt or mismatched caches fail closed and are never repaired implicitly.
+
 The frontend artifact is stored below the existing protected deployment
 artifact root at
 `<artifact-root>/<card-id>/<deployment-run-id>/frontend-web/<candidate-commit>/`.
@@ -114,3 +126,64 @@ inside the same protected stop/promote/start/verify boundary as backend source
 promotion and database rollback.
 
 The installer does not apply a production database migration.
+
+## CRITICAL SERVER-WIDE PERMISSION SAFETY RULE — NON-NEGOTIABLE
+
+**There will not be a third server-wide permissions incident.**
+
+This rule is release-blocking and must be propagated in every future cumulative
+RemiHub handoff README and successor handoff.
+
+- No installer, rollback, recovery, or deployment package may recursively or
+  archive-preservingly restore into `/` or another system parent in a way that
+  can copy staging/backup ownership or mode onto `/`, `/usr`, `/etc`, `/opt`,
+  `/var`, `/home`, `/dev`, or another critical parent.
+- `cp -a "$BACKUP/system-root/." /` and every equivalent broad root restore are
+  permanently forbidden.
+- Rollback may restore only explicitly enumerated leaf paths whose exact
+  pre-mutation existence/state was captured before mutation.
+- If exact pre-mutation state was not captured, rollback MUST FAIL CLOSED and
+  must not infer "absent", delete the path, or attempt a permission repair.
+- Critical parent ownership/modes and `/dev/null` identity must be captured
+  before protected mutation and independently reverified afterward.
+- Recursive chmod/chown of existing system/deployment trees is forbidden as a
+  rollback or repair technique. New isolated release/staging trees may still be
+  hardened recursively when their entire contents were created by that run.
+- An unsafe rollback is worse than a controlled stop: preserve evidence and stop
+  rather than guessing.
+
+The 2026-08-08 incident that changed `/` to mode 0750 is a regression case for
+this invariant.
+
+## Fresh QA runtime frontend bootstrap
+
+The protected installer recreates `/opt/remihub-agent/deployment/qa/application`
+from Git before complete QA verification. Generated `frontend-web/dist` content
+is intentionally not tracked in Git, so a fresh QA runtime cannot serve `/race`,
+`/race/draft`, or `/storage` until a verified frontend artifact is installed.
+
+Before `qa-verify.sh` runs frontend route checks, the installer now:
+
+1. creates one fixed, exact candidate worktree below the protected QA worktree
+   root;
+2. calls protected `frontend-prepare` for the exact candidate commit/tree and
+   exact `package-lock.json`;
+3. invokes the existing `LocalFrontendArtifactBuilder` in QA mode to perform its
+   two deterministic offline builds from the prepared cache;
+4. installs the resulting manifest/archive through protected `frontend-install`;
+5. verifies the installed files through protected `frontend-verify`;
+6. requires a real, non-symlink `frontend-web/dist/index.html` readable by
+   `remihub-qa-app`;
+7. removes only the exact installer-created bootstrap worktree.
+
+The bounded `frontend-web/package.json` changed-file tuple supplied to the
+builder is an explicit installer-bootstrap signal. It is not a candidate diff
+and does not weaken ordinary deployment changed-file semantics.
+
+QA route verification remains mandatory. Missing generated frontend content is
+repaired before verification; `/race/draft` and the other QA frontend routes
+are never skipped merely because a fresh Git runtime has no `dist`.
+
+All bootstrap cleanup remains subject to the CRITICAL SERVER-WIDE PERMISSION
+SAFETY RULE — NON-NEGOTIABLE. There will not be a third server-wide permissions
+incident.

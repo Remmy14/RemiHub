@@ -8,17 +8,19 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 GIT = "/usr/bin/git"
 SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
 RUNUSER = "/usr/sbin/runuser"
+NPM_CACHE_CONTROL = "/usr/local/libexec/remihub-backend-npm-cache-control"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 BRANCH_RE = re.compile(
     r"deployment/card-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/r[1-9][0-9]*"
@@ -742,6 +744,101 @@ def frontend_restore(environment: Environment, args: list[str]) -> None:
     print(json.dumps({"status": "restored", "snapshot": str(snapshot)}, sort_keys=True))
 
 
+def _run_npm_cache_control(action: str, arguments: list[str]) -> dict:
+    unit = f"remihub-npm-cache-control-{os.getpid()}-{secrets.token_hex(6)}"
+    command = [
+        SYSTEMD_RUN,
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--quiet",
+        f"--unit={unit}",
+        "--property=User=root",
+        "--property=Group=root",
+        "--property=UMask=0027",
+        "--property=KillMode=control-group",
+        # This root control unit must perform a controlled UID/GID drop to
+        # remihub-deployer inside the cache helper. NoNewPrivileges belongs on
+        # the unprivileged npm preparation child, not on this transition boundary.
+        "--property=PrivateDevices=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=RestrictRealtime=yes",
+        "--property=LockPersonality=yes",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=RestrictAddressFamilies=AF_UNIX",
+        "--property=IPAddressDeny=any",
+        "--property=ReadWritePaths=/var/cache/remihub-agent/npm",
+        "--property=ReadWritePaths=/var/lib/remihub-agent/npm-prep",
+        "--property=InaccessiblePaths=/opt/remihub-agent/config",
+        "--property=InaccessiblePaths=/opt/remihub-agent/worker-config",
+        "--property=InaccessiblePaths=/home",
+        "--property=InaccessiblePaths=/root",
+        "--property=TimeoutStartSec=960",
+        NPM_CACHE_CONTROL,
+        action,
+        *arguments,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={
+                "HOME": "/root",
+                "LANG": "C.UTF-8",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            },
+            timeout=960,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        fail("protected npm cache control could not be executed")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-3000:]
+        fail(
+            "protected npm cache control failed"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail("protected npm cache control returned invalid evidence")
+    if not isinstance(payload, dict):
+        fail("protected npm cache control returned invalid evidence")
+    return payload
+
+
+def frontend_prepare(environment: Environment, args: list[str]) -> None:
+    if len(args) != 3:
+        fail("frontend-prepare requires candidate worktree, commit, and tree")
+    candidate = Path(args[0])
+    expected_commit = commit(args[1])
+    expected_tree = commit(args[2])
+    environment_name = (
+        "qa" if environment is ENVIRONMENTS["qa"] else "production"
+    )
+    evidence = _run_npm_cache_control(
+        "prepare",
+        [environment_name, str(candidate), expected_commit, expected_tree],
+    )
+    print(json.dumps(evidence, sort_keys=True))
+
+
+def frontend_cache_verify(environment: Environment, args: list[str]) -> None:
+    if len(args) != 1:
+        fail("frontend-cache-verify requires the lockfile identity")
+    lockfile_sha256 = identity(args[0])
+    evidence = _run_npm_cache_control("verify", [lockfile_sha256])
+    print(json.dumps(evidence, sort_keys=True))
+
+
 def frontend_verify(environment: Environment, args: list[str]) -> None:
     if len(args) != 2:
         fail("frontend-verify requires manifest and identity")
@@ -927,6 +1024,12 @@ def main() -> None:
         return
     if action == "restore":
         restore(environment, args)
+        return
+    if action == "frontend-prepare":
+        frontend_prepare(environment, args)
+        return
+    if action == "frontend-cache-verify":
+        frontend_cache_verify(environment, args)
         return
     if action == "frontend-install":
         frontend_install(environment, args)
