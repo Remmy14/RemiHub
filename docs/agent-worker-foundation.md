@@ -122,9 +122,12 @@ The default heartbeat is every 30 seconds against a 120-second lease. A lost
 lease fences the stale executor from recording completion even if its external
 work finishes later. Executors that expose a cancellation hook are also asked
 to stop immediately; the implementation executor maps that hook to the active
-Codex turn interrupt. The shared PostgreSQL connection pool uses psycopg2's
-thread-safe pool implementation so the executor and heartbeat may acquire
-independent connections safely.
+Codex turn interrupt. Agent worker queue operations use direct per-operation
+PostgreSQL connections instead of the normal application pool. Each queue
+operation opens its own connection, commits or rolls back that operation, and
+closes the connection before returning. Heartbeats therefore acquire their own
+short-lived connections while the executor is active without leaving persistent
+idle worker-role sessions between poll cycles.
 
 Executors advertise their supported phases. Those phases are included in the
 database claim query, so a planning-only executor cannot claim implementation

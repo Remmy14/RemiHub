@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from uuid import uuid4
 
+import psycopg2
+
+from backend.config import load_config, resolve_database_config_path
 from backend.core.agent_state import (
     CardStatus,
     RepositoryScope,
@@ -31,12 +35,12 @@ from backend.services.agent_service import (
     _insert_message,
     _row_to_dict,
     _rows_to_dicts,
-    get_db_conn,
-    put_db_conn,
 )
 
 
 logger = logging.getLogger("remihub.agent_worker_service")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATABASE_CONFIG = PROJECT_ROOT / "config" / "config.ini"
 
 
 class AgentQueueStateError(RuntimeError):
@@ -55,6 +59,22 @@ WORKER_DATABASE_IDENTITIES = {
         "remihub_agent_worker",
     ),
 }
+
+
+def get_db_conn():
+    database_config_path = resolve_database_config_path(DEFAULT_DATABASE_CONFIG)
+    config = load_config(str(database_config_path))["Database"]
+    return psycopg2.connect(
+        user=config["user"],
+        password=config["password"],
+        host=config["host"],
+        port=config["port"],
+        database=config["database"],
+    )
+
+
+def put_db_conn(conn) -> None:
+    conn.close()
 
 
 def verify_worker_identity(environment: str) -> tuple[str, str, str]:

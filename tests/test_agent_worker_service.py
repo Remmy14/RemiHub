@@ -1,8 +1,11 @@
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 from backend.core.agent_worker import AgentLeaseLostError, ExecutionResult
+import backend.services.agent_worker_service as agent_worker_service_module
 from backend.services.agent_worker_service import (
     AgentQueueStateError,
     _claimed_run_from_row,
@@ -16,6 +19,74 @@ from backend.services.agent_worker_service import (
     verify_worker_identity,
 )
 from tests.test_agent_worker import claimed_run
+
+
+class AgentWorkerConnectionBoundaryTests(unittest.TestCase):
+    def test_import_and_queue_construction_do_not_open_database_boundary(self):
+        script = """
+from unittest.mock import patch
+from psycopg2 import pool
+
+with (
+    patch.object(pool, "ThreadedConnectionPool") as threaded_pool,
+    patch("psycopg2.connect") as connect,
+    patch("backend.config.resolve_database_config_path") as resolve_config,
+    patch("backend.config.load_config") as load_config,
+):
+    import backend.services.agent_worker_service as service
+    queue = service.DatabaseAgentQueue(environment="production")
+    assert queue.environment == "production"
+    threaded_pool.assert_not_called()
+    connect.assert_not_called()
+    resolve_config.assert_not_called()
+    load_config.assert_not_called()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @patch("backend.services.agent_worker_service.psycopg2.connect")
+    @patch("backend.services.agent_worker_service.load_config")
+    @patch("backend.services.agent_worker_service.resolve_database_config_path")
+    def test_direct_worker_connection_is_lazy_and_closed(
+        self,
+        resolve_config,
+        load_config,
+        connect,
+    ):
+        resolve_config.return_value = "/secure/worker.ini"
+        load_config.return_value = {
+            "Database": {
+                "user": "remihub_agent_worker",
+                "password": "secret",
+                "host": "127.0.0.1",
+                "port": "5432",
+                "database": "remihub",
+            }
+        }
+        connection = MagicMock()
+        connect.return_value = connection
+
+        conn = agent_worker_service_module.get_db_conn()
+        agent_worker_service_module.put_db_conn(conn)
+
+        resolve_config.assert_called_once_with(
+            agent_worker_service_module.DEFAULT_DATABASE_CONFIG
+        )
+        load_config.assert_called_once_with("/secure/worker.ini")
+        connect.assert_called_once_with(
+            user="remihub_agent_worker",
+            password="secret",
+            host="127.0.0.1",
+            port="5432",
+            database="remihub",
+        )
+        connection.close.assert_called_once_with()
 
 
 def candidate(**overrides) -> dict:
