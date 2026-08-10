@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
+import AgentScreen from "./AgentScreen";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import DraftCompanionScreen from "./DraftCompanionScreen";
 import RaceScreen from "./RaceScreen";
@@ -39,7 +40,7 @@ const modules: ModuleEntry[] = [
     name: "Agent",
     description: "Deployment and agent workflow controls.",
     href: "/agent",
-    status: "Planned",
+    status: "Authenticated",
   },
   {
     name: "Health",
@@ -262,7 +263,11 @@ function PrivateApp() {
   }
 
   if (path.startsWith("/agent")) {
-    return <PlaceholderModule title="Agent" />;
+    return (
+      <PortalLayout>
+        <AgentScreen />
+      </PortalLayout>
+    );
   }
 
   if (path.startsWith("/health")) {

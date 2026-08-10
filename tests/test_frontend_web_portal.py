@@ -119,6 +119,99 @@ class FrontendWebPortalTests(unittest.TestCase):
                     app_source,
                 )
 
+    def test_agent_portal_route_stays_inside_authenticated_shell(self):
+        app_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "App.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('import AgentScreen from "./AgentScreen";', app_source)
+        self.assertIn('path.startsWith("/agent")', app_source)
+        self.assertIn("<AuthenticatedRoute>", app_source)
+        self.assertLess(
+            app_source.index('path.startsWith("/race")'),
+            app_source.index("<AuthenticatedRoute>"),
+        )
+        self.assertGreater(
+            app_source.index('path.startsWith("/agent")'),
+            app_source.index("function PrivateApp()"),
+        )
+
+    def test_agent_frontend_uses_authenticated_api_only(self):
+        agent_api_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "agentApi.ts"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('from "./authenticatedApi"', agent_api_source)
+        self.assertIn("apiRequest<", agent_api_source)
+        self.assertNotIn("authenticated: false", agent_api_source)
+        self.assertNotIn("X-RemiHub-Key", agent_api_source)
+        self.assertNotIn("api_key", agent_api_source)
+        self.assertNotIn("token=", agent_api_source)
+
+    def test_agent_frontend_does_not_invent_lifecycle_routes(self):
+        agent_api_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "agentApi.ts"
+        ).read_text(encoding="utf-8")
+
+        expected_routes = (
+            "/agent/cards",
+            "/approve-implementation",
+            "/approve-deployment",
+            "/retry",
+            "/retry-github-sync",
+            "/cancel",
+            "/close",
+            "/messages",
+        )
+        for route in expected_routes:
+            with self.subTest(route=route):
+                self.assertIn(route, agent_api_source)
+
+        self.assertNotIn("review-stage", agent_api_source)
+        self.assertNotIn("review_stage", agent_api_source)
+
+    def test_agent_backend_router_remains_admin_only(self):
+        router_source = (
+            Path(__file__).resolve().parents[1]
+            / "backend"
+            / "routers"
+            / "agent.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("require_admin_principal", router_source)
+        self.assertIn("dependencies=[Depends(require_admin_principal)]", router_source)
+        self.assertNotIn("get_current_principal", router_source)
+
+    def test_race_public_exception_is_not_broadened_for_agent(self):
+        main_source = (
+            Path(__file__).resolve().parents[1]
+            / "backend"
+            / "main.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("app.include_router(agent.router)", main_source)
+        self.assertIn("app.include_router(race.router)", main_source)
+        self.assertIn("protected_routers = [", main_source)
+        self.assertLess(
+            main_source.index("app.include_router(agent.router)"),
+            main_source.index("protected_routers = ["),
+        )
+        self.assertLess(
+            main_source.index("app.include_router(race.router)"),
+            main_source.index("protected_routers = ["),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
