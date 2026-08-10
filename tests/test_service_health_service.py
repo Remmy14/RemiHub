@@ -18,8 +18,8 @@ def unit_status(
     active_state: str = "active",
     sub_state: str = "running",
     result: str = "success",
-    exec_main_code: str = "exited",
-    exec_main_status: str = "0",
+    exec_main_code: str | int | None = "exited",
+    exec_main_status: str | int | None = "0",
     unit_type: str = "simple",
 ) -> health.SystemdUnitStatus:
     return health.SystemdUnitStatus(
@@ -38,6 +38,54 @@ def unit_status(
 
 
 class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
+    def test_numeric_exec_main_code_with_zero_status_is_successful_exit(self):
+        self.assertTrue(
+            health._is_success_exit(
+                unit_status(exec_main_code=1, exec_main_status=0)
+            )
+        )
+        self.assertFalse(
+            health._is_failed_exit(
+                unit_status(exec_main_code=1, exec_main_status=0)
+            )
+        )
+
+    def test_string_numeric_exec_main_code_with_zero_status_is_successful_exit(self):
+        self.assertTrue(
+            health._is_success_exit(
+                unit_status(exec_main_code="1", exec_main_status="0")
+            )
+        )
+        self.assertFalse(
+            health._is_failed_exit(
+                unit_status(exec_main_code="1", exec_main_status="0")
+            )
+        )
+
+    def test_exited_exec_main_code_with_zero_status_remains_successful_exit(self):
+        self.assertTrue(
+            health._is_success_exit(
+                unit_status(exec_main_code="exited", exec_main_status=0)
+            )
+        )
+        self.assertFalse(
+            health._is_failed_exit(
+                unit_status(exec_main_code="exited", exec_main_status=0)
+            )
+        )
+
+    def test_numeric_exec_main_code_with_nonzero_status_is_failed_exit(self):
+        self.assertFalse(
+            health._is_success_exit(
+                unit_status(exec_main_code=1, exec_main_status="2")
+            )
+        )
+        self.assertTrue(
+            health._is_failed_exit(
+                unit_status(exec_main_code=1, exec_main_status="2")
+            )
+        )
+
     def test_inventory_contains_all_mandatory_remihub_units(self):
         expected = {
             "remihub-agent-android-deployment.service",
@@ -110,7 +158,25 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
 
     def test_timer_or_path_active_waiting_is_healthy(self):
         status, _message = health.evaluate_systemd_status(
-            unit_status(unit="remihub-agent-backend-deployment.timer", sub_state="waiting"),
+            unit_status(
+                unit="remihub-agent-backend-deployment.timer",
+                active_state="active",
+                sub_state="waiting",
+                result="success",
+            ),
+            health.ExpectedMode.ARMED_TIMER_OR_PATH,
+        )
+
+        self.assertEqual(status, HealthStatus.HEALTHY)
+
+    def test_timer_or_path_active_running_is_healthy(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                unit="remihub-agent-backend-deployment.timer",
+                active_state="active",
+                sub_state="running",
+                result="success",
+            ),
             health.ExpectedMode.ARMED_TIMER_OR_PATH,
         )
 
@@ -119,6 +185,30 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
     def test_timer_or_path_inactive_is_unhealthy(self):
         status, _message = health.evaluate_systemd_status(
             unit_status(active_state="inactive", sub_state="dead"),
+            health.ExpectedMode.ARMED_TIMER_OR_PATH,
+        )
+
+        self.assertEqual(status, HealthStatus.UNHEALTHY)
+
+    def test_timer_or_path_failed_state_is_unhealthy(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                active_state="failed",
+                sub_state="failed",
+                result="success",
+            ),
+            health.ExpectedMode.ARMED_TIMER_OR_PATH,
+        )
+
+        self.assertEqual(status, HealthStatus.UNHEALTHY)
+
+    def test_timer_or_path_failed_result_is_unhealthy(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                active_state="active",
+                sub_state="waiting",
+                result="exit-code",
+            ),
             health.ExpectedMode.ARMED_TIMER_OR_PATH,
         )
 
@@ -200,6 +290,37 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
 
         self.assertEqual(status, HealthStatus.IDLE)
 
+    def test_on_demand_inactive_dead_numeric_successful_oneshot_is_idle(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+                exec_main_code=1,
+                exec_main_status=0,
+                unit_type="oneshot",
+            ),
+            health.ExpectedMode.ON_DEMAND,
+        )
+
+        self.assertEqual(status, HealthStatus.IDLE)
+
+    def test_health_collector_style_inactive_dead_successful_oneshot_is_idle(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                unit="remihub-health-collector.service",
+                active_state="inactive",
+                sub_state="dead",
+                result="success",
+                exec_main_code="1",
+                exec_main_status="0",
+                unit_type="oneshot",
+            ),
+            health.ExpectedMode.ON_DEMAND,
+        )
+
+        self.assertEqual(status, HealthStatus.IDLE)
+
     def test_qa_runtime_inactive_success_is_idle(self):
         status, _message = health.evaluate_systemd_status(
             unit_status(active_state="inactive", sub_state="dead"),
@@ -219,6 +340,22 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
     def test_oneshot_successful_exited_is_healthy(self):
         status, _message = health.evaluate_systemd_status(
             unit_status(active_state="active", sub_state="exited"),
+            health.ExpectedMode.ONESHOT_SUCCESS_EXITED,
+        )
+
+        self.assertEqual(status, HealthStatus.HEALTHY)
+
+    def test_bindmount_style_numeric_successful_oneshot_is_healthy(self):
+        status, _message = health.evaluate_systemd_status(
+            unit_status(
+                unit="remihub-bindmount.service",
+                active_state="active",
+                sub_state="exited",
+                result="success",
+                exec_main_code="1",
+                exec_main_status="0",
+                unit_type="oneshot",
+            ),
             health.ExpectedMode.ONESHOT_SUCCESS_EXITED,
         )
 

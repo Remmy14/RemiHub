@@ -366,19 +366,27 @@ def _is_success_result(value: str | None) -> bool:
     return value in {None, "", "success"}
 
 
+def _normalized_systemd_value(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _is_zero_exit_status(value: object) -> bool:
+    return _normalized_systemd_value(value) in {None, "", "0"}
+
+
 def _is_success_exit(status: SystemdUnitStatus) -> bool:
-    code = status.get("ExecMainCode")
-    exit_status = status.get("ExecMainStatus")
-    if code in {None, "", "0"} and exit_status in {None, "", "0"}:
-        return True
-    return code == "exited" and exit_status in {None, "", "0"}
+    code = _normalized_systemd_value(status.get("ExecMainCode"))
+    return code in {None, "", "0", "1", "exited"} and _is_zero_exit_status(
+        status.get("ExecMainStatus")
+    )
 
 
 def _is_failed_exit(status: SystemdUnitStatus) -> bool:
-    code = status.get("ExecMainCode")
-    exit_status = status.get("ExecMainStatus")
-    if code == "exited":
-        return exit_status not in {None, "", "0"}
+    code = _normalized_systemd_value(status.get("ExecMainCode"))
+    if code in {None, "", "0", "1", "exited"}:
+        return not _is_zero_exit_status(status.get("ExecMainStatus"))
     if code not in {None, "", "0"}:
         return True
     return False
@@ -504,7 +512,7 @@ def evaluate_systemd_status(
         return HealthStatus.UNHEALTHY, "Persistent service is not running"
 
     if expected_mode == ExpectedMode.ARMED_TIMER_OR_PATH:
-        if active_state == "active" and sub_state == "waiting":
+        if active_state == "active" and sub_state in {"waiting", "running"}:
             return HealthStatus.HEALTHY, "Timer or path watcher is armed"
         return HealthStatus.UNHEALTHY, "Timer or path watcher is not armed"
 
