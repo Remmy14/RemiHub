@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import os
 import subprocess
@@ -19,6 +20,9 @@ from backend.models.health_models import (
 
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_TIMEOUT_SECONDS = 3
+SNAPSHOT_SINGLETON_ID = "current"
+SNAPSHOT_FRESHNESS_COMPONENT_ID = "health-collector-snapshot-freshness"
+SNAPSHOT_STALE_AFTER_SECONDS = 90
 SYSTEMD_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -139,6 +143,13 @@ UNIT_DEFINITIONS = (
         ExpectedMode.ARMED_TIMER_OR_PATH,
     ),
     UnitDefinition(
+        "remihub-health-collector-timer",
+        "Health Collector Timer",
+        HealthComponentGroup.CORE,
+        "remihub-health-collector.timer",
+        ExpectedMode.ARMED_TIMER_OR_PATH,
+    ),
+    UnitDefinition(
         "remihub-agent-android-deployment",
         "Android Deployment Worker",
         HealthComponentGroup.AGENT,
@@ -192,6 +203,13 @@ UNIT_DEFINITIONS = (
         "Agent Planning Sync",
         HealthComponentGroup.AGENT,
         "remihub-agent-planning-sync.service",
+        ExpectedMode.ON_DEMAND,
+    ),
+    UnitDefinition(
+        "remihub-health-collector",
+        "Health Collector",
+        HealthComponentGroup.CORE,
+        "remihub-health-collector.service",
         ExpectedMode.ON_DEMAND,
     ),
     UnitDefinition(
@@ -356,6 +374,28 @@ def _is_success_exit(status: SystemdUnitStatus) -> bool:
     return code == "exited" and exit_status in {None, "", "0"}
 
 
+def _is_failed_exit(status: SystemdUnitStatus) -> bool:
+    code = status.get("ExecMainCode")
+    exit_status = status.get("ExecMainStatus")
+    if code == "exited":
+        return exit_status not in {None, "", "0"}
+    if code not in {None, "", "0"}:
+        return True
+    return False
+
+
+def get_db_conn():
+    from backend.database.database import get_db_conn as acquire_connection
+
+    return acquire_connection()
+
+
+def put_db_conn(conn) -> None:
+    from backend.database.database import put_db_conn as release_connection
+
+    release_connection(conn)
+
+
 def inspect_systemd_unit(unit: str, *, timeout: float = SYSTEMD_TIMEOUT_SECONDS) -> SystemdUnitStatus:
     if unit not in ALLOWED_SYSTEMD_UNITS:
         raise ValueError(f"Systemd unit is not allowlisted: {unit}")
@@ -450,6 +490,7 @@ def evaluate_systemd_status(
     active_state = status.get("ActiveState")
     sub_state = status.get("SubState")
     result = status.get("Result")
+    unit_type = status.get("Type")
 
     if load_state in {"not-found", "error"}:
         return HealthStatus.UNKNOWN, "Systemd unit is absent or unreadable"
@@ -470,9 +511,16 @@ def evaluate_systemd_status(
     if expected_mode in {ExpectedMode.ON_DEMAND, ExpectedMode.QA_RUNTIME}:
         if active_state == "active":
             return HealthStatus.HEALTHY, "On-demand unit is currently active"
-        if not _is_success_exit(status):
+        if (
+            active_state == "inactive"
+            and sub_state in {"dead", "exited"}
+            and unit_type == "oneshot"
+            and _is_success_result(result)
+        ):
+            return HealthStatus.IDLE, "On-demand unit is idle with no failed result"
+        if _is_failed_exit(status):
             return HealthStatus.UNHEALTHY, "On-demand unit last exit status was not successful"
-        if active_state == "inactive" and sub_state in {"dead", "exited"} and _is_success_result(result) and _is_success_exit(status):
+        if active_state == "inactive" and sub_state in {"dead", "exited"} and _is_success_result(result):
             return HealthStatus.IDLE, "On-demand unit is idle with no failed result"
         return HealthStatus.UNKNOWN, "On-demand unit state is not recognized"
 
@@ -903,7 +951,7 @@ def aggregate_overall(components: list[HealthComponent]) -> HealthStatus:
     return HealthStatus.HEALTHY
 
 
-def get_service_health_snapshot() -> ServiceHealthSnapshotResponse:
+def collect_service_health_snapshot() -> ServiceHealthSnapshotResponse:
     checked_at = datetime.now(timezone.utc)
     components: list[HealthComponent] = []
 
@@ -964,3 +1012,174 @@ def get_service_health_snapshot() -> ServiceHealthSnapshotResponse:
         overall=aggregate_overall(components),
         components=components,
     )
+
+
+def _snapshot_payload(snapshot: ServiceHealthSnapshotResponse) -> dict:
+    validated = ServiceHealthSnapshotResponse.model_validate(snapshot)
+    return validated.model_dump(mode="json")
+
+
+def persist_service_health_snapshot(snapshot: ServiceHealthSnapshotResponse) -> None:
+    validated = ServiceHealthSnapshotResponse.model_validate(snapshot)
+    payload = _snapshot_payload(validated)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.service_health_current_snapshot (
+                    singleton_id,
+                    checked_at,
+                    overall,
+                    snapshot,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s::jsonb, CURRENT_TIMESTAMP)
+                ON CONFLICT (singleton_id) DO UPDATE
+                SET checked_at = EXCLUDED.checked_at,
+                    overall = EXCLUDED.overall,
+                    snapshot = EXCLUDED.snapshot,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE public.service_health_current_snapshot.checked_at <= EXCLUDED.checked_at;
+                """,
+                (
+                    SNAPSHOT_SINGLETON_ID,
+                    validated.checked_at,
+                    validated.overall.value,
+                    json.dumps(payload, separators=(",", ":")),
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("Stored service health snapshot is newer than this collection")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def load_current_service_health_snapshot() -> ServiceHealthSnapshotResponse | None:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT snapshot
+                FROM public.service_health_current_snapshot
+                WHERE singleton_id = %s;
+                """,
+                (SNAPSHOT_SINGLETON_ID,),
+            )
+            row = cur.fetchone()
+    finally:
+        put_db_conn(conn)
+
+    if row is None:
+        return None
+
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return ServiceHealthSnapshotResponse.model_validate(payload)
+
+
+def _freshness_component(
+    *,
+    status: HealthStatus,
+    message: str,
+    checked_at: datetime,
+) -> HealthComponent:
+    return _component(
+        id=SNAPSHOT_FRESHNESS_COMPONENT_ID,
+        name="Health Collector / Snapshot Freshness",
+        group=HealthComponentGroup.CORE,
+        kind=HealthComponentKind.COMPOSITE,
+        status=status,
+        message=message,
+        checked_at=checked_at,
+        required=True,
+    )
+
+
+def _without_freshness_component(components: list[HealthComponent]) -> list[HealthComponent]:
+    return [
+        component
+        for component in components
+        if component.id != SNAPSHOT_FRESHNESS_COMPONENT_ID
+    ]
+
+
+def _with_freshness_component(
+    snapshot: ServiceHealthSnapshotResponse,
+    *,
+    now: datetime | None = None,
+) -> ServiceHealthSnapshotResponse:
+    evaluated_at = now or datetime.now(timezone.utc)
+    checked_at = snapshot.checked_at
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    age = evaluated_at - checked_at
+    fresh = age <= timedelta(seconds=SNAPSHOT_STALE_AFTER_SECONDS)
+    components = _without_freshness_component(list(snapshot.components))
+    if fresh:
+        freshness = _freshness_component(
+            status=HealthStatus.HEALTHY,
+            message="Health collector snapshot is fresh",
+            checked_at=evaluated_at,
+        )
+    else:
+        freshness = _freshness_component(
+            status=HealthStatus.DEGRADED,
+            message=(
+                "Health collector snapshot is stale; showing last known component states"
+            ),
+            checked_at=evaluated_at,
+        )
+    components.append(freshness)
+    return ServiceHealthSnapshotResponse(
+        success=True,
+        checked_at=snapshot.checked_at,
+        overall=aggregate_overall(components),
+        components=components,
+    )
+
+
+def _missing_snapshot_response(*, now: datetime | None = None) -> ServiceHealthSnapshotResponse:
+    checked_at = now or datetime.now(timezone.utc)
+    components = [
+        _freshness_component(
+            status=HealthStatus.DEGRADED,
+            message="Health collector has not persisted a snapshot yet",
+            checked_at=checked_at,
+        )
+    ]
+    return ServiceHealthSnapshotResponse(
+        success=True,
+        checked_at=checked_at,
+        overall=aggregate_overall(components),
+        components=components,
+    )
+
+
+def get_service_health_snapshot() -> ServiceHealthSnapshotResponse:
+    try:
+        snapshot = load_current_service_health_snapshot()
+    except Exception:
+        checked_at = datetime.now(timezone.utc)
+        components = [
+            _freshness_component(
+                status=HealthStatus.DEGRADED,
+                message="Persisted health snapshot is unavailable",
+                checked_at=checked_at,
+            )
+        ]
+        return ServiceHealthSnapshotResponse(
+            success=True,
+            checked_at=checked_at,
+            overall=aggregate_overall(components),
+            components=components,
+        )
+    if snapshot is None:
+        return _missing_snapshot_response()
+    return _with_freshness_component(snapshot)

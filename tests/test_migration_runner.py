@@ -28,6 +28,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0004", "agent_worker_leases"),
                 ("0005", "agent_repository_scope"),
                 ("0006", "weightlifting_foundation"),
+                ("0007", "service_health_current_snapshot"),
             ],
         )
 
@@ -43,6 +44,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0004", "agent_worker_leases"),
                 ("0005", "agent_repository_scope"),
                 ("0006", "weightlifting_foundation"),
+                ("0007", "service_health_current_snapshot"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
@@ -95,6 +97,32 @@ class MigrationDiscoveryTests(unittest.TestCase):
             direction="down",
         )
         GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_service_health_current_snapshot_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0007_service_health_current_snapshot.up.sql"
+        down = MIGRATIONS_DIR / "0007_service_health_current_snapshot.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_service_health_migration_is_current_state_only(self):
+        up = (
+            MIGRATIONS_DIR / "0007_service_health_current_snapshot.up.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CREATE TABLE public.service_health_current_snapshot", up)
+        self.assertIn("singleton_id text PRIMARY KEY", up)
+        self.assertIn("snapshot jsonb NOT NULL", up)
+        self.assertNotIn("history", up.lower())
+        self.assertNotIn("event", up.lower())
+        self.assertNotIn("uptime", up.lower())
 
     def test_discovers_up_and_down_migration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
