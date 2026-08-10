@@ -26,6 +26,7 @@ from backend.routers import (
         autographs,
         fieldwatch,
         finance,
+        health,
         notifications,
         plex,
         pool,
@@ -107,6 +108,10 @@ app.include_router(auth.router)
 # Agent operations are always strict and administrator-only, even while legacy
 # RemiHub routes remain in transition mode.
 app.include_router(agent.router)
+
+# Infrastructure health is always strict and administrator-only. Register it
+# before the web Health SPA fallback so /health/services remains an API route.
+app.include_router(health.router)
 
 # Race API authorization is explicit at the endpoint level. Public Race Day
 # reads remain open while administrative operations require administrator auth.

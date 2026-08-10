@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-import subprocess
 from typing import Any
 
 # 3rd Party Imports
@@ -12,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 
 # Local Imports
 from backend.config import load_application_config
+from backend.services.service_health_service import systemd_status_for_rh_storage_compat
 
 
 router = APIRouter(prefix="/rh-storage", tags=["RH Storage"])
@@ -43,79 +43,6 @@ def _get_rh_storage_database_url() -> str:
         config = cfg.get("RHStorage", {})
         url = config.get("db_url")
     return url
-
-
-def _get_systemd_service_status(service_name: str) -> dict[str, Any]:
-    """
-    Returns basic systemd status for a local service.
-
-    This is intentionally read-only and uses systemctl show so it is safe
-    to call from the RemiHub backend.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "systemctl",
-                "show",
-                service_name,
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=LoadState",
-                "--property=UnitFileState",
-                "--property=ExecMainPID",
-                "--property=ActiveEnterTimestamp",
-                "--no-pager",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except Exception as exc:
-        return {
-            "available": False,
-            "service_name": service_name,
-            "active": False,
-            "active_state": "unknown",
-            "sub_state": "unknown",
-            "load_state": "unknown",
-            "unit_file_state": "unknown",
-            "pid": None,
-            "active_since": None,
-            "error": str(exc),
-        }
-
-    values: dict[str, str] = {}
-
-    for line in result.stdout.splitlines():
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        values[key] = value
-
-    active_state = values.get("ActiveState", "unknown")
-    sub_state = values.get("SubState", "unknown")
-
-    pid_raw = values.get("ExecMainPID")
-    pid = None
-    if pid_raw and pid_raw.isdigit():
-        pid_value = int(pid_raw)
-        if pid_value > 0:
-            pid = pid_value
-
-    return {
-        "available": result.returncode == 0,
-        "service_name": service_name,
-        "active": active_state == "active",
-        "active_state": active_state,
-        "sub_state": sub_state,
-        "load_state": values.get("LoadState", "unknown"),
-        "unit_file_state": values.get("UnitFileState", "unknown"),
-        "pid": pid,
-        "active_since": values.get("ActiveEnterTimestamp") or None,
-        "error": result.stderr.strip() or None,
-    }
 
 
 async def _fetch_rows(conn: asyncpg.Connection, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -307,7 +234,7 @@ async def get_rh_storage_status() -> dict[str, Any]:
         job["finished_at"] = _format_dt(job.get("finished_at"))
 
     # Get rh_storage systemctl service status
-    service_status = _get_systemd_service_status("rh-storage.service")
+    service_status = systemd_status_for_rh_storage_compat("rh-storage.service")
 
     return {
         "success": True,
