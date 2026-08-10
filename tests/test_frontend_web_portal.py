@@ -139,6 +139,27 @@ class FrontendWebPortalTests(unittest.TestCase):
             app_source.index("function PrivateApp()"),
         )
 
+    def test_health_portal_route_stays_inside_authenticated_shell(self):
+        app_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "App.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('import HealthScreen from "./HealthScreen";', app_source)
+        self.assertIn('path.startsWith("/health")', app_source)
+        self.assertIn("<AuthenticatedRoute>", app_source)
+        self.assertIn("<HealthScreen />", app_source)
+        self.assertLess(
+            app_source.index('path.startsWith("/race")'),
+            app_source.index("<AuthenticatedRoute>"),
+        )
+        self.assertGreater(
+            app_source.index('path.startsWith("/health")'),
+            app_source.index("function PrivateApp()"),
+        )
+
     def test_agent_frontend_uses_authenticated_api_only(self):
         agent_api_source = (
             Path(__file__).resolve().parents[1]
@@ -154,6 +175,131 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertNotIn("X-RemiHub-Key", agent_api_source)
         self.assertNotIn("api_key", agent_api_source)
         self.assertNotIn("token=", agent_api_source)
+
+    def test_health_frontend_uses_authenticated_services_api_only(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        health_api_source = (
+            frontend_root
+            / "src"
+            / "api"
+            / "healthApi.ts"
+        ).read_text(encoding="utf-8")
+        health_screen_source = (
+            frontend_root
+            / "src"
+            / "HealthScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('from "./authenticatedApi"', health_api_source)
+        self.assertIn("apiRequest<ServiceHealthSnapshotResponse>", health_api_source)
+        self.assertIn('"/health/services"', health_api_source)
+        self.assertNotIn("authenticated: false", health_api_source)
+        self.assertNotIn("X-RemiHub-Key", health_api_source)
+        self.assertNotIn("api_key", health_api_source)
+        self.assertNotIn("token=", health_api_source)
+        self.assertNotIn("Authorization", health_screen_source)
+        self.assertNotIn("Bearer", health_screen_source)
+        self.assertNotIn("/health/systemd", health_api_source)
+
+    def test_health_frontend_models_match_deployed_contract_shape(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "healthApi.ts"
+        ).read_text(encoding="utf-8")
+
+        for status in (
+            '"healthy"',
+            '"degraded"',
+            '"unhealthy"',
+            '"idle"',
+            '"unknown"',
+        ):
+            with self.subTest(status=status):
+                self.assertIn(status, source)
+
+        for field in (
+            "checked_at",
+            "overall",
+            "components",
+            "group",
+            "kind",
+            "status",
+            "message",
+            "expected_mode",
+            "systemd",
+            "dependencies",
+            "active_state",
+            "sub_state",
+            "result",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, source)
+
+    def test_health_screen_presents_statuses_groups_and_stale_refresh(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "HealthScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for status_label in (
+            "Healthy",
+            "Idle",
+            "Degraded",
+            "Unhealthy",
+            "Unknown",
+            "Normal standby",
+            "Not confirmed healthy",
+        ):
+            with self.subTest(status_label=status_label):
+                self.assertIn(status_label, source)
+
+        for group in (
+            '"core"',
+            '"agent"',
+            '"storage"',
+            '"rh_storage"',
+            '"media"',
+        ):
+            with self.subTest(group=group):
+                self.assertIn(group, source)
+
+        self.assertIn("groupedComponents", source)
+        self.assertIn("knownGroupOrder", source)
+        self.assertIn("Stale snapshot", source)
+        self.assertIn("Last refresh failed", source)
+        self.assertIn("requestInFlight", source)
+        self.assertIn("POLL_INTERVAL_MILLIS = 30000", source)
+        self.assertIn("document.visibilityState", source)
+        self.assertIn("No health components were returned", source)
+        self.assertIn("Component details", source)
+
+    def test_health_screen_does_not_duplicate_systemd_health_semantics(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "HealthScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        forbidden_fragments = (
+            'active_state === "inactive"',
+            'active_state === "active"',
+            'sub_state === "running"',
+            'sub_state === "waiting"',
+            "systemctl",
+            "journalctl",
+            "restartService",
+            "startService",
+            "stopService",
+        )
+        for fragment in forbidden_fragments:
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, source)
 
     def test_agent_frontend_does_not_invent_lifecycle_routes(self):
         agent_api_source = (

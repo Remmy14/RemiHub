@@ -4,6 +4,7 @@ import type { FormEvent, ReactNode } from "react";
 import AgentScreen from "./AgentScreen";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import DraftCompanionScreen from "./DraftCompanionScreen";
+import HealthScreen from "./HealthScreen";
 import RaceScreen from "./RaceScreen";
 import RhStorageStatusScreen from "./RhStorageStatusScreen";
 
@@ -46,7 +47,7 @@ const modules: ModuleEntry[] = [
     name: "Health",
     description: "Service health and operational status.",
     href: "/health",
-    status: "Planned",
+    status: "Authenticated",
   },
 ];
 
@@ -231,26 +232,6 @@ function PortalHome() {
   );
 }
 
-function PlaceholderModule({ title }: { title: string }) {
-  return (
-    <PortalLayout>
-      <main className="mx-auto max-w-3xl px-4 py-8">
-        <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="text-sm font-bold uppercase text-blue-600">
-            RemiHub Portal
-          </div>
-          <h1 className="mt-1 text-2xl font-black">{title}</h1>
-          <p className="mt-3 text-sm leading-6 text-slate-600">
-            This portal module is not implemented in this card. The authenticated
-            route is reserved so future work can add the full module without
-            changing the shell.
-          </p>
-        </section>
-      </main>
-    </PortalLayout>
-  );
-}
-
 function PrivateApp() {
   const path = window.location.pathname;
 
@@ -271,7 +252,11 @@ function PrivateApp() {
   }
 
   if (path.startsWith("/health")) {
-    return <PlaceholderModule title="Health" />;
+    return (
+      <PortalLayout>
+        <HealthScreen />
+      </PortalLayout>
+    );
   }
 
   return <PortalHome />;
