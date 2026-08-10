@@ -392,6 +392,23 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
 
 
 class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
+    def jdownloader_runtime(self, *, uid: int = 4242) -> health.JDownloaderUserRuntime:
+        home = "/home/alex"
+        runtime_dir = f"/run/user/{uid}"
+        return health.JDownloaderUserRuntime(
+            username="alex",
+            uid=uid,
+            home=health.Path(home),
+            runtime_dir=health.Path(runtime_dir),
+            bus_path=health.Path(runtime_dir) / "bus",
+            unit_file=health.Path(home) / ".config/systemd/user/jdownloader.service",
+            enabled_link=(
+                health.Path(home)
+                / ".config/systemd/user/graphical-session.target.wants/"
+                / "jdownloader.service"
+            ),
+        )
+
     def test_path_check_existing_directory_is_healthy(self):
         definition = health.PathDefinition(
             "tmp",
@@ -584,79 +601,261 @@ class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
 
         self.assertEqual(component.status, HealthStatus.DEGRADED)
 
-    @patch.dict(
-        "os.environ",
-        {
-            "XDG_RUNTIME_DIR": "/run/user/1000",
-            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
-        },
-        clear=True,
-    )
+    @patch("backend.services.service_health_service.pwd.getpwnam")
+    def test_jdownloader_user_runtime_resolves_configured_username_and_uid(self, getpwnam):
+        getpwnam.return_value = Mock(pw_uid=4242, pw_dir="/home/alex")
+
+        runtime = health._jdownloader_user_runtime()
+
+        getpwnam.assert_called_once_with("alex")
+        self.assertEqual(runtime.uid, 4242)
+        self.assertEqual(str(runtime.runtime_dir), "/run/user/4242")
+        self.assertEqual(str(runtime.bus_path), "/run/user/4242/bus")
+        self.assertNotEqual(str(runtime.runtime_dir), "/run/user/1000")
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
     @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
     @patch("backend.services.service_health_service.Path.exists", return_value=True)
     @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
     def test_jdownloader_user_service_running_is_healthy(
         self,
+        runtime,
         _is_file,
         _exists,
+        _is_dir,
+        _is_socket,
         run,
+        _geteuid,
     ):
+        runtime.return_value = self.jdownloader_runtime()
         run.return_value = Mock(
             returncode=0,
-            stdout="LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\n",
+            stdout=(
+                "LoadState=loaded\n"
+                "ActiveState=active\n"
+                "SubState=running\n"
+                "UnitFileState=enabled\n"
+                "Result=success\n"
+                "ExecMainCode=1\n"
+                "ExecMainStatus=0\n"
+            ),
             stderr="",
         )
 
         check = health.inspect_jdownloader_user_service()
 
         self.assertEqual(check.status, HealthStatus.HEALTHY)
+        self.assertIn("load=loaded", check.observed)
+        self.assertIn("active=active", check.observed)
+        self.assertIn("sub=running", check.observed)
         command = run.call_args.args[0]
         self.assertEqual(command[:3], [health.SYSTEMCTL, "--user", "show"])
         self.assertIn(health.JDOWNLOADER_SYSTEMD_UNIT_NAME, command)
         self.assertNotIn("start", command)
         self.assertNotIn("restart", command)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/4242")
+        self.assertEqual(
+            env["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/4242/bus",
+        )
 
     @patch.dict(
         "os.environ",
         {
-            "XDG_RUNTIME_DIR": "/run/user/1000",
-            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "XDG_RUNTIME_DIR": "/wrong",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/wrong/bus",
         },
         clear=True,
     )
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
     @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
     @patch("backend.services.service_health_service.Path.exists", return_value=True)
     @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
     def test_jdownloader_user_service_stopped_is_degraded(
         self,
+        runtime,
         _is_file,
         _exists,
+        _is_dir,
+        _is_socket,
         run,
+        _geteuid,
     ):
+        runtime.return_value = self.jdownloader_runtime()
         run.return_value = Mock(
             returncode=0,
-            stdout="LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n",
+            stdout=(
+                "LoadState=loaded\n"
+                "ActiveState=inactive\n"
+                "SubState=dead\n"
+                "Result=success\n"
+                "ExecMainCode=1\n"
+                "ExecMainStatus=0\n"
+            ),
             stderr="",
         )
 
         check = health.inspect_jdownloader_user_service()
 
         self.assertEqual(check.status, HealthStatus.DEGRADED)
+        self.assertIn("manager is observable", check.message)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/4242")
+        self.assertEqual(
+            env["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/4242/bus",
+        )
 
     @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
     @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
     @patch("backend.services.service_health_service.Path.exists", return_value=True)
     @patch("backend.services.service_health_service.Path.is_file", return_value=True)
-    def test_jdownloader_user_manager_without_runtime_env_is_unknown(
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
+    def test_jdownloader_user_service_failed_is_unhealthy(
         self,
+        runtime,
         _is_file,
         _exists,
+        _is_dir,
+        _is_socket,
         run,
+        _geteuid,
     ):
+        runtime.return_value = self.jdownloader_runtime()
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "LoadState=loaded\n"
+                "ActiveState=failed\n"
+                "SubState=failed\n"
+                "Result=exit-code\n"
+                "ExecMainCode=1\n"
+                "ExecMainStatus=2\n"
+            ),
+            stderr="",
+        )
+
+        check = health.inspect_jdownloader_user_service()
+
+        self.assertEqual(check.status, HealthStatus.UNHEALTHY)
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
+    @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=False)
+    @patch("backend.services.service_health_service.Path.exists", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
+    def test_jdownloader_missing_user_runtime_is_degraded(
+        self,
+        runtime,
+        _is_file,
+        _exists,
+        _is_dir,
+        run,
+        _geteuid,
+    ):
+        runtime.return_value = self.jdownloader_runtime()
+
+        check = health.inspect_jdownloader_user_service()
+
+        self.assertEqual(check.status, HealthStatus.DEGRADED)
+        self.assertIn("graphical session is started", check.message)
+        self.assertEqual(check.observed, "runtime_dir_unavailable")
+        run.assert_not_called()
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
+    @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=False)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
+    @patch("backend.services.service_health_service.Path.exists", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
+    def test_jdownloader_missing_user_bus_is_degraded(
+        self,
+        runtime,
+        _is_file,
+        _exists,
+        _is_dir,
+        _is_socket,
+        run,
+        _geteuid,
+    ):
+        runtime.return_value = self.jdownloader_runtime()
+
+        check = health.inspect_jdownloader_user_service()
+
+        self.assertEqual(check.status, HealthStatus.DEGRADED)
+        self.assertIn("graphical session is started", check.message)
+        self.assertEqual(check.observed, "user_bus_unavailable")
+        run.assert_not_called()
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
+    @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
+    @patch("backend.services.service_health_service.Path.exists", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
+    def test_jdownloader_user_manager_query_failure_is_unknown(
+        self,
+        runtime,
+        _is_file,
+        _exists,
+        _is_dir,
+        _is_socket,
+        run,
+        _geteuid,
+    ):
+        runtime.return_value = self.jdownloader_runtime()
+        run.return_value = Mock(returncode=1, stdout="", stderr="permission denied")
+
         check = health.inspect_jdownloader_user_service()
 
         self.assertEqual(check.status, HealthStatus.UNKNOWN)
-        run.assert_not_called()
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("backend.services.service_health_service.os.geteuid", return_value=4242)
+    @patch("backend.services.service_health_service.subprocess.run")
+    @patch("backend.services.service_health_service.Path.is_socket", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_dir", return_value=True)
+    @patch("backend.services.service_health_service.Path.exists", return_value=True)
+    @patch("backend.services.service_health_service.Path.is_file", return_value=True)
+    @patch("backend.services.service_health_service._jdownloader_user_runtime")
+    def test_jdownloader_user_manager_connection_failure_is_degraded(
+        self,
+        runtime,
+        _is_file,
+        _exists,
+        _is_dir,
+        _is_socket,
+        run,
+        _geteuid,
+    ):
+        runtime.return_value = self.jdownloader_runtime()
+        run.return_value = Mock(
+            returncode=1,
+            stdout="",
+            stderr="Failed to connect to bus: Connection refused",
+        )
+
+        check = health.inspect_jdownloader_user_service()
+
+        self.assertEqual(check.status, HealthStatus.DEGRADED)
+        self.assertEqual(check.observed, "user_manager_unavailable")
 
 
 class ServiceHealthAggregationAndSafetyTests(unittest.TestCase):

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import os
+import pwd
 import subprocess
 
 from backend.models.health_models import (
@@ -335,12 +336,19 @@ JDOWNLOADER_PATHS = (
     ),
 )
 
-JDOWNLOADER_USER_UNIT = "/home/alex/.config/systemd/user/jdownloader.service"
+JDOWNLOADER_USER = "alex"
 JDOWNLOADER_SYSTEMD_UNIT_NAME = "jdownloader.service"
-JDOWNLOADER_USER_UNIT_LINK = (
-    "/home/alex/.config/systemd/user/graphical-session.target.wants/"
-    "jdownloader.service"
-)
+
+
+@dataclass(frozen=True)
+class JDownloaderUserRuntime:
+    username: str
+    uid: int
+    home: Path
+    runtime_dir: Path
+    bus_path: Path
+    unit_file: Path
+    enabled_link: Path
 
 
 @dataclass(frozen=True)
@@ -729,153 +737,253 @@ def evaluate_path_component(definition: PathDefinition, checked_at: datetime) ->
     )
 
 
-def inspect_jdownloader_user_service() -> HealthDependencyCheck:
-    unit_file = Path(JDOWNLOADER_USER_UNIT)
-    enabled_link = Path(JDOWNLOADER_USER_UNIT_LINK)
-    try:
-        if not unit_file.is_file():
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.UNKNOWN,
-                message="Alex user service file is not present",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="user_systemd_unit",
-                observed="missing",
-            )
-        if not enabled_link.exists():
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.DEGRADED,
-                message="Alex user service is installed but not enabled for graphical session",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="enabled_user_systemd_unit",
-                observed="installed_not_enabled",
-            )
-    except Exception as exc:
-        return HealthDependencyCheck(
-            id="jdownloader-user-service",
-            name="JDownloader User Service",
-            kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-            status=HealthStatus.UNKNOWN,
-            message=f"Alex user service inspection unavailable: {type(exc).__name__}",
-            path=JDOWNLOADER_USER_UNIT,
-            expected="user_systemd_unit",
-            observed="unknown",
-        )
+def _jdownloader_user_runtime(username: str = JDOWNLOADER_USER) -> JDownloaderUserRuntime:
+    user = pwd.getpwnam(username)
+    home = Path(user.pw_dir)
+    runtime_dir = Path("/run/user") / str(user.pw_uid)
+    return JDownloaderUserRuntime(
+        username=username,
+        uid=user.pw_uid,
+        home=home,
+        runtime_dir=runtime_dir,
+        bus_path=runtime_dir / "bus",
+        unit_file=home / ".config/systemd/user/jdownloader.service",
+        enabled_link=(
+            home
+            / ".config/systemd/user/graphical-session.target.wants/"
+            / "jdownloader.service"
+        ),
+    )
 
-    if os.environ.get("XDG_RUNTIME_DIR") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        command = [
-            SYSTEMCTL,
-            "--user",
-            "show",
-            JDOWNLOADER_SYSTEMD_UNIT_NAME,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=Result",
-            "--no-pager",
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=SYSTEMD_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.UNKNOWN,
-                message=f"Alex user service state unavailable: {type(exc).__name__}",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="running_user_systemd_unit",
-                observed="unknown",
-            )
 
-        values: dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key] = value
-
-        load_state = values.get("LoadState")
-        active_state = values.get("ActiveState")
-        sub_state = values.get("SubState")
-        service_result = values.get("Result")
-
-        if result.returncode != 0 or load_state in {"", "not-found", "error"}:
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.UNKNOWN,
-                message="Alex user service state is unavailable",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="running_user_systemd_unit",
-                observed="unknown",
-            )
-        if active_state == "failed" or service_result not in {None, "", "success"}:
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.UNHEALTHY,
-                message="Alex user service is failed or last invocation failed",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="running_user_systemd_unit",
-                observed=f"{active_state}/{sub_state}",
-            )
-        if active_state == "active":
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.HEALTHY,
-                message="Alex user service is active",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="running_user_systemd_unit",
-                observed=f"{active_state}/{sub_state}",
-            )
-        if active_state == "inactive":
-            return HealthDependencyCheck(
-                id="jdownloader-user-service",
-                name="JDownloader User Service",
-                kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-                status=HealthStatus.DEGRADED,
-                message="Alex user service is installed but stopped",
-                path=JDOWNLOADER_USER_UNIT,
-                expected="running_user_systemd_unit",
-                observed=f"{active_state}/{sub_state}",
-            )
-
-        return HealthDependencyCheck(
-            id="jdownloader-user-service",
-            name="JDownloader User Service",
-            kind=HealthComponentKind.USER_SYSTEMD_UNIT,
-            status=HealthStatus.UNKNOWN,
-            message="Alex user service state is not recognized",
-            path=JDOWNLOADER_USER_UNIT,
-            expected="running_user_systemd_unit",
-            observed=f"{active_state}/{sub_state}",
-        )
-
+def _jdownloader_user_service_check(
+    *,
+    status: HealthStatus,
+    message: str,
+    path: str | None,
+    expected: str,
+    observed: str,
+) -> HealthDependencyCheck:
     return HealthDependencyCheck(
         id="jdownloader-user-service",
         name="JDownloader User Service",
         kind=HealthComponentKind.USER_SYSTEMD_UNIT,
+        status=status,
+        message=message,
+        path=path,
+        expected=expected,
+        observed=observed,
+    )
+
+
+def _jdownloader_session_unavailable(
+    runtime: JDownloaderUserRuntime,
+    observed: str,
+) -> HealthDependencyCheck:
+    display_name = runtime.username.capitalize()
+    return _jdownloader_user_service_check(
+        status=HealthStatus.DEGRADED,
+        message=(
+            f"{display_name} user session/systemd manager is not active; "
+            "JDownloader is unavailable until the graphical session is started"
+        ),
+        path=str(runtime.unit_file),
+        expected="active_user_session_systemd_manager",
+        observed=observed,
+    )
+
+
+def _jdownloader_observed_state(values: dict[str, str]) -> str:
+    return (
+        f"load={values.get('LoadState') or 'unknown'};"
+        f"active={values.get('ActiveState') or 'unknown'};"
+        f"sub={values.get('SubState') or 'unknown'};"
+        f"result={values.get('Result') or 'unknown'};"
+        f"unit_file={values.get('UnitFileState') or 'unknown'}"
+    )
+
+
+def _user_manager_unavailable_error(stderr: str) -> bool:
+    lower = stderr.lower()
+    return (
+        "failed to connect to bus" in lower
+        or "no medium found" in lower
+        or "connection refused" in lower
+    ) and "permission denied" not in lower
+
+
+def _jdownloader_query_environment(runtime: JDownloaderUserRuntime) -> dict[str, str]:
+    return {
+        "HOME": str(runtime.home),
+        "USER": runtime.username,
+        "LOGNAME": runtime.username,
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": str(runtime.runtime_dir),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime.bus_path}",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def inspect_jdownloader_user_service() -> HealthDependencyCheck:
+    try:
+        runtime = _jdownloader_user_runtime()
+    except KeyError:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message=f"{JDOWNLOADER_USER.capitalize()} user service owner is not present",
+            path=None,
+            expected="configured_user",
+            observed="missing_user",
+        )
+    except Exception as exc:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message=f"Alex user service owner lookup unavailable: {type(exc).__name__}",
+            path=None,
+            expected="configured_user",
+            observed="unknown",
+        )
+
+    try:
+        if not runtime.unit_file.is_file():
+            return _jdownloader_user_service_check(
+                status=HealthStatus.UNKNOWN,
+                message="Alex user service file is not present",
+                path=str(runtime.unit_file),
+                expected="user_systemd_unit",
+                observed="missing",
+            )
+        if not runtime.enabled_link.exists():
+            return _jdownloader_user_service_check(
+                status=HealthStatus.DEGRADED,
+                message="Alex user service is installed but not enabled for graphical session",
+                path=str(runtime.unit_file),
+                expected="enabled_user_systemd_unit",
+                observed="installed_not_enabled",
+            )
+        if os.geteuid() != runtime.uid:
+            return _jdownloader_user_service_check(
+                status=HealthStatus.UNKNOWN,
+                message="Alex user service state requires collection under the Alex user identity",
+                path=str(runtime.unit_file),
+                expected=f"user_identity:{runtime.uid}",
+                observed=f"user_identity:{os.geteuid()}",
+            )
+        if not runtime.runtime_dir.exists() or not runtime.runtime_dir.is_dir():
+            return _jdownloader_session_unavailable(runtime, "runtime_dir_unavailable")
+        if not runtime.bus_path.exists() or not runtime.bus_path.is_socket():
+            return _jdownloader_session_unavailable(runtime, "user_bus_unavailable")
+    except Exception as exc:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message=f"Alex user service inspection unavailable: {type(exc).__name__}",
+            path=str(runtime.unit_file),
+            expected="user_systemd_unit",
+            observed="unknown",
+        )
+
+    command = [
+        SYSTEMCTL,
+        "--user",
+        "show",
+        JDOWNLOADER_SYSTEMD_UNIT_NAME,
+        *(f"--property={prop}" for prop in SYSTEMD_PROPERTIES),
+        "--no-pager",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMD_TIMEOUT_SECONDS,
+            env=_jdownloader_query_environment(runtime),
+        )
+    except Exception as exc:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message=f"Alex user service state unavailable: {type(exc).__name__}",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed="unknown",
+        )
+
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+
+    load_state = values.get("LoadState")
+    active_state = values.get("ActiveState")
+    sub_state = values.get("SubState")
+    service_result = values.get("Result")
+    systemd_status = SystemdUnitStatus(
+        unit=JDOWNLOADER_SYSTEMD_UNIT_NAME,
+        available=(
+            result.returncode == 0 and load_state not in {"", "not-found", "error"}
+        ),
+        properties=values,
+    )
+    observed = _jdownloader_observed_state(values)
+
+    if result.returncode != 0:
+        if _user_manager_unavailable_error(result.stderr):
+            return _jdownloader_session_unavailable(runtime, "user_manager_unavailable")
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message="Alex user service state is unavailable",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed="unknown",
+        )
+
+    if not systemd_status.available:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNKNOWN,
+            message="Alex user service state is unavailable",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed=observed,
+        )
+
+    if (
+        active_state == "failed"
+        or service_result not in {None, "", "success"}
+        or _is_failed_exit(systemd_status)
+    ):
+        return _jdownloader_user_service_check(
+            status=HealthStatus.UNHEALTHY,
+            message="Alex user service is failed or last invocation failed",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed=observed,
+        )
+    if active_state == "active" and sub_state == "running":
+        return _jdownloader_user_service_check(
+            status=HealthStatus.HEALTHY,
+            message="Alex user service is active and running",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed=observed,
+        )
+    if active_state in {"active", "inactive"}:
+        return _jdownloader_user_service_check(
+            status=HealthStatus.DEGRADED,
+            message="Alex user systemd manager is observable but JDownloader is not running",
+            path=str(runtime.unit_file),
+            expected="running_user_systemd_unit",
+            observed=observed,
+        )
+
+    return _jdownloader_user_service_check(
         status=HealthStatus.UNKNOWN,
-        message="Alex user systemd manager state is not safely observable from the backend runtime",
-        path=JDOWNLOADER_USER_UNIT,
+        message="Alex user service state is not recognized",
+        path=str(runtime.unit_file),
         expected="running_user_systemd_unit",
-        observed="unobservable",
+        observed=observed,
     )
 
 
