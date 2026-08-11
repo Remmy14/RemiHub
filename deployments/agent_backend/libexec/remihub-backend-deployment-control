@@ -526,6 +526,61 @@ def verify_runtime(environment: Environment, args: list[str]) -> None:
     print(expected)
 
 
+def observe_runtime(environment: Environment, args: list[str]) -> None:
+    if args:
+        fail("observe-runtime accepts no additional arguments")
+    if environment is not ENVIRONMENTS["qa"]:
+        fail("observe-runtime is QA-only")
+    branch_result = run(
+        [
+            GIT,
+            "-C",
+            str(environment.runtime),
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ],
+        user=environment.runtime_user,
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    payload = {
+        "schema_version": 1,
+        "runtime": "qa",
+        "expected_branch": environment.runtime_branch,
+        "branch": branch,
+        "commit": None,
+        "status": "unknown",
+        "reason": None,
+    }
+    if branch is None:
+        payload["reason"] = "branch_unavailable"
+    elif branch != environment.runtime_branch:
+        payload["status"] = "branch_mismatch"
+        payload["reason"] = "branch_mismatch"
+    else:
+        commit_result = run(
+            [
+                GIT,
+                "-C",
+                str(environment.runtime),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ],
+            user=environment.runtime_user,
+            check=False,
+        )
+        observed = commit_result.stdout.strip()
+        if commit_result.returncode == 0 and COMMIT_RE.fullmatch(observed):
+            payload["status"] = "ok"
+            payload["commit"] = observed
+        else:
+            payload["reason"] = "commit_unavailable"
+    print(json.dumps(payload, sort_keys=True))
+
+
 def ensure_runtime_tag(environment: Environment, rollback_ref: str, base: str) -> None:
     existing = run(
         [GIT, "-C", str(environment.runtime), "rev-parse", "--verify", "--quiet", f"refs/tags/{rollback_ref}^{{commit}}"],
@@ -1018,6 +1073,9 @@ def main() -> None:
         return
     if action == "verify-runtime":
         verify_runtime(environment, args)
+        return
+    if action == "observe-runtime":
+        observe_runtime(environment, args)
         return
     if action == "promote":
         promote(environment, args)

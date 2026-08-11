@@ -24,13 +24,12 @@ SYSTEMD_TIMEOUT_SECONDS = 3
 SNAPSHOT_SINGLETON_ID = "current"
 SNAPSHOT_FRESHNESS_COMPONENT_ID = "health-collector-snapshot-freshness"
 SNAPSHOT_STALE_AFTER_SECONDS = 90
-GIT = "/usr/bin/git"
-GIT_TIMEOUT_SECONDS = 5
 COMMIT_HASH_LENGTH = 40
 DEPLOYMENT_BASELINE_PARITY_COMPONENT_ID = "deployment-baseline-parity"
-GITHUB_SYNC_LATEST_RESULT = Path(
-    "/var/lib/remihub-agent/github-sync/backend/latest-result.json"
+DEPLOYMENT_BASELINE_OBSERVATION_PATH = Path(
+    "/var/lib/remihub-agent/health-observations/backend/deployment-baseline.json"
 )
+DEPLOYMENT_BASELINE_OBSERVATION_STALE_AFTER_SECONDS = 180
 SYSTEMD_PROPERTIES = (
     "LoadState",
     "ActiveState",
@@ -76,17 +75,6 @@ class PathDefinition:
     path: str
     kind: HealthComponentKind
     expected_type: str = "directory"
-    required: bool = True
-
-
-@dataclass(frozen=True)
-class DeploymentBaselineDefinition:
-    id: str
-    name: str
-    path: Path
-    ref: str
-    worktree: bool
-    branch: str | None = None
     required: bool = True
 
 
@@ -169,6 +157,13 @@ UNIT_DEFINITIONS = (
         ExpectedMode.ARMED_TIMER_OR_PATH,
     ),
     UnitDefinition(
+        "remihub-agent-deployment-baseline-observer-timer",
+        "Deployment Baseline Observer Timer",
+        HealthComponentGroup.AGENT,
+        "remihub-agent-deployment-baseline-observer.timer",
+        ExpectedMode.ARMED_TIMER_OR_PATH,
+    ),
+    UnitDefinition(
         "remihub-agent-android-deployment",
         "Android Deployment Worker",
         HealthComponentGroup.AGENT,
@@ -229,6 +224,13 @@ UNIT_DEFINITIONS = (
         "Health Collector",
         HealthComponentGroup.CORE,
         "remihub-health-collector.service",
+        ExpectedMode.ON_DEMAND,
+    ),
+    UnitDefinition(
+        "remihub-agent-deployment-baseline-observer",
+        "Deployment Baseline Observer",
+        HealthComponentGroup.AGENT,
+        "remihub-agent-deployment-baseline-observer.service",
         ExpectedMode.ON_DEMAND,
     ),
     UnitDefinition(
@@ -357,60 +359,14 @@ JDOWNLOADER_PATHS = (
 JDOWNLOADER_USER = "alex"
 JDOWNLOADER_SYSTEMD_UNIT_NAME = "jdownloader.service"
 
-DEPLOYMENT_BASELINES = (
-    DeploymentBaselineDefinition(
-        id="canonical",
-        name="Canonical",
-        path=Path("/opt/remihub"),
-        ref="HEAD",
-        worktree=True,
-        branch="main",
-    ),
-    DeploymentBaselineDefinition(
-        id="planning",
-        name="Planning",
-        path=Path("/opt/remihub-agent/repositories/remihub-planning"),
-        ref="HEAD",
-        worktree=True,
-        branch="main",
-    ),
-    DeploymentBaselineDefinition(
-        id="implementation-main",
-        name="Implementation Main",
-        path=Path("/opt/remihub-agent/repositories/remihub-implementation.git"),
-        ref="refs/heads/main",
-        worktree=False,
-    ),
-    DeploymentBaselineDefinition(
-        id="qa-source",
-        name="QA Source",
-        path=Path("/opt/remihub-agent/deployment/qa/repository.git"),
-        ref="refs/heads/qa-main",
-        worktree=False,
-    ),
-    DeploymentBaselineDefinition(
-        id="qa-runtime",
-        name="QA Runtime",
-        path=Path("/opt/remihub-agent/deployment/qa/application"),
-        ref="HEAD",
-        worktree=True,
-        branch="qa-runtime",
-    ),
-    DeploymentBaselineDefinition(
-        id="production-source",
-        name="Production Source",
-        path=Path("/opt/remihub-agent/deployment/production/repository.git"),
-        ref="refs/heads/production-main",
-        worktree=False,
-    ),
-    DeploymentBaselineDefinition(
-        id="production-runtime",
-        name="Production Runtime",
-        path=Path("/opt/remihub"),
-        ref="HEAD",
-        worktree=True,
-        branch="main",
-    ),
+DEPLOYMENT_BASELINE_OBSERVATION_ROWS = (
+    ("canonical", "Canonical / Production Runtime", "HEAD", "main"),
+    ("planning", "Planning", "HEAD", "main"),
+    ("implementation-main", "Implementation Main", "refs/heads/main", None),
+    ("qa-source", "QA Source", "refs/heads/qa-main", None),
+    ("qa-runtime", "QA Runtime", "HEAD", "qa-runtime"),
+    ("production-source", "Production Source", "refs/heads/production-main", None),
+    ("github-main", "GitHub Main", "refs/heads/main", None),
 )
 
 
@@ -819,39 +775,6 @@ def evaluate_path_component(definition: PathDefinition, checked_at: datetime) ->
     )
 
 
-def _git_environment() -> dict[str, str]:
-    return {
-        "HOME": "/nonexistent",
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_OPTIONAL_LOCKS": "0",
-    }
-
-
-def _run_git_identity_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=GIT_TIMEOUT_SECONDS,
-        env=_git_environment(),
-    )
-
-
-def _one_line(value: str) -> str | None:
-    lines = [line.strip() for line in value.splitlines() if line.strip()]
-    if len(lines) != 1:
-        return None
-    return lines[0]
-
-
 def _baseline_check(
     *,
     id: str,
@@ -874,139 +797,147 @@ def _baseline_check(
     )
 
 
-def _resolve_baseline_commit(
-    definition: DeploymentBaselineDefinition,
-) -> HealthDependencyCheck:
-    path = str(definition.path)
-    try:
-        if definition.worktree:
-            if definition.branch is not None:
-                branch_result = _run_git_identity_command(
-                    [
-                        GIT,
-                        "-c",
-                        f"safe.directory={definition.path}",
-                        "-C",
-                        path,
-                        "symbolic-ref",
-                        "--quiet",
-                        "--short",
-                        "HEAD",
-                    ]
-                )
-                branch = _one_line(branch_result.stdout)
-                if branch_result.returncode != 0 or branch != definition.branch:
-                    return _baseline_check(
-                        id=definition.id,
-                        name=definition.name,
-                        status=HealthStatus.UNKNOWN,
-                        message=f"{definition.name} is not on {definition.branch}",
-                        path=path,
-                        expected=definition.branch,
-                        observed=branch or "unknown",
-                    )
-            command = [
-                GIT,
-                "-c",
-                f"safe.directory={definition.path}",
-                "-C",
-                path,
-                "rev-parse",
-                "--verify",
-                f"{definition.ref}^{{commit}}",
-            ]
-        else:
-            command = [
-                GIT,
-                f"--git-dir={definition.path}",
-                "rev-parse",
-                "--verify",
-                f"{definition.ref}^{{commit}}",
-            ]
-        result = _run_git_identity_command(command)
-        commit = _one_line(result.stdout)
-        if result.returncode != 0 or not _is_commit_hash(commit):
-            return _baseline_check(
-                id=definition.id,
-                name=definition.name,
-                status=HealthStatus.UNKNOWN,
-                message=f"{definition.name} commit could not be resolved",
-                path=path,
-                expected=definition.ref,
-                observed="unknown",
-            )
-        return _baseline_check(
-            id=definition.id,
-            name=definition.name,
-            status=HealthStatus.HEALTHY,
-            message=f"{definition.name} commit is observable",
-            path=path,
-            expected=definition.ref,
-            observed=commit,
-        )
-    except Exception as exc:
-        return _baseline_check(
-            id=definition.id,
-            name=definition.name,
+def _deployment_baseline_empty_checks(message: str) -> list[HealthDependencyCheck]:
+    return [
+        _baseline_check(
+            id=id,
+            name=name,
             status=HealthStatus.UNKNOWN,
-            message=f"{definition.name} inspection unavailable: {type(exc).__name__}",
-            path=path,
-            expected=definition.ref,
-            observed="unknown",
-        )
-
-
-def _github_baseline_check() -> HealthDependencyCheck:
-    try:
-        if not GITHUB_SYNC_LATEST_RESULT.is_file():
-            return _baseline_check(
-                id="github-main",
-                name="GitHub Main",
-                status=HealthStatus.UNKNOWN,
-                message="GitHub main has no persisted sync observation",
-                path=str(GITHUB_SYNC_LATEST_RESULT),
-                expected="refs/heads/main",
-                observed="unknown",
-            )
-        payload = json.loads(GITHUB_SYNC_LATEST_RESULT.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("result is not an object")
-        observed = payload.get("remote_after") or payload.get("remote_before")
-        if not isinstance(observed, str) or not _is_commit_hash(observed):
-            return _baseline_check(
-                id="github-main",
-                name="GitHub Main",
-                status=HealthStatus.UNKNOWN,
-                message="GitHub main persisted observation has no commit",
-                path=str(GITHUB_SYNC_LATEST_RESULT),
-                expected="refs/heads/main",
-                observed="unknown",
-            )
-        status = HealthStatus.HEALTHY if payload.get("status") == "verified" else HealthStatus.DEGRADED
-        message = (
-            "GitHub main is observable from verified sync evidence"
-            if status == HealthStatus.HEALTHY
-            else "GitHub main is observable from incomplete sync evidence"
-        )
-        return _baseline_check(
-            id="github-main",
-            name="GitHub Main",
-            status=status,
             message=message,
-            path=str(GITHUB_SYNC_LATEST_RESULT),
-            expected="refs/heads/main",
-            observed=observed,
-        )
-    except Exception as exc:
-        return _baseline_check(
-            id="github-main",
-            name="GitHub Main",
-            status=HealthStatus.UNKNOWN,
-            message=f"GitHub main persisted observation is unreadable: {type(exc).__name__}",
-            path=str(GITHUB_SYNC_LATEST_RESULT),
-            expected="refs/heads/main",
+            path=str(DEPLOYMENT_BASELINE_OBSERVATION_PATH),
+            expected=branch or ref,
             observed="unknown",
         )
+        for id, name, ref, branch in DEPLOYMENT_BASELINE_OBSERVATION_ROWS
+    ]
+
+
+def _parse_observation_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _observation_row_status(row: dict, name: str) -> tuple[HealthStatus, str, str | None]:
+    status = row.get("status")
+    reason = row.get("reason")
+    if not isinstance(reason, str) or not reason:
+        reason = None
+    if status in {"ok", "verified"}:
+        return HealthStatus.HEALTHY, f"{name} commit is observable", None
+    if status == "branch_mismatch":
+        expected = row.get("expected_branch") or row.get("branch")
+        observed = row.get("observed_branch")
+        if isinstance(expected, str) and isinstance(observed, str):
+            return (
+                HealthStatus.DEGRADED,
+                f"{name} is on {observed}, expected {expected}",
+                observed,
+            )
+        return HealthStatus.DEGRADED, f"{name} branch does not match the expected branch", None
+    if status in {"mismatch", "degraded", "unverified"}:
+        return HealthStatus.DEGRADED, reason or f"{name} observation is degraded", None
+    return HealthStatus.UNKNOWN, reason or f"{name} could not be inspected by the protected observer", None
+
+
+def _deployment_baseline_checks_from_observation(
+    checked_at: datetime,
+) -> tuple[list[HealthDependencyCheck], str | None]:
+    try:
+        if not DEPLOYMENT_BASELINE_OBSERVATION_PATH.is_file():
+            return (
+                _deployment_baseline_empty_checks(
+                    "Protected baseline observation is unavailable"
+                ),
+                "Protected baseline observation is unavailable.",
+            )
+        payload = json.loads(
+            DEPLOYMENT_BASELINE_OBSERVATION_PATH.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return (
+            _deployment_baseline_empty_checks(
+                "Protected baseline observation is unreadable"
+            ),
+            "Protected baseline observation is unreadable.",
+        )
+
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return (
+            _deployment_baseline_empty_checks(
+                "Protected baseline observation is invalid"
+            ),
+            "Protected baseline observation is invalid.",
+        )
+
+    observed_at = _parse_observation_timestamp(payload.get("observed_at"))
+    if observed_at is None:
+        return (
+            _deployment_baseline_empty_checks(
+                "Protected baseline observation timestamp is invalid"
+            ),
+            "Protected baseline observation timestamp is invalid.",
+        )
+    reference_time = checked_at if checked_at.tzinfo else checked_at.replace(tzinfo=timezone.utc)
+    if reference_time - observed_at > timedelta(
+        seconds=DEPLOYMENT_BASELINE_OBSERVATION_STALE_AFTER_SECONDS
+    ):
+        return (
+            _deployment_baseline_empty_checks(
+                "Protected baseline observation is stale"
+            ),
+            "Protected baseline observation is stale.",
+        )
+
+    rows = payload.get("observations")
+    if not isinstance(rows, list):
+        return (
+            _deployment_baseline_empty_checks(
+                "Protected baseline observation rows are invalid"
+            ),
+            "Protected baseline observation rows are invalid.",
+        )
+    by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
+
+    checks: list[HealthDependencyCheck] = []
+    for id, name, ref, branch in DEPLOYMENT_BASELINE_OBSERVATION_ROWS:
+        row = by_id.get(id)
+        if not isinstance(row, dict):
+            checks.append(
+                _baseline_check(
+                    id=id,
+                    name=name,
+                    status=HealthStatus.UNKNOWN,
+                    message=f"{name} is missing from the protected observation",
+                    path=str(DEPLOYMENT_BASELINE_OBSERVATION_PATH),
+                    expected=branch or ref,
+                    observed="unknown",
+                )
+            )
+            continue
+        commit = row.get("commit")
+        status, message, fallback_observed = _observation_row_status(row, name)
+        if status != HealthStatus.UNKNOWN and not _is_commit_hash(commit):
+            status = HealthStatus.UNKNOWN
+            message = f"{name} protected observation has no commit"
+        checks.append(
+            _baseline_check(
+                id=id,
+                name=name,
+                status=status,
+                message=message,
+                path=str(DEPLOYMENT_BASELINE_OBSERVATION_PATH),
+                expected=branch or ref,
+                observed=commit if _is_commit_hash(commit) else fallback_observed or "unknown",
+            )
+        )
+    return checks, None
 
 
 def _backend_deployment_is_active() -> bool:
@@ -1036,16 +967,24 @@ def _first_mismatch_message(mismatches: list[HealthDependencyCheck]) -> str:
         return "GitHub main does not match the deployed backend baseline."
     if first.id == "deployment-baseline-qa-runtime":
         return "QA runtime does not match the settled backend baseline."
-    if first.id == "deployment-baseline-production-runtime":
-        return "Production runtime does not match the settled backend baseline."
     return f"{first.name} does not match the settled backend baseline."
 
 
 def evaluate_deployment_baseline_parity_component(
     checked_at: datetime,
 ) -> HealthComponent:
-    checks = [_resolve_baseline_commit(definition) for definition in DEPLOYMENT_BASELINES]
-    checks.append(_github_baseline_check())
+    checks, observation_error = _deployment_baseline_checks_from_observation(checked_at)
+    if observation_error is not None:
+        return _component(
+            id=DEPLOYMENT_BASELINE_PARITY_COMPONENT_ID,
+            name="Deployment Baseline Parity",
+            group=HealthComponentGroup.CORE,
+            kind=HealthComponentKind.COMPOSITE,
+            status=HealthStatus.UNKNOWN,
+            message=observation_error,
+            checked_at=checked_at,
+            dependencies=checks,
+        )
 
     unknown = [check for check in checks if check.status == HealthStatus.UNKNOWN]
     baseline = next(
@@ -1064,7 +1003,7 @@ def evaluate_deployment_baseline_parity_component(
             group=HealthComponentGroup.CORE,
             kind=HealthComponentKind.COMPOSITE,
             status=HealthStatus.UNKNOWN,
-            message="Canonical backend baseline could not be inspected.",
+            message="Canonical / Production Runtime backend baseline could not be inspected.",
             checked_at=checked_at,
             dependencies=checks,
         )
@@ -1083,7 +1022,16 @@ def evaluate_deployment_baseline_parity_component(
     normalized: list[HealthDependencyCheck] = []
     mismatches: list[HealthDependencyCheck] = []
     for check in checks:
-        if check.observed == baseline:
+        if check.status == HealthStatus.DEGRADED:
+            mismatch = check.model_copy(
+                update={
+                    "status": HealthStatus.DEGRADED,
+                    "expected": baseline if _is_commit_hash(check.observed) else check.expected,
+                }
+            )
+            normalized.append(mismatch)
+            mismatches.append(mismatch)
+        elif check.observed == baseline:
             normalized.append(
                 check.model_copy(
                     update={

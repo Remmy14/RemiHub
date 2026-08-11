@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Fixed protected observer for backend deployment baseline health."""
+from __future__ import annotations
+
+import grp
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+
+VERSION = "1.0.0"
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+GIT = "/usr/bin/git"
+RUNUSER = "/usr/sbin/runuser"
+DEPLOYMENT_CONTROL = "/usr/local/libexec/remihub-backend-deployment-control"
+OUTPUT = Path("/var/lib/remihub-agent/health-observations/backend/deployment-baseline.json")
+GITHUB_SYNC_LATEST_RESULT = Path("/var/lib/remihub-agent/github-sync/backend/latest-result.json")
+
+
+@dataclass(frozen=True)
+class GitSurface:
+    id: str
+    name: str
+    repo: Path
+    ref: str
+    user: str
+    worktree: bool
+    branch: str | None = None
+
+
+GIT_SURFACES = (
+    GitSurface(
+        id="canonical",
+        name="Canonical / Production Runtime",
+        repo=Path("/opt/remihub"),
+        ref="HEAD",
+        user="alex",
+        worktree=True,
+        branch="main",
+    ),
+    GitSurface(
+        id="planning",
+        name="Planning",
+        repo=Path("/opt/remihub-agent/repositories/remihub-planning"),
+        ref="HEAD",
+        user="alex",
+        worktree=True,
+        branch="main",
+    ),
+    GitSurface(
+        id="implementation-main",
+        name="Implementation Main",
+        repo=Path("/opt/remihub-agent/repositories/remihub-implementation.git"),
+        ref="refs/heads/main",
+        user="remihub-agent",
+        worktree=False,
+    ),
+    GitSurface(
+        id="qa-source",
+        name="QA Source",
+        repo=Path("/opt/remihub-agent/deployment/qa/repository.git"),
+        ref="refs/heads/qa-main",
+        user="remihub-deployer",
+        worktree=False,
+    ),
+    GitSurface(
+        id="production-source",
+        name="Production Source",
+        repo=Path("/opt/remihub-agent/deployment/production/repository.git"),
+        ref="refs/heads/production-main",
+        user="remihub-deployer",
+        worktree=False,
+    ),
+)
+
+
+class ObservationFailure(RuntimeError):
+    pass
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def git_environment(user: str) -> dict[str, str]:
+    return {
+        "HOME": "/root" if user == "root" else f"/home/{user}",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+
+
+def run(command: Sequence[str], *, user: str) -> subprocess.CompletedProcess[str]:
+    actual = list(command)
+    if user != "root":
+        actual = [RUNUSER, "--user", user, "--", *actual]
+    return subprocess.run(
+        actual,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        env=git_environment(user),
+    )
+
+
+def one_line(result: subprocess.CompletedProcess[str]) -> str | None:
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    return lines[0]
+
+
+def commit(value: str | None) -> str | None:
+    if isinstance(value, str) and HEX40.fullmatch(value):
+        return value
+    return None
+
+
+def branch_command(surface: GitSurface) -> list[str]:
+    return [
+        GIT,
+        "-c",
+        f"safe.directory={surface.repo}",
+        "-C",
+        str(surface.repo),
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    ]
+
+
+def commit_command(surface: GitSurface) -> list[str]:
+    if surface.worktree:
+        return [
+            GIT,
+            "-c",
+            f"safe.directory={surface.repo}",
+            "-C",
+            str(surface.repo),
+            "rev-parse",
+            "--verify",
+            f"{surface.ref}^{{commit}}",
+        ]
+    return [
+        GIT,
+        f"--git-dir={surface.repo}",
+        "rev-parse",
+        "--verify",
+        f"{surface.ref}^{{commit}}",
+    ]
+
+
+def observe_git_surface(surface: GitSurface) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": surface.id,
+        "name": surface.name,
+        "ref": surface.ref,
+        "expected_branch": surface.branch,
+        "status": "unknown",
+        "reason": None,
+        "commit": None,
+    }
+    try:
+        if surface.branch is not None:
+            branch_result = run(branch_command(surface), user=surface.user)
+            observed_branch = one_line(branch_result)
+            row["observed_branch"] = observed_branch
+            if branch_result.returncode != 0 or observed_branch is None:
+                row["reason"] = "branch_unavailable"
+                return row
+            if observed_branch != surface.branch:
+                row["status"] = "branch_mismatch"
+                row["reason"] = "branch_mismatch"
+                return row
+        result = run(commit_command(surface), user=surface.user)
+        observed = commit(one_line(result))
+        if result.returncode != 0 or observed is None:
+            row["reason"] = "commit_unavailable"
+            return row
+        row["status"] = "ok"
+        row["commit"] = observed
+        return row
+    except Exception as exc:
+        row["reason"] = f"inspection_unavailable:{type(exc).__name__}"
+        return row
+
+
+def observe_qa_runtime() -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "qa-runtime",
+        "name": "QA Runtime",
+        "ref": "HEAD",
+        "expected_branch": "qa-runtime",
+        "status": "unknown",
+        "reason": None,
+        "commit": None,
+    }
+    try:
+        result = run([DEPLOYMENT_CONTROL, "observe-runtime", "qa"], user="root")
+        if result.returncode != 0:
+            row["reason"] = "runtime_boundary_unavailable"
+            return row
+        payload = json.loads(result.stdout)
+    except Exception as exc:
+        row["reason"] = f"runtime_boundary_unavailable:{type(exc).__name__}"
+        return row
+    if not isinstance(payload, dict):
+        row["reason"] = "runtime_boundary_invalid"
+        return row
+    row["observed_branch"] = payload.get("branch")
+    observed = commit(payload.get("commit"))
+    if payload.get("status") == "branch_mismatch":
+        row["status"] = "branch_mismatch"
+        row["reason"] = "branch_mismatch"
+        return row
+    if payload.get("status") != "ok" or observed is None:
+        row["reason"] = "commit_unavailable"
+        return row
+    row["status"] = "ok"
+    row["commit"] = observed
+    return row
+
+
+def observe_github_main() -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "github-main",
+        "name": "GitHub Main",
+        "ref": "refs/heads/main",
+        "expected_branch": None,
+        "sync_status": None,
+        "status": "unknown",
+        "reason": None,
+        "commit": None,
+    }
+    try:
+        if not GITHUB_SYNC_LATEST_RESULT.is_file() or GITHUB_SYNC_LATEST_RESULT.is_symlink():
+            row["reason"] = "github_sync_result_unavailable"
+            return row
+        payload = json.loads(GITHUB_SYNC_LATEST_RESULT.read_text(encoding="utf-8"))
+    except Exception as exc:
+        row["reason"] = f"github_sync_result_unreadable:{type(exc).__name__}"
+        return row
+    if not isinstance(payload, dict):
+        row["reason"] = "github_sync_result_invalid"
+        return row
+    observed = commit(payload.get("remote_after") or payload.get("remote_before"))
+    sync_status = payload.get("status")
+    row["sync_status"] = sync_status if isinstance(sync_status, str) else None
+    if observed is None:
+        row["reason"] = "github_sync_commit_unavailable"
+        return row
+    row["commit"] = observed
+    if sync_status == "verified":
+        row["status"] = "ok"
+    else:
+        row["status"] = "unverified"
+        row["reason"] = "github_sync_not_verified"
+    return row
+
+
+def atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    storage_gid = grp.getgrnam("storage").gr_gid
+    parent_metadata = path.parent.lstat()
+    if not stat.S_ISDIR(parent_metadata.st_mode) or stat.S_ISLNK(parent_metadata.st_mode):
+        raise ObservationFailure("observation directory is not a real directory")
+    parent_mode = stat.S_IMODE(parent_metadata.st_mode)
+    if parent_metadata.st_uid != 0 or parent_metadata.st_gid != storage_gid or parent_mode != 0o750:
+        raise ObservationFailure("observation directory ownership or mode is unsafe")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o640)
+        os.fchown(fd, 0, storage_gid)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def main() -> int:
+    if len(sys.argv) != 1:
+        print("remihub-backend-deployment-baseline-observer: accepts no arguments", file=sys.stderr)
+        return 64
+    if os.geteuid() != 0:
+        print("remihub-backend-deployment-baseline-observer: must run as root", file=sys.stderr)
+        return 64
+
+    observations = [observe_git_surface(surface) for surface in GIT_SURFACES]
+    observations.append(observe_qa_runtime())
+    observations.append(observe_github_main())
+    ordered = {
+        row["id"]: row
+        for row in observations
+    }
+    payload = {
+        "schema_version": 1,
+        "observer_version": VERSION,
+        "repository": "backend",
+        "observed_at": now(),
+        "observations": [
+            ordered[id]
+            for id in (
+                "canonical",
+                "planning",
+                "implementation-main",
+                "qa-source",
+                "qa-runtime",
+                "production-source",
+                "github-main",
+            )
+        ],
+    }
+    try:
+        atomic_json(OUTPUT, payload)
+    except Exception as exc:
+        print(
+            f"remihub-backend-deployment-baseline-observer: write failed: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

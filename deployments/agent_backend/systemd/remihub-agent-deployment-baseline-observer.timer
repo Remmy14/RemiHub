@@ -1,0 +1,12 @@
+[Unit]
+Description=Run RemiHub Backend Deployment Baseline Observer
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=remihub-agent-deployment-baseline-observer.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

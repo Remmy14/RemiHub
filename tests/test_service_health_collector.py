@@ -10,6 +10,7 @@ from backend.models.health_models import (
     HealthStatus,
     ServiceHealthSnapshotResponse,
 )
+from backend.services import service_health_service
 from backend.tasks import service_health_collector
 
 
@@ -68,6 +69,22 @@ class ServiceHealthCollectorTests(unittest.TestCase):
             "systemctl stop",
             "systemctl restart",
             "subprocess",
+        )
+        for fragment in forbidden_fragments:
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, source)
+
+    def test_health_collector_does_not_directly_open_protected_baseline_sources(self):
+        source = Path(service_health_service.__file__).read_text(encoding="utf-8")
+
+        forbidden_fragments = (
+            "/opt/remihub-agent/repositories/remihub-implementation.git",
+            "/opt/remihub-agent/deployment/qa/repository.git",
+            "/opt/remihub-agent/deployment/qa/application",
+            "/var/lib/remihub-agent/github-sync/backend/latest-result.json",
+            "--git-dir",
+            "rev-parse",
+            "symbolic-ref",
         )
         for fragment in forbidden_fragments:
             with self.subTest(fragment=fragment):

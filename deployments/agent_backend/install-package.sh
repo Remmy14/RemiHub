@@ -103,12 +103,16 @@
 
   SYSTEM_PATHS=(
     /usr/local/libexec/remihub-backend-deployment-control
+    /usr/local/libexec/remihub-backend-deployment-baseline-observer
     /usr/local/libexec/remihub-backend-npm-cache-control
     /usr/local/libexec/remihub-backend-validation-sandbox
     /usr/local/libexec/remihub-backend-qa-server
     /usr/local/libexec/remihub-backend-validation-support
     /etc/sudoers.d/remihub-backend-deployment
     /etc/systemd/system/remihub-backend-qa.service
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.service
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.timer
+    /etc/tmpfiles.d/remihub-agent-health-observations.conf
     /etc/systemd/system/remihub-agent-deployment-qa.service
     /etc/systemd/system/remihub-agent-deployment-production.service
     /opt/remihub-agent/deployment/config/qa-worker.ini
@@ -121,6 +125,7 @@
     /opt/remihub-agent/deployment/config/frontend-web-policy.json
     /var/cache/remihub-agent/npm
     /var/lib/remihub-agent/npm-prep
+    /var/lib/remihub-agent/health-observations
   )
 
   CRITICAL_PARENTS=(
@@ -990,9 +995,13 @@ PY
   echo "Isolation probe passed: remihub-qa-app cannot read repository.git"
 
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-deployment-control" /usr/local/libexec/remihub-backend-deployment-control
+  install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-deployment-baseline-observer" /usr/local/libexec/remihub-backend-deployment-baseline-observer
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-npm-cache-control" /usr/local/libexec/remihub-backend-npm-cache-control
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-validation-sandbox" /usr/local/libexec/remihub-backend-validation-sandbox
   install -o root -g root -m 0755 "$ASSETS/libexec/remihub-backend-qa-server" /usr/local/libexec/remihub-backend-qa-server
+  install -o root -g root -m 0644 \
+    "$ASSETS/tmpfiles/remihub-agent-health-observations.conf" \
+    /etc/tmpfiles.d/remihub-agent-health-observations.conf
   rm -rf /usr/local/libexec/remihub-backend-validation-support
   install -d -o root -g root -m 0755 /usr/local/libexec/remihub-backend-validation-support
   install -o root -g root -m 0644 "$ASSETS/validation-support/"* /usr/local/libexec/remihub-backend-validation-support/
@@ -1009,6 +1018,8 @@ PY
       exit 1
     }
   done
+  install -d -o root -g storage -m 0750 /var/lib/remihub-agent/health-observations
+  install -d -o root -g storage -m 0750 /var/lib/remihub-agent/health-observations/backend
 
   rm -rf "$RELEASE"
   install -d -o root -g remihub-agent -m 0750 "$RELEASE"
@@ -1085,6 +1096,12 @@ PY
 
   echo "[6/10] Install static systemd workers and QA runtime"
   install -o root -g root -m 0644 "$ASSETS/systemd/remihub-backend-qa.service" /etc/systemd/system/remihub-backend-qa.service
+  install -o root -g root -m 0644 \
+    "$ASSETS/systemd/remihub-agent-deployment-baseline-observer.service" \
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.service
+  install -o root -g root -m 0644 \
+    "$ASSETS/systemd/remihub-agent-deployment-baseline-observer.timer" \
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.timer
   sed \
     -e "s|@RELEASE@|$RELEASE|g" \
     -e "s|@PG_DUMP@|$PG_DUMP_BINARY|g" \
@@ -1106,8 +1123,11 @@ PY
   systemctl daemon-reload
   systemd-analyze verify \
     /etc/systemd/system/remihub-backend-qa.service \
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.service \
+    /etc/systemd/system/remihub-agent-deployment-baseline-observer.timer \
     /etc/systemd/system/remihub-agent-deployment-qa.service \
     /etc/systemd/system/remihub-agent-deployment-production.service
+  systemctl enable --now remihub-agent-deployment-baseline-observer.timer
 
   echo "[7/10] Run complete QA validation before production promotion"
   "$RELEASE/deployments/agent_backend/qa-verify.sh" \
