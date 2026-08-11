@@ -1,12 +1,20 @@
 import json
 import subprocess
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, patch
 
 from pydantic import ValidationError
 
-from backend.models.health_models import HealthComponent, HealthComponentGroup, HealthComponentKind, HealthStatus, ServiceHealthSnapshotResponse
+from backend.models.health_models import (
+    HealthComponent,
+    HealthComponentGroup,
+    HealthComponentKind,
+    HealthDependencyCheck,
+    HealthStatus,
+    ServiceHealthSnapshotResponse,
+)
 from backend.services import service_health_service as health
 
 
@@ -320,6 +328,54 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
         )
 
         self.assertEqual(status, HealthStatus.IDLE)
+
+    def test_on_demand_oneshot_activating_start_is_healthy(self):
+        status, message = health.evaluate_systemd_status(
+            unit_status(
+                unit="remihub-health-collector.service",
+                active_state="activating",
+                sub_state="start",
+                result="success",
+                exec_main_code="",
+                exec_main_status="",
+                unit_type="oneshot",
+            ),
+            health.ExpectedMode.ON_DEMAND,
+        )
+
+        self.assertEqual(status, HealthStatus.HEALTHY)
+        self.assertNotEqual(message, "On-demand unit state is not recognized")
+
+    def test_health_collector_activating_start_oneshot_is_not_unknown(self):
+        status, message = health.evaluate_systemd_status(
+            unit_status(
+                unit="remihub-health-collector.service",
+                active_state="activating",
+                sub_state="start",
+                result="success",
+                unit_type="oneshot",
+            ),
+            health.ExpectedMode.ON_DEMAND,
+        )
+
+        self.assertEqual(status, HealthStatus.HEALTHY)
+        self.assertNotIn("not recognized", message)
+
+    def test_unrecognized_on_demand_state_remains_unknown(self):
+        status, message = health.evaluate_systemd_status(
+            unit_status(
+                active_state="reloading",
+                sub_state="reload",
+                result="success",
+                exec_main_code="",
+                exec_main_status="",
+                unit_type="oneshot",
+            ),
+            health.ExpectedMode.ON_DEMAND,
+        )
+
+        self.assertEqual(status, HealthStatus.UNKNOWN)
+        self.assertEqual(message, "On-demand unit state is not recognized")
 
     def test_qa_runtime_inactive_success_is_idle(self):
         status, _message = health.evaluate_systemd_status(
@@ -858,6 +914,238 @@ class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
         self.assertEqual(check.observed, "user_manager_unavailable")
 
 
+class ServiceHealthDeploymentBaselineParityTests(unittest.TestCase):
+    BASE = "a" * 40
+    OTHER = "b" * 40
+
+    def check(
+        self,
+        *,
+        id: str,
+        name: str,
+        observed: str | None = None,
+        status: HealthStatus = HealthStatus.HEALTHY,
+        message: str = "ok",
+    ) -> HealthDependencyCheck:
+        return HealthDependencyCheck(
+            id=f"deployment-baseline-{id}",
+            name=name,
+            kind=HealthComponentKind.COMPOSITE,
+            status=status,
+            message=message,
+            expected="ref",
+            observed=observed if observed is not None else self.BASE,
+        )
+
+    def baseline_checks(self, *, qa_runtime: str | None = None) -> list[HealthDependencyCheck]:
+        values = {
+            "canonical": ("Canonical", self.BASE),
+            "planning": ("Planning", self.BASE),
+            "implementation-main": ("Implementation Main", self.BASE),
+            "qa-source": ("QA Source", self.BASE),
+            "qa-runtime": ("QA Runtime", qa_runtime or self.BASE),
+            "production-source": ("Production Source", self.BASE),
+            "production-runtime": ("Production Runtime", self.BASE),
+        }
+        return [
+            self.check(id=id, name=name, observed=observed)
+            for id, (name, observed) in values.items()
+        ]
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=False)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_all_backend_baseline_surfaces_equal_is_healthy(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        resolve_baseline.side_effect = self.baseline_checks()
+        github_check.return_value = self.check(id="github-main", name="GitHub Main")
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.HEALTHY)
+        self.assertEqual(component.message, "Backend deployment baseline identities are converged.")
+        self.assertEqual(len(component.dependencies), len(health.DEPLOYMENT_BASELINES) + 1)
+        self.assertTrue(
+            all(dependency.expected == self.BASE for dependency in component.dependencies)
+        )
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=False)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_one_settled_baseline_differs_is_degraded(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        resolve_baseline.side_effect = self.baseline_checks(qa_runtime=self.OTHER)
+        github_check.return_value = self.check(id="github-main", name="GitHub Main")
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.DEGRADED)
+        self.assertEqual(
+            component.message,
+            "QA runtime does not match the settled backend baseline.",
+        )
+        qa_runtime = next(
+            dependency
+            for dependency in component.dependencies
+            if dependency.id == "deployment-baseline-qa-runtime"
+        )
+        self.assertEqual(qa_runtime.status, HealthStatus.DEGRADED)
+        self.assertEqual(qa_runtime.expected, self.BASE)
+        self.assertEqual(qa_runtime.observed, self.OTHER)
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=False)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_missing_required_baseline_is_unknown_with_named_reason(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        checks = self.baseline_checks()
+        checks[1] = self.check(
+            id="planning",
+            name="Planning",
+            observed="unknown",
+            status=HealthStatus.UNKNOWN,
+            message="Planning commit could not be resolved",
+        )
+        resolve_baseline.side_effect = checks
+        github_check.return_value = self.check(id="github-main", name="GitHub Main")
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.UNKNOWN)
+        self.assertEqual(component.message, "Planning could not be inspected.")
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=False)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_github_behind_settled_local_baseline_is_degraded(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        resolve_baseline.side_effect = self.baseline_checks()
+        github_check.return_value = self.check(
+            id="github-main",
+            name="GitHub Main",
+            observed=self.OTHER,
+        )
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.DEGRADED)
+        self.assertEqual(
+            component.message,
+            "GitHub main does not match the deployed backend baseline.",
+        )
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=True)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_legitimate_staged_transition_reports_in_progress_not_persistent_failure(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        resolve_baseline.side_effect = self.baseline_checks(qa_runtime=self.OTHER)
+        github_check.return_value = self.check(id="github-main", name="GitHub Main")
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.DEGRADED)
+        self.assertEqual(
+            component.message,
+            "Backend deployment is in progress; baseline convergence is still settling.",
+        )
+
+    @patch("backend.services.service_health_service._backend_deployment_is_active", return_value=False)
+    @patch("backend.services.service_health_service._github_baseline_check")
+    @patch("backend.services.service_health_service._resolve_baseline_commit")
+    def test_settled_state_after_deployment_requires_convergence(
+        self,
+        resolve_baseline,
+        github_check,
+        _active,
+    ):
+        resolve_baseline.side_effect = self.baseline_checks(qa_runtime=self.OTHER)
+        github_check.return_value = self.check(id="github-main", name="GitHub Main")
+
+        component = health.evaluate_deployment_baseline_parity_component(
+            datetime.now(timezone.utc)
+        )
+
+        self.assertEqual(component.status, HealthStatus.DEGRADED)
+        self.assertNotIn("in progress", component.message)
+
+    @patch("backend.services.service_health_service.subprocess.run")
+    def test_parity_git_identity_collection_is_read_only(self, run):
+        run.side_effect = [
+            Mock(returncode=0, stdout="main\n", stderr=""),
+            Mock(returncode=0, stdout=f"{self.BASE}\n", stderr=""),
+        ]
+        definition = health.DeploymentBaselineDefinition(
+            id="test",
+            name="Test",
+            path=health.Path("/srv/remihub-test"),
+            ref="HEAD",
+            worktree=True,
+            branch="main",
+        )
+
+        check = health._resolve_baseline_commit(definition)
+
+        self.assertEqual(check.status, HealthStatus.HEALTHY)
+        self.assertEqual(check.observed, self.BASE)
+        for call in run.call_args_list:
+            command = call.args[0]
+            for forbidden in ("fetch", "push", "reset", "update-ref", "start"):
+                self.assertNotIn(forbidden, command)
+            self.assertEqual(call.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertFalse(call.kwargs["check"])
+
+    def test_github_observation_uses_persisted_sync_result_without_network_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = health.Path(directory) / "latest-result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "status": "verified",
+                        "remote_after": self.BASE,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(health, "GITHUB_SYNC_LATEST_RESULT", result_path):
+                with patch("backend.services.service_health_service.subprocess.run") as run:
+                    check = health._github_baseline_check()
+
+        self.assertEqual(check.status, HealthStatus.HEALTHY)
+        self.assertEqual(check.observed, self.BASE)
+        run.assert_not_called()
+
+
 class ServiceHealthAggregationAndSafetyTests(unittest.TestCase):
     def component(self, status: HealthStatus, required: bool = True) -> HealthComponent:
         return HealthComponent(
@@ -912,12 +1200,14 @@ class ServiceHealthAggregationAndSafetyTests(unittest.TestCase):
         self.assertEqual(overall, HealthStatus.UNHEALTHY)
 
     @patch("backend.services.service_health_service.evaluate_jdownloader_component")
+    @patch("backend.services.service_health_service.evaluate_deployment_baseline_parity_component")
     @patch("backend.services.service_health_service.evaluate_path_component")
     @patch("backend.services.service_health_service.evaluate_unit_component")
     def test_one_probe_error_does_not_abort_snapshot(
         self,
         unit_component,
         path_component,
+        parity_component,
         jdownloader_component,
     ):
         checked_at = datetime.now(timezone.utc)
@@ -926,6 +1216,7 @@ class ServiceHealthAggregationAndSafetyTests(unittest.TestCase):
             self.component(HealthStatus.HEALTHY),
         ] + [self.component(HealthStatus.IDLE)] * 30
         path_component.return_value = self.component(HealthStatus.HEALTHY)
+        parity_component.return_value = self.component(HealthStatus.HEALTHY)
         jdownloader_component.return_value = self.component(HealthStatus.DEGRADED)
 
         snapshot = health.collect_service_health_snapshot()
