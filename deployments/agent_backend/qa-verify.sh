@@ -15,6 +15,20 @@
     exit 1
   fi
 
+  synthetic_health_card_from_stamp() {
+    local stamp="${1:?verification stamp required}"
+    local digest
+
+    digest="$(printf '%s' "$stamp" | sha256sum)"
+    digest="${digest%% *}"
+    printf '%s-%s-4%s-8%s-%s\n' \
+      "${digest:0:8}" \
+      "${digest:8:4}" \
+      "${digest:13:3}" \
+      "${digest:17:3}" \
+      "${digest:20:12}"
+  }
+
   TARGET="/opt/remihub-agent/deployment/qa/repository.git"
   WORKTREES="/opt/remihub-agent/deployment/qa/worktrees"
   ARTIFACTS="/opt/remihub-agent/deployment/qa/artifacts"
@@ -25,7 +39,7 @@
   STAMP="${REQUESTED_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
   RECORD="$ARTIFACTS/install-verification-$STAMP"
   VALIDATION_CARD="11111111-1111-4111-8111-111111111111"
-  HEALTH_CARD="22222222-2222-4222-8222-222222222222"
+  HEALTH_CARD="$(synthetic_health_card_from_stamp "$STAMP")"
   VALIDATION_WORKTREE="$WORKTREES/card-$VALIDATION_CARD-r1"
   HEALTH_WORKTREE="$WORKTREES/card-$HEALTH_CARD-r1"
   HEALTH_BRANCH="deployment/card-$HEALTH_CARD/r1"
@@ -52,18 +66,40 @@
   wait_for_qa_health() {
     local output="${1:?health output path required}"
     local label="${2:?health label required}"
-    local attempts="${3:-20}"
+    local timeout_seconds="${3:-90}"
+    local active_state
+    local deadline
+    local remaining
+    local curl_timeout
 
     systemctl reset-failed remihub-backend-qa.service >/dev/null 2>&1 || true
     systemctl start remihub-backend-qa.service
-    for _ in $(seq 1 "$attempts"); do
-      if curl -fsS http://127.0.0.1:8001/openapi.json >"$output"; then
-        return 0
-      fi
-      if [[ "$(systemctl is-active remihub-backend-qa.service || true)" == "failed" ]]; then
+    deadline=$((SECONDS + timeout_seconds))
+    while (( SECONDS < deadline )); do
+      remaining=$((deadline - SECONDS))
+      if (( remaining < 1 )); then
         break
       fi
-      sleep 1
+      curl_timeout="$remaining"
+      if (( curl_timeout > 5 )); then
+        curl_timeout=5
+      fi
+      if curl -fsS \
+        --connect-timeout 1 \
+        --max-time "$curl_timeout" \
+        http://127.0.0.1:8001/openapi.json >"$output"; then
+        return 0
+      fi
+      active_state="$(systemctl show remihub-backend-qa.service --property=ActiveState --value 2>/dev/null || true)"
+      if [[ "$active_state" == "failed" || "$active_state" == "inactive" ]]; then
+        break
+      fi
+      remaining=$((deadline - SECONDS))
+      if (( remaining > 1 )); then
+        sleep 1
+      else
+        break
+      fi
     done
     capture_qa_diagnostics "$label"
     return 1
@@ -93,6 +129,7 @@
     runuser -u remihub-deployer -- git --git-dir="$TARGET" worktree remove --force "$VALIDATION_WORKTREE" >/dev/null 2>&1
     runuser -u remihub-deployer -- git --git-dir="$TARGET" worktree remove --force "$HEALTH_WORKTREE" >/dev/null 2>&1
     runuser -u remihub-deployer -- git --git-dir="$TARGET" branch -D "$HEALTH_BRANCH" >/dev/null 2>&1
+    runuser -u remihub-deployer -- git --git-dir="$TARGET" tag -d "$ROLLBACK_REF" >/dev/null 2>&1
   }
   trap cleanup EXIT
 

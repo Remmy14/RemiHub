@@ -254,6 +254,30 @@ class AgentWorkerOrchestrationTests(unittest.TestCase):
             error_message="Maximum worker attempts exceeded (3)",
         )
 
+    def test_cross_stage_deployment_claim_at_attempt_limit_still_executes(self):
+        worker = AgentWorker(
+            queue=self.queue,
+            executor=self.executor,
+            worker_id="production-worker",
+            lease_seconds=120,
+            heartbeat_seconds=30,
+            max_attempts=2,
+        )
+        self.executor.allowed_phases = frozenset({RunPhase.DEPLOYMENT})
+        claim = claimed_run(phase=RunPhase.DEPLOYMENT, attempt_count=2)
+        result = ExecutionResult(
+            message="Production deployed",
+            card_status=CardStatus.COMPLETED,
+        )
+        self.queue.claim_next_run.return_value = claim
+        self.executor.execute.return_value = result
+
+        self.assertTrue(worker.process_once())
+
+        self.executor.execute.assert_called_once_with(claim)
+        self.queue.complete_run.assert_called_once_with(claim, result)
+        self.queue.fail_run.assert_not_called()
+
 
 class FakeAgentExecutorTests(unittest.TestCase):
     def test_fake_executor_returns_phase_appropriate_states(self):
@@ -554,6 +578,7 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             os.environ,
             {
                 "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_QUEUE_ENVIRONMENT": "production",
                 "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
                 "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
                 "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
@@ -596,6 +621,7 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
 
         result = build_executor(settings, queue=MagicMock())
 
+        self.assertEqual(settings.queue_environment, "production")
         self.assertEqual(result, deployment_executor.return_value)
         sandbox_validator.assert_called_once_with(
             validation_command="/srv/agent/bin/validate",
@@ -628,6 +654,7 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             database=deployment_database.return_value,
             runtime=deployment_runtime.return_value,
             qa_history_reader=None,
+            qa_candidate_repository=None,
             command_timeout_seconds=45,
         )
         deployment_executor.assert_called_once_with(
@@ -680,6 +707,9 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_ROLE": (
                 "remihub_qa_migration_reader"
             ),
+            "REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY": (
+                "/srv/agent/qa-deployment.git"
+            ),
             "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
             "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": (
                 "/usr/lib/postgresql/16/bin/pg_dump"
@@ -721,6 +751,10 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
         self.assertEqual(
             deployment_manager.call_args.kwargs["qa_history_reader"],
             qa_history_reader.return_value,
+        )
+        self.assertEqual(
+            deployment_manager.call_args.kwargs["qa_candidate_repository"],
+            "/srv/agent/qa-deployment.git",
         )
         github_synchronizer.assert_called_once_with(
             helper_path="/srv/agent/bin/github-sync-helper",
@@ -786,6 +820,81 @@ class BackendDeploymentWorkerSettingsTests(unittest.TestCase):
             "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG",
         ):
             build_executor(settings, queue=MagicMock())
+
+    def test_production_backend_deployment_requires_qa_candidate_repository(self):
+        environment = {
+            "REMIHUB_AGENT_ENVIRONMENT": "production",
+            "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+            "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+            "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY": "/srv/agent/production.git",
+            "REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT": "/srv/agent/production-worktrees",
+            "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT": "/srv/agent/production-artifacts",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG": "/srv/agent/prod.ini",
+            "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE": "remihub",
+            "REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG": (
+                "/srv/agent/qa-parity.ini"
+            ),
+            "REMIHUB_AGENT_DEPLOYMENT_BACKUP_ROOT": "/srv/agent/backups",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_DUMP_BINARY": "/usr/bin/pg_dump",
+            "REMIHUB_AGENT_DEPLOYMENT_PG_RESTORE_BINARY": "/usr/bin/pg_restore",
+            "REMIHUB_AGENT_DEPLOYMENT_VALIDATOR": "/srv/agent/validate",
+            "REMIHUB_AGENT_DEPLOYMENT_RUNTIME_HELPER": "/srv/agent/runtime-helper",
+            "REMIHUB_AGENT_DEPLOYMENT_GITHUB_SYNC_HELPER": "/srv/agent/github-sync",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = AgentWorkerSettings.from_environment()
+
+        with self.assertRaisesRegex(
+            AgentWorkerConfigurationError,
+            "REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY",
+        ):
+            build_executor(settings, queue=MagicMock())
+
+    def test_backend_deployment_environment_rejects_invalid_value(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+                "REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT": "staging",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                AgentWorkerConfigurationError,
+                "REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT",
+            ):
+                AgentWorkerSettings.from_environment()
+
+    def test_queue_environment_rejects_invalid_value(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_QUEUE_ENVIRONMENT": "staging",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                AgentWorkerConfigurationError,
+                "REMIHUB_AGENT_QUEUE_ENVIRONMENT",
+            ):
+                AgentWorkerSettings.from_environment()
+
+    def test_backend_deployment_environment_defaults_from_worker_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_ENVIRONMENT": "qa",
+                "REMIHUB_AGENT_EXECUTOR": "git-backend-deployment",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+
+        self.assertEqual(settings.deployment_environment, "qa")
 
     def test_backend_deployment_requires_explicit_postgresql_clients(self):
         environment = {

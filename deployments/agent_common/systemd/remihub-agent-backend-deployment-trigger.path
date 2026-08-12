@@ -1,9 +1,9 @@
 [Unit]
-Description=Watch for approved backend deployment wake requests
+Description=Watch for approved backend QA deployment wake requests
 Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
 
 [Path]
-PathExists=/run/remihub-agent/deployment-trigger/backend.request
+PathExists=/run/remihub-agent/deployment-trigger/backend-qa.request
 Unit=remihub-agent-backend-deployment-trigger.service
 
 [Install]

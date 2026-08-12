@@ -1,5 +1,5 @@
 [Unit]
-Description=Wake the protected backend QA deployment worker
+Description=Wake the protected backend production deployment worker
 Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
 ConditionPathIsDirectory=/run/remihub-agent/deployment-trigger
 ConditionFileIsExecutable=/usr/local/libexec/remihub-agent-deployment-trigger
@@ -8,8 +8,8 @@ ConditionFileIsExecutable=/usr/local/libexec/remihub-agent-deployment-trigger
 Type=oneshot
 User=root
 Group=root
-ExecStartPre=/usr/bin/rm -f /run/remihub-agent/deployment-trigger/backend-qa.request
-ExecStart=/usr/local/libexec/remihub-agent-deployment-trigger backend-qa
+ExecStartPre=/usr/bin/rm -f /run/remihub-agent/deployment-trigger/backend-production.request
+ExecStart=/usr/local/libexec/remihub-agent-deployment-trigger backend-production
 
 NoNewPrivileges=true
 PrivateTmp=true

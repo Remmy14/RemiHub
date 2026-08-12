@@ -64,6 +64,7 @@ class ClaimedRun:
     worktree_path: str | None = None
     codex_thread_id: str | None = None
     deployment_source: DeploymentSource | None = None
+    result_metadata: dict = field(default_factory=dict)
     messages: tuple[dict, ...] = field(default_factory=tuple)
 
 
@@ -93,6 +94,7 @@ class AgentQueue(Protocol):
         lease_seconds: int,
         allowed_phases: frozenset[RunPhase],
         allowed_repository_scopes: frozenset[RepositoryScope],
+        deployment_environment: str | None = None,
     ) -> ClaimedRun | None: ...
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None: ...

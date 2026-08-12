@@ -26,6 +26,7 @@
   SOURCE_PROMOTED=0
   PLANNING_PROMOTED=0
   SYSTEM_BACKUP_CAPTURED=0
+  DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED=0
   SYSTEM_MUTATED=0
   ROLLBACK_STATE_CAPTURED=0
   QA_REINITIALIZED=0
@@ -101,7 +102,15 @@
     if service_was_active "$service"; then ACTIVE["$service"]=1; else ACTIVE["$service"]=0; fi
   done
 
+  DEPLOYMENT_TRIGGER_STATE_UNITS=(
+    remihub-agent-backend-deployment-trigger.path
+    remihub-agent-backend-production-deployment-trigger.path
+    remihub-agent-backend-qa-deployment.timer
+    remihub-agent-backend-deployment.timer
+  )
+
   SYSTEM_PATHS=(
+    /usr/local/libexec/remihub-agent-deployment-trigger
     /usr/local/libexec/remihub-backend-deployment-control
     /usr/local/libexec/remihub-backend-deployment-baseline-observer
     /usr/local/libexec/remihub-backend-npm-cache-control
@@ -115,6 +124,13 @@
     /etc/tmpfiles.d/remihub-agent-health-observations.conf
     /etc/systemd/system/remihub-agent-deployment-qa.service
     /etc/systemd/system/remihub-agent-deployment-production.service
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.path
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.service
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.path
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.service
+    /etc/systemd/system/remihub-agent-backend-qa-deployment.timer
+    /etc/systemd/system/remihub-agent-backend-deployment.timer
+    /etc/tmpfiles.d/remihub-agent-deployment-trigger.conf
     /opt/remihub-agent/deployment/config/qa-worker.ini
     /opt/remihub-agent/deployment/config/prod-worker.ini
     /opt/remihub-agent/deployment/config/qa-migrator.ini
@@ -229,6 +245,93 @@
     SYSTEM_BACKUP_CAPTURED=1
   }
 
+  capture_deployment_trigger_unit_state() {
+    local unit unit_path existed enabled_state active_state
+    : >"$BACKUP/deployment-trigger-unit-state.tsv"
+    for unit in "${DEPLOYMENT_TRIGGER_STATE_UNITS[@]}"; do
+      unit_path="/etc/systemd/system/$unit"
+      if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+        existed=present
+      else
+        existed=absent
+      fi
+      enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+      [[ -n "$enabled_state" ]] || enabled_state=unknown
+      active_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+      [[ -n "$active_state" ]] || active_state=unknown
+      printf '%s\t%s\t%s\t%s\n' \
+        "$unit" "$existed" "$enabled_state" "$active_state" \
+        >>"$BACKUP/deployment-trigger-unit-state.tsv"
+    done
+    DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED=1
+  }
+
+  restore_deployment_trigger_unit_state() {
+    local unit existed enabled_state active_state expected known_unit found
+    [[ -f "$BACKUP/deployment-trigger-unit-state.tsv" ]] || {
+      echo "Deployment trigger unit state was not captured; refusing restore." >&2
+      return 1
+    }
+
+    for expected in "${DEPLOYMENT_TRIGGER_STATE_UNITS[@]}"; do
+      found=0
+      while IFS=$'\t' read -r unit existed enabled_state active_state; do
+        [[ -n "$unit" ]] || continue
+        if [[ "$unit" == "$expected" ]]; then
+          found=1
+          break
+        fi
+      done <"$BACKUP/deployment-trigger-unit-state.tsv"
+      [[ "$found" -eq 1 ]] || {
+        echo "Deployment trigger unit state is missing for $expected." >&2
+        return 1
+      }
+    done
+
+    while IFS=$'\t' read -r unit existed enabled_state active_state; do
+      [[ -n "$unit" ]] || continue
+      known_unit=0
+      for expected in "${DEPLOYMENT_TRIGGER_STATE_UNITS[@]}"; do
+        if [[ "$unit" == "$expected" ]]; then known_unit=1; fi
+      done
+      [[ "$known_unit" -eq 1 ]] || {
+        echo "Unexpected deployment trigger unit in restore manifest: $unit" >&2
+        return 1
+      }
+
+      case "$enabled_state" in
+        enabled)
+          systemctl enable "$unit" || true
+          ;;
+        enabled-runtime)
+          systemctl enable --runtime "$unit" || true
+          ;;
+        *)
+          systemctl disable "$unit" || true
+          ;;
+      esac
+
+      if [[ "$active_state" == "active" ]]; then
+        systemctl start "$unit" || true
+      else
+        systemctl stop "$unit" || true
+        systemctl reset-failed "$unit" || true
+      fi
+    done <"$BACKUP/deployment-trigger-unit-state.tsv"
+  }
+
+  quiesce_deployment_trigger_units() {
+    [[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]] || {
+      echo "Deployment trigger unit state is not captured; refusing to quiesce schedulers." >&2
+      return 1
+    }
+    systemctl stop \
+      remihub-agent-backend-deployment-trigger.path \
+      remihub-agent-backend-production-deployment-trigger.path \
+      remihub-agent-backend-qa-deployment.timer \
+      remihub-agent-backend-deployment.timer || true
+  }
+
   restore_system_paths() {
     local index=0 path manifest_index state expected_path parent base archive expected_index
     [[ "$SYSTEM_BACKUP_CAPTURED" -eq 1 ]] || {
@@ -278,6 +381,7 @@
       fi
     done
     systemctl daemon-reload || true
+    restore_deployment_trigger_unit_state
   }
 
   restart_original_services() {
@@ -633,7 +737,17 @@ PY
     if [[ "$COMPLETE" -eq 1 ]]; then exit "$status"; fi
     echo "Installation failed; preserving or restoring only state explicitly captured in $BACKUP" >&2
     set +e
-    systemctl stop remihub-agent-deployment-qa.service remihub-agent-deployment-production.service remihub-backend-qa.service
+    if [[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]]; then
+      systemctl stop \
+        remihub-agent-backend-deployment-trigger.path \
+        remihub-agent-backend-production-deployment-trigger.path \
+        remihub-agent-backend-qa-deployment.timer \
+        remihub-agent-backend-deployment.timer
+    fi
+    systemctl stop \
+      remihub-agent-deployment-qa.service \
+      remihub-agent-deployment-production.service \
+      remihub-backend-qa.service
 
     if [[ "$PLANNING_PROMOTED" -eq 1 ]]; then
       runuser -u alex -- git -C "$PLANNING" reset --hard "$EXPECTED_BASE"
@@ -700,6 +814,9 @@ PY
       if [[ "$SYSTEM_MUTATED" -eq 1 ]]; then
         restore_system_paths || \
           echo "System leaf rollback failed; no parent permission repair was attempted." >&2
+      elif [[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]]; then
+        restore_deployment_trigger_unit_state || \
+          echo "Deployment trigger unit-state rollback failed." >&2
       fi
 
       restore_parent_directory_state \
@@ -901,6 +1018,8 @@ PY
   fi
 
   backup_system_paths
+  capture_deployment_trigger_unit_state
+  quiesce_deployment_trigger_units
   verify_critical_parent_state
   ROLLBACK_STATE_CAPTURED=1
   echo "ROLLBACK_STATE_CAPTURED=PASS"
@@ -1120,13 +1239,43 @@ PY
   install -o root -g root -m 0644 \
     "$BACKUP/remihub-agent-deployment-production.service.new" \
     /etc/systemd/system/remihub-agent-deployment-production.service
+  install -o root -g root -m 0755 \
+    "$RELEASE/deployments/agent_common/libexec/remihub-agent-deployment-trigger" \
+    /usr/local/libexec/remihub-agent-deployment-trigger
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/tmpfiles/remihub-agent-deployment-trigger.conf" \
+    /etc/tmpfiles.d/remihub-agent-deployment-trigger.conf
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-deployment-trigger.path" \
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.path
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-deployment-trigger.service" \
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.service
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-production-deployment-trigger.path" \
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.path
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-production-deployment-trigger.service" \
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.service
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-qa-deployment.timer" \
+    /etc/systemd/system/remihub-agent-backend-qa-deployment.timer
+  install -o root -g root -m 0644 \
+    "$RELEASE/deployments/agent_common/systemd/remihub-agent-backend-deployment.timer" \
+    /etc/systemd/system/remihub-agent-backend-deployment.timer
   systemctl daemon-reload
   systemd-analyze verify \
     /etc/systemd/system/remihub-backend-qa.service \
     /etc/systemd/system/remihub-agent-deployment-baseline-observer.service \
     /etc/systemd/system/remihub-agent-deployment-baseline-observer.timer \
     /etc/systemd/system/remihub-agent-deployment-qa.service \
-    /etc/systemd/system/remihub-agent-deployment-production.service
+    /etc/systemd/system/remihub-agent-deployment-production.service \
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.path \
+    /etc/systemd/system/remihub-agent-backend-deployment-trigger.service \
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.path \
+    /etc/systemd/system/remihub-agent-backend-production-deployment-trigger.service \
+    /etc/systemd/system/remihub-agent-backend-qa-deployment.timer \
+    /etc/systemd/system/remihub-agent-backend-deployment.timer
   systemctl enable --now remihub-agent-deployment-baseline-observer.timer
 
   echo "[7/10] Run complete QA validation before production promotion"
@@ -1211,6 +1360,11 @@ PY
   rm -rf "$STAGING"
   verify_critical_parent_state
   echo "CRITICAL_PARENT_POSTCHECK=PASS"
+  systemctl enable --now \
+    remihub-agent-backend-deployment-trigger.path \
+    remihub-agent-backend-production-deployment-trigger.path \
+    remihub-agent-backend-qa-deployment.timer \
+    remihub-agent-backend-deployment.timer
   printf 'installed_commit=%s\nrelease=%s\nbackup=%s\n' "$NEW_COMMIT" "$RELEASE" "$BACKUP" >"$BACKUP/INSTALL-SUCCEEDED.txt"
   COMPLETE=1
   trap - EXIT

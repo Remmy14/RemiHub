@@ -112,6 +112,33 @@ def _validate_positive_seconds(value: int, *, field: str) -> int:
     return value
 
 
+def _normalize_deployment_environment(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in {"qa", "production"}:
+        raise ValueError("deployment_environment must be qa or production")
+    return normalized
+
+
+def _normalized_metadata(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _merge_metadata(existing: object, updates: dict | None) -> dict:
+    merged = _normalized_metadata(existing)
+    merged.update(dict(updates or {}))
+    return merged
+
+
+def _failure_metadata(existing: object) -> dict:
+    metadata = _normalized_metadata(existing)
+    pipeline = metadata.get("deployment_pipeline")
+    if isinstance(pipeline, dict):
+        return {"deployment_pipeline": pipeline}
+    return {}
+
+
 def _deployment_source_from_row(row: dict) -> DeploymentSource | None:
     values = (
         row.get("deployment_approval_id"),
@@ -153,6 +180,7 @@ def _claimed_run_from_row(row: dict, messages: list[dict]) -> ClaimedRun:
         worktree_path=row["worktree_path"],
         codex_thread_id=row["codex_thread_id"],
         deployment_source=_deployment_source_from_row(row),
+        result_metadata=_normalized_metadata(row.get("result_metadata")),
         messages=tuple(messages),
     )
 
@@ -200,7 +228,11 @@ def claim_next_run(
     lease_seconds: int,
     allowed_phases: frozenset[RunPhase],
     allowed_repository_scopes: frozenset[RepositoryScope] = frozenset(RepositoryScope),
+    deployment_environment: str | None = None,
 ) -> ClaimedRun | None:
+    normalized_deployment_environment = _normalize_deployment_environment(
+        deployment_environment
+    )
     normalized_worker_id = worker_id.strip()
     if not normalized_worker_id:
         raise ValueError("worker_id must not be blank")
@@ -234,6 +266,27 @@ def claim_next_run(
         if normalized_scopes == all_scopes
         else "AND cards.repository_scope = ANY(%s)"
     )
+    deployment_environment_predicate = ""
+    if normalized_deployment_environment == "qa":
+        deployment_environment_predicate = """
+                  AND (
+                    runs.phase <> 'deployment'
+                    OR cards.repository_scope <> 'backend'
+                    OR COALESCE(
+                        runs.result_metadata #>> '{deployment_pipeline,stage}',
+                        ''
+                    ) <> 'qa_succeeded'
+                  )
+        """
+    elif normalized_deployment_environment == "production":
+        deployment_environment_predicate = """
+                  AND (
+                    runs.phase <> 'deployment'
+                    OR cards.repository_scope <> 'backend'
+                    OR runs.result_metadata #>> '{deployment_pipeline,stage}'
+                       = 'qa_succeeded'
+                  )
+        """
     query_parameters: list[object] = [normalized_phases]
     if scope_predicate:
         query_parameters.append(normalized_scopes)
@@ -249,6 +302,7 @@ def claim_next_run(
                        runs.status AS run_status,
                        runs.card_revision,
                        runs.attempt_count,
+                       runs.result_metadata,
                        runs.worker_id AS previous_worker_id,
                        runs.lease_expires_at AS previous_lease_expires_at,
                        cards.status AS card_status,
@@ -298,6 +352,7 @@ def claim_next_run(
                  AND implementation_run.card_revision = runs.card_revision
                 WHERE runs.phase = ANY(%s)
                   {scope_predicate}
+                  {deployment_environment_predicate}
                   AND (
                     (
                         runs.status = 'queued'
@@ -362,9 +417,7 @@ def claim_next_run(
                     lease_seconds,
                     attempt_count,
                     json.dumps(
-                        row.get("result_metadata") or {}
-                        if previous_run_status is RunStatus.BLOCKED
-                        else {},
+                        _normalized_metadata(row.get("result_metadata")),
                         sort_keys=True,
                     ),
                     row["id"],
@@ -697,11 +750,25 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
     if len(message) > 20000:
         raise ValueError("Agent completion message must be at most 20000 characters")
 
-    _, target_status = require_run_completion_status(
-        claim.phase,
-        result.card_status,
+    metadata_payload = _merge_metadata(claim.result_metadata, result.metadata)
+    deployment_pipeline = metadata_payload.get("deployment_pipeline")
+    qa_handoff = (
+        claim.phase is RunPhase.DEPLOYMENT
+        and claim.repository_scope is RepositoryScope.BACKEND
+        and isinstance(deployment_pipeline, dict)
+        and deployment_pipeline.get("stage") == "qa_succeeded"
     )
-    metadata_payload = dict(result.metadata or {})
+    if qa_handoff:
+        target_status = CardStatus.DEPLOYMENT_QUEUED
+    else:
+        _, target_status = require_run_completion_status(
+            claim.phase,
+            result.card_status,
+        )
+    run_completion_status = (
+        RunStatus.QUEUED if qa_handoff else RunStatus.SUCCEEDED
+    )
+    finished_at_sql = "NULL" if qa_handoff else "CURRENT_TIMESTAMP"
     completed_scope: RepositoryScope | None = None
     if claim.phase is RunPhase.PLANNING:
         if result.repository_scope is None:
@@ -728,7 +795,13 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                 claim,
                 statuses=(RunStatus.RUNNING.value,),
             )
-            require_card_transition(row["card_status"], target_status)
+            if qa_handoff:
+                if CardStatus(row["card_status"]) is not CardStatus.DEPLOYING:
+                    raise AgentQueueStateError(
+                        "QA deployment handoff requires an active deployment card"
+                    )
+            else:
+                require_card_transition(row["card_status"], target_status)
             message_id = _insert_message(
                 cur,
                 card_id=claim.card_id,
@@ -738,20 +811,20 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                 client_message_id=None,
             )
             cur.execute(
-                """
+                f"""
                 UPDATE agent.runs
                 SET status = %s,
                     lease_token = NULL,
                     lease_expires_at = NULL,
                     blocked_reason = NULL,
-                    finished_at = CURRENT_TIMESTAMP,
+                    finished_at = {finished_at_sql},
                     error_message = NULL,
                     result_message_id = %s,
                     result_metadata = %s::jsonb
                 WHERE id = %s
                 """,
                 (
-                    RunStatus.SUCCEEDED.value,
+                    run_completion_status.value,
                     message_id,
                     metadata,
                     claim.id,
@@ -786,6 +859,8 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                 "to_card_status": target_status.value,
                 "worker_id": claim.worker_id,
             }
+            if qa_handoff:
+                event_payload["deployment_pipeline"] = deployment_pipeline
             if completed_scope is not None:
                 event_payload["repository_scope"] = completed_scope.value
                 if completed_scope is RepositoryScope.ANDROID:
@@ -793,7 +868,11 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
             _insert_event(
                 cur,
                 card_id=claim.card_id,
-                event_type="run.succeeded",
+                event_type=(
+                    "run.qa_succeeded"
+                    if qa_handoff
+                    else "run.succeeded"
+                ),
                 actor_type="worker",
                 actor_user_id=None,
                 payload=event_payload,
@@ -841,7 +920,10 @@ def block_run(
         retry_after_seconds,
         field="retry_after_seconds",
     )
-    metadata_payload = json.dumps(dict(metadata or {}), sort_keys=True)
+    metadata_payload = json.dumps(
+        _merge_metadata(claim.result_metadata, metadata),
+        sort_keys=True,
+    )
     resume_status = queued_card_status_for_phase(claim.phase)
 
     conn = get_db_conn()
@@ -901,7 +983,7 @@ def block_run(
                     "retry_after_seconds": retry_after_seconds,
                     "run_id": claim.id,
                     "worker_id": claim.worker_id,
-                    "metadata": dict(metadata or {}),
+                    "metadata": _merge_metadata(claim.result_metadata, metadata),
                 },
             )
         conn.commit()
@@ -943,10 +1025,18 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
                     finished_at = CURRENT_TIMESTAMP,
                     error_message = %s,
                     result_message_id = NULL,
-                    result_metadata = '{}'::jsonb
+                    result_metadata = %s::jsonb
                 WHERE id = %s
                 """,
-                (RunStatus.FAILED.value, normalized_error, claim.id),
+                (
+                    RunStatus.FAILED.value,
+                    normalized_error,
+                    json.dumps(
+                        _failure_metadata(claim.result_metadata),
+                        sort_keys=True,
+                    ),
+                    claim.id,
+                ),
             )
             cur.execute(
                 """
@@ -981,8 +1071,16 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
 
 
 class DatabaseAgentQueue:
-    def __init__(self, *, environment: str):
+    def __init__(
+        self,
+        *,
+        environment: str,
+        deployment_environment: str | None = None,
+    ):
         self.environment = environment
+        self.deployment_environment = _normalize_deployment_environment(
+            deployment_environment
+        )
 
     def verify_identity(self) -> tuple[str, str, str]:
         return verify_worker_identity(self.environment)
@@ -994,12 +1092,18 @@ class DatabaseAgentQueue:
         lease_seconds: int,
         allowed_phases: frozenset[RunPhase],
         allowed_repository_scopes: frozenset[RepositoryScope] = frozenset(RepositoryScope),
+        deployment_environment: str | None = None,
     ) -> ClaimedRun | None:
         return claim_next_run(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             allowed_phases=allowed_phases,
             allowed_repository_scopes=allowed_repository_scopes,
+            deployment_environment=(
+                deployment_environment
+                if deployment_environment is not None
+                else self.deployment_environment
+            ),
         )
 
     def start_run(self, claim: ClaimedRun, *, lease_seconds: int) -> None:

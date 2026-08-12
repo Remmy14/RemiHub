@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import subprocess
 import tarfile
@@ -700,14 +701,23 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.source_worktrees = self.root / "implementation-worktrees"
         self.source_artifacts = self.root / "implementation-artifacts"
         self.target = self.root / "qa-deployment.git"
+        self.production_target = self.root / "production-deployment.git"
         self.candidate_worktrees = self.root / "deployment-worktrees"
+        self.production_candidate_worktrees = (
+            self.root / "production-deployment-worktrees"
+        )
         self.deployment_artifacts = self.root / "deployment-artifacts"
+        self.production_deployment_artifacts = (
+            self.root / "production-deployment-artifacts"
+        )
         for path in (
             self.seed,
             self.source_worktrees,
             self.source_artifacts,
             self.candidate_worktrees,
+            self.production_candidate_worktrees,
             self.deployment_artifacts,
+            self.production_deployment_artifacts,
         ):
             path.mkdir()
 
@@ -758,8 +768,20 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        subprocess.run(
+            ["git", "clone", "--bare", str(self.seed), str(self.production_target)],
+            check=True,
+            capture_output=True,
+        )
         _git(self.target, "remote", "remove", "origin")
+        _git(self.production_target, "remote", "remove", "origin")
         _git(self.target, "update-ref", "refs/heads/qa-main", self.base_commit)
+        _git(
+            self.production_target,
+            "update-ref",
+            "refs/heads/production-main",
+            self.base_commit,
+        )
 
         self.implementation_claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
         self.implementation_manager = GitImplementationWorkspaceManager(
@@ -827,6 +849,37 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             ),
         )
 
+    def _qa_succeeded_claim(self, claim):
+        expected = self._expected_history(
+            self.implementation_workspace.path
+            / "backend"
+            / "database"
+            / "migrations"
+        )
+        base_versions = {
+            item["version"] for item in self._expected_history()
+        }
+        pending = tuple(
+            item["version"]
+            for item in expected
+            if item["version"] not in base_versions
+        )
+        candidate = self._manager(
+            database=FakeDatabase(pending=pending, history=expected),
+        ).deploy(claim)
+        return replace(
+            claim,
+            result_metadata={
+                "deployment_pipeline": {
+                    "stage": "qa_succeeded",
+                    "card_id": claim.card_id,
+                    "deployment_run_id": claim.id,
+                    "candidate_commit": candidate.candidate_commit,
+                    "qa_candidate_repository": str(self.target),
+                }
+            },
+        )
+
     def _manager(
         self,
         *,
@@ -838,16 +891,27 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         environment="qa",
     ):
         target_branch = "qa-main" if environment == "qa" else "production-main"
+        target_repository = self.target
+        candidate_worktree_root = self.candidate_worktrees
+        deployment_artifact_root = self.deployment_artifacts
         if environment == "production":
-            _git(self.target, "update-ref", "refs/heads/production-main", self.base_commit)
+            target_repository = self.production_target
+            candidate_worktree_root = self.production_candidate_worktrees
+            deployment_artifact_root = self.production_deployment_artifacts
+            _git(
+                target_repository,
+                "update-ref",
+                "refs/heads/production-main",
+                self.base_commit,
+            )
         return GitBackendDeploymentManager(
             environment=environment,
             source_repository=self.source,
             source_worktree_root=self.source_worktrees,
             source_artifact_root=self.source_artifacts,
-            target_repository=self.target,
-            candidate_worktree_root=self.candidate_worktrees,
-            deployment_artifact_root=self.deployment_artifacts,
+            target_repository=target_repository,
+            candidate_worktree_root=candidate_worktree_root,
+            deployment_artifact_root=deployment_artifact_root,
             target_branch=target_branch,
             validator=validator or self.validator,
             database=database or self.database,
@@ -861,6 +925,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                     if environment == "production"
                     else None
                 )
+            ),
+            qa_candidate_repository=(
+                self.target if environment == "production" else None
             ),
         )
 
@@ -974,7 +1041,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             changes[
                 f"backend/database/migrations/{version:04d}_step_{version}.down.sql"
             ] = f"DROP TABLE step_{version};\n"
-        claim = self._prepare_deployment(changes)
+        claim = self._qa_succeeded_claim(self._prepare_deployment(changes))
         expected = self._expected_history(
             self.implementation_workspace.path / "backend" / "database" / "migrations"
         )
@@ -993,10 +1060,10 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(runtime.events, [])
         self.assertEqual(database.events, [])
         self.assertEqual(
-            _git(self.target, "rev-parse", "production-main"),
+            _git(self.production_target, "rev-parse", "production-main"),
             self.base_commit,
         )
-        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest_path = self.production_deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
         manifest = json.loads(manifest_path.read_text())
         attempt = manifest["attempts"][-1]
         self.assertEqual(attempt["status"], "failed_migration_parity")
@@ -1006,7 +1073,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
 
     def test_production_aligned_qa_history_permits_continued_execution(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         qa_reader = FakeHistoryReader(expected)
 
@@ -1016,13 +1085,15 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         ).deploy(claim)
 
         self.assertEqual(
-            _git(self.target, "rev-parse", "production-main"),
+            _git(self.production_target, "rev-parse", "production-main"),
             candidate.candidate_commit,
         )
         self.assertIn("history", qa_reader.events)
 
     def test_production_refuses_qa_name_mismatch(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         observed = ({**expected[0], "name": "different_name"},)
 
@@ -1033,7 +1104,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             ).deploy(claim)
 
     def test_production_refuses_qa_checksum_mismatch(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         observed = ({**expected[0], "checksum": "0" * 64},)
 
@@ -1044,7 +1117,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             ).deploy(claim)
 
     def test_production_refuses_unexpected_qa_migration(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         observed = expected + (
             {"version": "9999", "name": "future", "checksum": "f" * 64},
@@ -1057,7 +1132,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             ).deploy(claim)
 
     def test_no_new_migration_candidate_still_enforces_complete_qa_parity(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
 
         with self.assertRaisesRegex(AgentDeploymentError, "missing=\\('0001'"):
             self._manager(
@@ -1084,7 +1161,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(attempt["status"], "rolled_back")
 
     def test_production_history_is_rechecked_after_production_validation(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         database = FakeDatabase(history=expected)
 
@@ -1098,7 +1177,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertIn("history", database.events)
 
     def test_post_deployment_production_history_mismatch_rolls_back(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         database = FakeDatabase(history=())
         runtime = FakeRuntime()
@@ -1113,10 +1194,10 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
 
         self.assertEqual(runtime.current_commit, self.base_commit)
         self.assertEqual(
-            _git(self.target, "rev-parse", "production-main"),
+            _git(self.production_target, "rev-parse", "production-main"),
             self.base_commit,
         )
-        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest_path = self.production_deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
         manifest = json.loads(manifest_path.read_text())
         attempt = manifest["attempts"][-1]
         self.assertEqual(attempt["status"], "rolled_back")
@@ -1126,7 +1207,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
 
     def test_migration_parity_evidence_omits_protected_values(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         expected = self._expected_history()
         candidate = self._manager(
             qa_history_reader=FakeHistoryReader(expected),
@@ -1448,7 +1531,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(_git(self.target, "rev-parse", "qa-main"), self.base_commit)
 
     def test_ambiguous_source_sync_is_reconciled_in_production(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         runtime = FakeRuntime(fail_sync_after_apply=True)
 
         with self.assertRaises(DeploymentRolledBackError):
@@ -1457,7 +1542,21 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         self.assertEqual(runtime.sources_commit, self.base_commit)
         self.assertEqual(runtime.current_commit, self.base_commit)
         self.assertEqual(
-            _git(self.target, "rev-parse", "production-main"),
+            _git(self.production_target, "rev-parse", "production-main"),
+            self.base_commit,
+        )
+
+    def test_production_cannot_bypass_qa_succeeded_pipeline(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+
+        with self.assertRaisesRegex(
+            AgentDeploymentError,
+            "QA-succeeded pipeline metadata",
+        ):
+            self._manager(environment="production").deploy(claim)
+
+        self.assertEqual(
+            _git(self.production_target, "rev-parse", "production-main"),
             self.base_commit,
         )
 
@@ -1524,7 +1623,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             )
 
     def test_production_executor_records_verified_github_sync(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         synchronizer = FakeGitHubSynchronizer()
         executor = GitBackendDeploymentExecutor(
             deployment_manager=self._manager(environment="production"),
@@ -1547,7 +1648,9 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
 
     def test_github_failure_blocks_without_redeploy_and_retry_only_resynchronizes(self):
-        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        claim = self._qa_succeeded_claim(
+            self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        )
         runtime = FakeRuntime()
         synchronizer = FakeGitHubSynchronizer(fail_times=1)
         executor = GitBackendDeploymentExecutor(
@@ -1577,7 +1680,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             )
         )
 
-        manifest_path = self.deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
+        manifest_path = self.production_deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
         pending_manifest = json.loads(manifest_path.read_text())
         self.assertEqual(pending_manifest["attempts"][-1]["status"], "succeeded")
         self.assertEqual(pending_manifest["attempts"][-1]["stage"], "github_sync_pending")
@@ -1631,6 +1734,132 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
 
 
 class DeploymentControlSynchronizationTests(unittest.TestCase):
+    @staticmethod
+    def _qa_verify_source() -> str:
+        return (
+            Path(__file__).resolve().parents[1]
+            / "deployments"
+            / "agent_backend"
+            / "qa-verify.sh"
+        ).read_text(encoding="utf-8")
+
+    @staticmethod
+    def _qa_health_function(source: str) -> str:
+        health_start = source.index("  wait_for_qa_health() {")
+        health_end = source.index("\n  verify_qa_frontend_routes()", health_start)
+        return source[health_start:health_end].replace("\n  ", "\n", 1)
+
+    @staticmethod
+    def _qa_synthetic_identity_function(source: str) -> str:
+        function_start = source.index("  synthetic_health_card_from_stamp() {")
+        function_end = source.index("\n  TARGET=", function_start)
+        return source[function_start:function_end].replace("\n  ", "\n", 1)
+
+    def _synthetic_health_identity(self, stamp: str) -> tuple[str, str, str]:
+        function = self._qa_synthetic_identity_function(self._qa_verify_source())
+        script = f"""#!/usr/bin/env bash
+set -euo pipefail
+{function}
+card="$(synthetic_health_card_from_stamp {stamp!r})"
+printf '%s\\n' "$card"
+printf 'deployment/card-%s/r1\\n' "$card"
+printf 'rollback-before-agent-card-%s-r1\\n' "$card"
+"""
+        result = subprocess.run(
+            ["/usr/bin/env", "bash", "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        card, branch, rollback_ref = result.stdout.splitlines()
+        return card, branch, rollback_ref
+
+    def _run_qa_health_harness(
+        self,
+        *,
+        healthy_after: int,
+        timeout: int = 90,
+        terminal_state: str = "active",
+        terminal_after: int = 9999,
+    ) -> dict:
+        function = self._qa_health_function(self._qa_verify_source())
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            script = root / "harness.sh"
+            output = root / "openapi.json"
+            log = root / "events.log"
+            script.write_text(
+                f"""#!/usr/bin/env bash
+set -u
+SECONDS=0
+CURL_CALLS=0
+DIAGNOSTICS=0
+EVENT_LOG={str(log)!r}
+HEALTHY_AFTER={healthy_after}
+TERMINAL_AFTER={terminal_after}
+TERMINAL_STATE={terminal_state!r}
+
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >>"$EVENT_LOG"
+  if [[ "$1" == "show" ]]; then
+    if (( SECONDS >= TERMINAL_AFTER )); then
+      printf '%s\\n' "$TERMINAL_STATE"
+    else
+      printf 'active\\n'
+    fi
+  fi
+  return 0
+}}
+
+curl() {{
+  CURL_CALLS=$((CURL_CALLS + 1))
+  printf 'curl %s\\n' "$*" >>"$EVENT_LOG"
+  if (( SECONDS >= HEALTHY_AFTER )); then
+    printf '{{"openapi":"ok"}}\\n'
+    return 0
+  fi
+  return 22
+}}
+
+sleep() {{
+  printf 'sleep %s\\n' "$*" >>"$EVENT_LOG"
+  SECONDS=$((SECONDS + $1))
+}}
+
+capture_qa_diagnostics() {{
+  DIAGNOSTICS=$((DIAGNOSTICS + 1))
+  printf 'diagnostics %s\\n' "$*" >>"$EVENT_LOG"
+}}
+
+{function}
+
+set +e
+wait_for_qa_health {str(output)!r} candidate-health {timeout}
+RESULT=$?
+set -e
+printf 'RESULT=%s\\nSECONDS=%s\\nCURL_CALLS=%s\\nDIAGNOSTICS=%s\\n' \
+  "$RESULT" "$SECONDS" "$CURL_CALLS" "$DIAGNOSTICS"
+""",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["/usr/bin/env", "bash", str(script)],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            values = {}
+            for line in result.stdout.splitlines():
+                key, value = line.split("=", 1)
+                values[key] = int(value)
+            values["events"] = log.read_text(encoding="utf-8")
+            values["healthy_output"] = (
+                output.read_text(encoding="utf-8") if output.exists() else ""
+            )
+            return values
+
     def test_planning_fetch_uses_verified_production_runtime(self):
         helper_path = (
             Path(__file__).resolve().parents[1]
@@ -1976,6 +2205,60 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
         self.assertIn("retry-runtime-state.txt", verifier)
         self.assertIn("restored-health-runtime-state.txt", verifier)
 
+    def test_qa_verifier_derives_unique_valid_synthetic_identities_from_stamp(self):
+        first_card, first_branch, first_ref = self._synthetic_health_identity(
+            "20260812T010203Z"
+        )
+        second_card, second_branch, second_ref = self._synthetic_health_identity(
+            "20260812T010204Z"
+        )
+
+        uuid_pattern = re.compile(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+            r"8[0-9a-f]{3}-[0-9a-f]{12}$"
+        )
+        self.assertRegex(first_card, uuid_pattern)
+        self.assertRegex(second_card, uuid_pattern)
+        self.assertNotEqual(first_card, second_card)
+        self.assertEqual(first_branch, f"deployment/card-{first_card}/r1")
+        self.assertEqual(second_branch, f"deployment/card-{second_card}/r1")
+        self.assertEqual(first_ref, f"rollback-before-agent-card-{first_card}-r1")
+        self.assertEqual(second_ref, f"rollback-before-agent-card-{second_card}-r1")
+
+    def test_qa_verifier_stale_synthetic_ref_from_previous_stamp_cannot_collide(self):
+        old_card, old_branch, old_ref = self._synthetic_health_identity(
+            "20260812T020304Z"
+        )
+        new_card, new_branch, new_ref = self._synthetic_health_identity(
+            "20260812T020305Z"
+        )
+        stale_refs = {
+            old_branch,
+            old_ref,
+            f"refs/heads/{old_branch}",
+            f"refs/tags/{old_ref}",
+        }
+
+        self.assertNotEqual(old_card, new_card)
+        self.assertNotIn(new_branch, stale_refs)
+        self.assertNotIn(new_ref, stale_refs)
+        self.assertNotIn(f"refs/heads/{new_branch}", stale_refs)
+        self.assertNotIn(f"refs/tags/{new_ref}", stale_refs)
+
+    def test_qa_verifier_cleanup_targets_only_current_synthetic_fixture(self):
+        verifier = self._qa_verify_source()
+
+        self.assertIn(
+            'worktree remove --force "$HEALTH_WORKTREE"',
+            verifier,
+        )
+        self.assertIn('branch -D "$HEALTH_BRANCH"', verifier)
+        self.assertIn('tag -d "$ROLLBACK_REF"', verifier)
+        self.assertNotIn("rollback-before-agent-card-22222222", verifier)
+        self.assertNotIn("refs/tags/rollback-before-agent-card-*", verifier)
+        self.assertNotIn("for_each_ref", verifier)
+        self.assertNotIn("for-each-ref", verifier)
+
     def test_installer_finishes_with_owner_scoped_git_checks_and_qa_gate(self):
         installer_path = (
             Path(__file__).resolve().parents[1]
@@ -2239,6 +2522,75 @@ class DeploymentControlSynchronizationTests(unittest.TestCase):
             'wait_for_qa_health "$RECORD/qa-openapi.json" "candidate-health"',
             verifier,
         )
+
+    def test_qa_verifier_uses_bounded_90_second_http_readiness(self):
+        health = self._qa_health_function(self._qa_verify_source())
+
+        self.assertIn('local timeout_seconds="${3:-90}"', health)
+        self.assertNotIn('local attempts="${3:-20}"', health)
+        self.assertIn(
+            "--connect-timeout 1",
+            health,
+        )
+        self.assertIn(
+            '--max-time "$curl_timeout"',
+            health,
+        )
+        self.assertIn(
+            "http://127.0.0.1:8001/openapi.json >\"$output\"",
+            health,
+        )
+        self.assertIn(
+            "systemctl show remihub-backend-qa.service --property=ActiveState --value",
+            health,
+        )
+        self.assertIn(
+            '[[ "$active_state" == "failed" || "$active_state" == "inactive" ]]',
+            health,
+        )
+        self.assertIn('capture_qa_diagnostics "$label"', health)
+        self.assertIn("return 1", health)
+
+    def test_qa_health_accepts_http_success_after_old_20_second_threshold(self):
+        result = self._run_qa_health_harness(healthy_after=25)
+
+        self.assertEqual(result["RESULT"], 0)
+        self.assertGreater(result["SECONDS"], 20)
+        self.assertLess(result["SECONDS"], 90)
+        self.assertGreater(result["CURL_CALLS"], 20)
+        self.assertEqual(result["DIAGNOSTICS"], 0)
+        self.assertIn('{"openapi":"ok"}', result["healthy_output"])
+        self.assertIn("--connect-timeout 1", result["events"])
+        self.assertIn("--max-time", result["events"])
+
+    def test_qa_health_times_out_without_http_success(self):
+        result = self._run_qa_health_harness(healthy_after=999, timeout=7)
+
+        self.assertEqual(result["RESULT"], 1)
+        self.assertLessEqual(result["SECONDS"], 7)
+        self.assertEqual(result["DIAGNOSTICS"], 1)
+        self.assertEqual(result["healthy_output"], "")
+        self.assertIn("diagnostics candidate-health", result["events"])
+        self.assertIn("--connect-timeout 1", result["events"])
+        self.assertIn("--max-time", result["events"])
+
+    def test_qa_health_fails_promptly_on_terminal_service_state(self):
+        for terminal_state in ("failed", "inactive"):
+            with self.subTest(terminal_state=terminal_state):
+                result = self._run_qa_health_harness(
+                    healthy_after=999,
+                    terminal_state=terminal_state,
+                    terminal_after=3,
+                )
+
+                self.assertEqual(result["RESULT"], 1)
+                self.assertLess(result["SECONDS"], 90)
+                self.assertEqual(result["DIAGNOSTICS"], 1)
+                self.assertIn("diagnostics candidate-health", result["events"])
+                self.assertIn(
+                    "systemctl show remihub-backend-qa.service",
+                    result["events"],
+                )
 
     def test_installer_binds_versioned_postgresql_clients(self):
         installer_path = (

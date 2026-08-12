@@ -5,6 +5,8 @@ from unittest.mock import ANY, patch
 
 from backend.core.agent_deployment_trigger import (
     AgentDeploymentTriggerError,
+    BACKEND_PRODUCTION_TRIGGER_REQUEST,
+    BACKEND_QA_TRIGGER_REQUEST,
     TRIGGER_DIRECTORY,
     TRIGGER_REQUESTS,
     trigger_deployment_worker,
@@ -57,15 +59,53 @@ class AgentDeploymentTriggerTests(unittest.TestCase):
         close,
     ):
         open_file.return_value = 19
-        write.return_value = len(b"backend\n")
+        write.return_value = len(b"backend-qa\n")
 
         trigger_deployment_worker(RepositoryScope.BACKEND)
 
         self.assertEqual(
             open_file.call_args.args[0],
-            Path("/run/remihub-agent/deployment-trigger/backend.request"),
+            Path("/run/remihub-agent/deployment-trigger/backend-qa.request"),
         )
-        self.assertEqual(bytes(write.call_args.args[1]), b"backend\n")
+        self.assertEqual(bytes(write.call_args.args[1]), b"backend-qa\n")
+
+    @patch("backend.core.agent_deployment_trigger.os.close")
+    @patch("backend.core.agent_deployment_trigger.os.fsync")
+    @patch("backend.core.agent_deployment_trigger.os.write")
+    @patch("backend.core.agent_deployment_trigger.os.open")
+    def test_backend_production_trigger_uses_explicit_request_path(
+        self,
+        open_file,
+        write,
+        fsync,
+        close,
+    ):
+        open_file.return_value = 23
+        write.return_value = len(b"backend-production\n")
+
+        trigger_deployment_worker(
+            RepositoryScope.BACKEND,
+            deployment_environment="production",
+        )
+
+        self.assertEqual(open_file.call_args.args[0], BACKEND_PRODUCTION_TRIGGER_REQUEST)
+        self.assertEqual(bytes(write.call_args.args[1]), b"backend-production\n")
+        fsync.assert_called_once_with(23)
+        close.assert_called_once_with(23)
+
+    def test_invalid_backend_deployment_environment_is_rejected(self):
+        with self.assertRaisesRegex(AgentDeploymentTriggerError, "qa or production"):
+            trigger_deployment_worker(
+                RepositoryScope.BACKEND,
+                deployment_environment="staging",
+            )
+
+    def test_android_rejects_backend_deployment_environment_target(self):
+        with self.assertRaisesRegex(AgentDeploymentTriggerError, "only valid for backend"):
+            trigger_deployment_worker(
+                RepositoryScope.ANDROID,
+                deployment_environment="qa",
+            )
 
     @patch("backend.core.agent_deployment_trigger.os.open")
     def test_trigger_failure_is_actionable(self, open_file):
@@ -87,7 +127,15 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
             / "deployments/agent_common/libexec/remihub-agent-deployment-trigger"
         ).read_text()
         self.assertIn(
-            '"backend": "remihub-agent-deployment-production.service"',
+            '"backend": "remihub-agent-deployment-qa.service"',
+            text,
+        )
+        self.assertIn(
+            '"backend-qa": "remihub-agent-deployment-qa.service"',
+            text,
+        )
+        self.assertIn(
+            '"backend-production": "remihub-agent-deployment-production.service"',
             text,
         )
         self.assertIn(
@@ -115,9 +163,11 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
         )
         self.assertEqual(
             TRIGGER_REQUESTS[RepositoryScope.BACKEND],
-            Path(
-                "/run/remihub-agent/deployment-trigger/backend.request"
-            ),
+            BACKEND_QA_TRIGGER_REQUEST,
+        )
+        self.assertEqual(
+            BACKEND_PRODUCTION_TRIGGER_REQUEST,
+            Path("/run/remihub-agent/deployment-trigger/backend-production.request"),
         )
 
     def test_deprecated_sudoers_asset_is_removed(self):
@@ -139,6 +189,14 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
             "d /run/remihub-agent/deployment-trigger 0750 alex storage -",
             text,
         )
+        self.assertIn(
+            "r /run/remihub-agent/deployment-trigger/backend-qa.request - - - -",
+            text,
+        )
+        self.assertIn(
+            "r /run/remihub-agent/deployment-trigger/backend-production.request - - - -",
+            text,
+        )
         self.assertNotIn("0777", text)
 
     def test_path_units_watch_exact_markers(self):
@@ -154,8 +212,15 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
             android_path,
         )
         self.assertIn(
-            "PathExists=/run/remihub-agent/deployment-trigger/backend.request",
+            "PathExists=/run/remihub-agent/deployment-trigger/backend-qa.request",
             backend_path,
+        )
+        production_path = (
+            systemd / "remihub-agent-backend-production-deployment-trigger.path"
+        ).read_text()
+        self.assertIn(
+            "PathExists=/run/remihub-agent/deployment-trigger/backend-production.request",
+            production_path,
         )
 
     def test_trigger_services_use_fixed_root_helper_commands(self):
@@ -166,6 +231,9 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
         backend = (
             systemd / "remihub-agent-backend-deployment-trigger.service"
         ).read_text()
+        backend_production = (
+            systemd / "remihub-agent-backend-production-deployment-trigger.service"
+        ).read_text()
         self.assertIn(
             "ExecStart=/usr/local/libexec/"
             "remihub-agent-deployment-trigger android",
@@ -173,13 +241,20 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
         )
         self.assertIn(
             "ExecStart=/usr/local/libexec/"
-            "remihub-agent-deployment-trigger backend",
+            "remihub-agent-deployment-trigger backend-qa",
             backend,
+        )
+        self.assertIn(
+            "ExecStart=/usr/local/libexec/"
+            "remihub-agent-deployment-trigger backend-production",
+            backend_production,
         )
         self.assertIn("NoNewPrivileges=true", android)
         self.assertIn("NoNewPrivileges=true", backend)
+        self.assertIn("NoNewPrivileges=true", backend_production)
         self.assertNotIn("sudo", android)
         self.assertNotIn("sudo", backend)
+        self.assertNotIn("sudo", backend_production)
 
     def test_fallback_timers_are_independent_calendar_polls(self):
         systemd = self.ROOT / "deployments/agent_common/systemd"
@@ -189,19 +264,29 @@ class DeploymentTriggerAssetTests(unittest.TestCase):
         backend = (
             systemd / "remihub-agent-backend-deployment.timer"
         ).read_text()
+        backend_qa = (
+            systemd / "remihub-agent-backend-qa-deployment.timer"
+        ).read_text()
         self.assertIn("OnCalendar=*-*-* *:*:00", android)
+        self.assertIn("OnCalendar=*-*-* *:*:15", backend_qa)
         self.assertIn("OnCalendar=*-*-* *:*:30", backend)
         self.assertNotIn("OnUnitInactiveSec", android)
+        self.assertNotIn("OnUnitInactiveSec", backend_qa)
         self.assertNotIn("OnUnitInactiveSec", backend)
         self.assertIn(
             "Unit=remihub-agent-android-deployment.service",
             android,
         )
         self.assertIn(
+            "Unit=remihub-agent-deployment-qa.service",
+            backend_qa,
+        )
+        self.assertIn(
             "Unit=remihub-agent-deployment-production.service",
             backend,
         )
         self.assertIn("Persistent=true", android)
+        self.assertIn("Persistent=true", backend_qa)
         self.assertIn("Persistent=true", backend)
 
     def test_worker_grant_asset_is_column_limited(self):

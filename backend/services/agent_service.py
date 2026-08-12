@@ -306,16 +306,25 @@ def _decorate_card(card: dict, *, latest_run: dict | None = None) -> dict:
     return result
 
 
-def _request_deployment_worker(scope: RepositoryScope) -> None:
+def _request_deployment_worker(
+    scope: RepositoryScope,
+    *,
+    deployment_environment: str | None = None,
+) -> None:
     try:
-        trigger_deployment_worker(scope)
+        trigger_deployment_worker(
+            scope,
+            deployment_environment=deployment_environment,
+        )
     except AgentDeploymentTriggerError:
         # Approval/retry has already committed. Keep the run queued so the
         # systemd fallback timer can claim it, while retaining an actionable
         # server-side error for operators.
         logger.exception(
-            "Deployment worker immediate trigger failed; fallback timer will retry: scope=%s",
+            "Deployment worker immediate trigger failed; fallback timer will retry: "
+            "scope=%s deployment_environment=%s",
             scope.value,
+            deployment_environment,
         )
 
 
@@ -1254,7 +1263,10 @@ def approve_deployment(
     finally:
         put_db_conn(conn)
 
-    _request_deployment_worker(repository_scope)
+    if repository_scope is RepositoryScope.BACKEND:
+        _request_deployment_worker(repository_scope, deployment_environment="qa")
+    else:
+        _request_deployment_worker(repository_scope)
     return result
 
 
@@ -1423,7 +1435,13 @@ def retry_card(
         put_db_conn(conn)
 
     if deployment_trigger_scope is not None:
-        _request_deployment_worker(deployment_trigger_scope)
+        if deployment_trigger_scope is RepositoryScope.BACKEND:
+            _request_deployment_worker(
+                deployment_trigger_scope,
+                deployment_environment="qa",
+            )
+        else:
+            _request_deployment_worker(deployment_trigger_scope)
     return result
 
 
@@ -1581,7 +1599,13 @@ def retry_deployment_github_sync(
         put_db_conn(conn)
 
     if deployment_trigger_scope is not None:
-        _request_deployment_worker(deployment_trigger_scope)
+        if deployment_trigger_scope is RepositoryScope.BACKEND:
+            _request_deployment_worker(
+                deployment_trigger_scope,
+                deployment_environment="production",
+            )
+        else:
+            _request_deployment_worker(deployment_trigger_scope)
     return result
 
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=RemiHub Backend QA Deployment Queue Fallback Poll
+Documentation=file:///opt/remihub/deployments/agent_common/hardening/deployment-worker-trigger.md
+
+[Timer]
+OnCalendar=*-*-* *:*:15
+AccuracySec=5s
+Persistent=true
+Unit=remihub-agent-deployment-qa.service
+
+[Install]
+WantedBy=timers.target

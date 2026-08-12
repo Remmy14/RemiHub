@@ -137,16 +137,30 @@ UNIT_DEFINITIONS = (
     ),
     UnitDefinition(
         "remihub-agent-backend-deployment-timer",
-        "Backend Deployment Timer",
+        "Backend Production Deployment Timer",
         HealthComponentGroup.AGENT,
         "remihub-agent-backend-deployment.timer",
         ExpectedMode.ARMED_TIMER_OR_PATH,
     ),
     UnitDefinition(
+        "remihub-agent-backend-qa-deployment-timer",
+        "Backend QA Deployment Timer",
+        HealthComponentGroup.AGENT,
+        "remihub-agent-backend-qa-deployment.timer",
+        ExpectedMode.ARMED_TIMER_OR_PATH,
+    ),
+    UnitDefinition(
         "remihub-agent-backend-deployment-trigger-path",
-        "Backend Deployment Trigger Path",
+        "Backend QA Deployment Trigger Path",
         HealthComponentGroup.AGENT,
         "remihub-agent-backend-deployment-trigger.path",
+        ExpectedMode.ARMED_TIMER_OR_PATH,
+    ),
+    UnitDefinition(
+        "remihub-agent-backend-production-deployment-trigger-path",
+        "Backend Production Deployment Trigger Path",
+        HealthComponentGroup.AGENT,
+        "remihub-agent-backend-production-deployment-trigger.path",
         ExpectedMode.ARMED_TIMER_OR_PATH,
     ),
     UnitDefinition(
@@ -179,9 +193,16 @@ UNIT_DEFINITIONS = (
     ),
     UnitDefinition(
         "remihub-agent-backend-deployment-trigger",
-        "Backend Deployment Trigger",
+        "Backend QA Deployment Trigger",
         HealthComponentGroup.AGENT,
         "remihub-agent-backend-deployment-trigger.service",
+        ExpectedMode.ON_DEMAND,
+    ),
+    UnitDefinition(
+        "remihub-agent-backend-production-deployment-trigger",
+        "Backend Production Deployment Trigger",
+        HealthComponentGroup.AGENT,
+        "remihub-agent-backend-production-deployment-trigger.service",
         ExpectedMode.ON_DEMAND,
     ),
     UnitDefinition(

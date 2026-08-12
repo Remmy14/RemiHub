@@ -7,7 +7,9 @@ import sys
 
 
 UNITS = {
-    "backend": "remihub-agent-deployment-production.service",
+    "backend": "remihub-agent-deployment-qa.service",
+    "backend-qa": "remihub-agent-deployment-qa.service",
+    "backend-production": "remihub-agent-deployment-production.service",
     "android": "remihub-agent-android-deployment.service",
 }
 
@@ -17,7 +19,11 @@ def main() -> int:
         print("deployment trigger must run as root", file=sys.stderr)
         return 77
     if len(sys.argv) != 2 or sys.argv[1] not in UNITS:
-        print("usage: remihub-agent-deployment-trigger {backend|android}", file=sys.stderr)
+        print(
+            "usage: remihub-agent-deployment-trigger "
+            "{backend|backend-qa|backend-production|android}",
+            file=sys.stderr,
+        )
         return 64
 
     scope = sys.argv[1]

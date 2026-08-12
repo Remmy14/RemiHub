@@ -8,8 +8,10 @@ from backend.core.agent_worker import AgentLeaseLostError, ExecutionResult
 import backend.services.agent_worker_service as agent_worker_service_module
 from backend.services.agent_worker_service import (
     AgentQueueStateError,
+    DatabaseAgentQueue,
     _claimed_run_from_row,
     _validate_candidate,
+    block_run,
     claim_next_run,
     complete_run,
     fail_run,
@@ -87,6 +89,27 @@ with (
             database="remihub",
         )
         connection.close.assert_called_once_with()
+
+    @patch("backend.services.agent_worker_service.claim_next_run")
+    def test_database_queue_carries_deployment_environment(self, claim):
+        queue = DatabaseAgentQueue(
+            environment="production",
+            deployment_environment="production",
+        )
+        claim.return_value = None
+
+        result = queue.claim_next_run(
+            worker_id="worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.DEPLOYMENT}),
+            allowed_repository_scopes=frozenset({RepositoryScope.BACKEND}),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            claim.call_args.kwargs["deployment_environment"],
+            "production",
+        )
 
 
 def candidate(**overrides) -> dict:
@@ -295,6 +318,79 @@ class AgentClaimCandidateTests(unittest.TestCase):
         connection.rollback.assert_called_once_with()
         put_db_conn.assert_called_once_with(connection)
 
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_backend_deployment_qa_claim_excludes_qa_succeeded_runs(
+        self,
+        get_db_conn,
+        put_db_conn,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        get_db_conn.return_value = connection
+
+        result = claim_next_run(
+            worker_id="qa-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.DEPLOYMENT}),
+            allowed_repository_scopes=frozenset({RepositoryScope.BACKEND}),
+            deployment_environment="qa",
+        )
+
+        self.assertIsNone(result)
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("runs.result_metadata", sql)
+        self.assertIn("deployment_pipeline,stage", sql)
+        self.assertIn("<> 'qa_succeeded'", sql)
+        self.assertEqual(parameters, (["deployment"], ["backend"]))
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_backend_deployment_production_claim_requires_qa_succeeded(
+        self,
+        get_db_conn,
+        put_db_conn,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = None
+        get_db_conn.return_value = connection
+
+        result = claim_next_run(
+            worker_id="production-worker",
+            lease_seconds=120,
+            allowed_phases=frozenset({RunPhase.DEPLOYMENT}),
+            allowed_repository_scopes=frozenset({RepositoryScope.BACKEND}),
+            deployment_environment="production",
+        )
+
+        self.assertIsNone(result)
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("runs.result_metadata", sql)
+        self.assertIn("deployment_pipeline,stage", sql)
+        self.assertIn("= 'qa_succeeded'", sql)
+        self.assertEqual(parameters, (["deployment"], ["backend"]))
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_claim_rejects_invalid_deployment_environment_before_database(
+        self,
+        get_db_conn,
+    ):
+        with self.assertRaisesRegex(ValueError, "deployment_environment"):
+            claim_next_run(
+                worker_id="qa-worker",
+                lease_seconds=120,
+                allowed_phases=frozenset({RunPhase.DEPLOYMENT}),
+                deployment_environment="staging",
+            )
+
+        get_db_conn.assert_not_called()
+
     def test_claim_rejects_empty_phase_capability(self):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             claim_next_run(
@@ -304,6 +400,7 @@ class AgentClaimCandidateTests(unittest.TestCase):
             )
 
     def test_claimed_run_includes_repository_scope(self):
+        result_metadata = {"deployment_pipeline": {"stage": "qa_succeeded"}}
         claim = _claimed_run_from_row(
             {
                 **candidate(active_card_status="planning"),
@@ -318,11 +415,13 @@ class AgentClaimCandidateTests(unittest.TestCase):
                 "worktree_path": None,
                 "codex_thread_id": None,
                 "repository_scope": "android",
+                "result_metadata": result_metadata,
             },
             [],
         )
 
         self.assertEqual(claim.repository_scope, RepositoryScope.ANDROID)
+        self.assertEqual(claim.result_metadata, result_metadata)
 
 
 class AgentHeartbeatTests(unittest.TestCase):
@@ -769,6 +868,66 @@ class RunCompletionTests(unittest.TestCase):
     @patch("backend.services.agent_worker_service._lock_owned_run")
     @patch("backend.services.agent_worker_service.put_db_conn")
     @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_qa_success_requeues_same_backend_deployment_run(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_message,
+        insert_event,
+        insert_notification,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        lock_owned_run.return_value = {
+            "card_status": "deploying",
+            "phase": "deployment",
+            "repository_scope": "backend",
+        }
+        insert_message.return_value = "message-id"
+        claim = claimed_run(phase=RunPhase.DEPLOYMENT)
+        pipeline = {
+            "stage": "qa_succeeded",
+            "deployment_run_id": claim.id,
+            "candidate_commit": "a" * 40,
+        }
+
+        complete_run(
+            claim,
+            ExecutionResult(
+                message="QA deployed",
+                card_status=CardStatus.DEPLOYMENT_QUEUED,
+                metadata={
+                    "deployment_pipeline": pipeline,
+                    "candidate": {"candidate_commit": "a" * 40},
+                },
+            ),
+        )
+
+        run_update_sql, run_update_parameters = cursor.execute.call_args_list[0].args
+        self.assertIn("status = %s", run_update_sql)
+        self.assertIn("finished_at = NULL", run_update_sql)
+        self.assertIn("result_metadata = %s::jsonb", run_update_sql)
+        self.assertEqual(run_update_parameters[0], "queued")
+        self.assertEqual(run_update_parameters[1], "message-id")
+        self.assertIn('"stage": "qa_succeeded"', run_update_parameters[2])
+        self.assertEqual(run_update_parameters[3], claim.id)
+        card_update_sql, card_update_parameters = cursor.execute.call_args_list[1].args
+        self.assertIn("status = %s", card_update_sql)
+        self.assertEqual(card_update_parameters, ("deployment_queued", claim.card_id))
+        insert_event.assert_called_once()
+        self.assertEqual(insert_event.call_args.kwargs["event_type"], "run.qa_succeeded")
+        insert_notification.assert_not_called()
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service.insert_notification")
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._insert_message")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
     def test_frontend_completion_inserts_build_ready_notification(
         self,
         get_db_conn,
@@ -869,11 +1028,62 @@ class AgentWorkerIdentityTests(unittest.TestCase):
 
 class RunFailureMetadataTests(unittest.TestCase):
     @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_block_run_merges_metadata_without_losing_deployment_pipeline(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        get_db_conn.return_value = connection
+        claim = claimed_run(phase=RunPhase.DEPLOYMENT)
+        claim = type(claim)(
+            **{
+                **claim.__dict__,
+                "result_metadata": {
+                    "deployment_pipeline": {
+                        "stage": "qa_succeeded",
+                        "candidate_commit": "a" * 40,
+                    }
+                },
+            }
+        )
+        lock_owned_run.return_value = {
+            "card_status": "deploying",
+            "phase": "deployment",
+            "repository_scope": "backend",
+        }
+
+        block_run(
+            claim,
+            reason="GitHub sync pending",
+            retry_after_seconds=60,
+            metadata={"deployment_recovery": {"retryable": True}},
+        )
+
+        run_update_sql, run_update_parameters = cursor.execute.call_args_list[0].args
+        self.assertIn("result_metadata = %s::jsonb", run_update_sql)
+        self.assertIn('"deployment_pipeline"', run_update_parameters[3])
+        self.assertIn('"deployment_recovery"', run_update_parameters[3])
+        insert_event.assert_called_once()
+        self.assertIn(
+            "deployment_pipeline",
+            insert_event.call_args.kwargs["payload"]["metadata"],
+        )
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service._insert_event")
     @patch("backend.services.agent_worker_service._insert_message")
     @patch("backend.services.agent_worker_service._lock_owned_run")
     @patch("backend.services.agent_worker_service.put_db_conn")
     @patch("backend.services.agent_worker_service.get_db_conn")
-    def test_fail_run_clears_result_metadata_without_parameter_mismatch(
+    def test_fail_run_preserves_deployment_pipeline_without_parameter_mismatch(
         self,
         get_db_conn,
         put_db_conn,
@@ -885,6 +1095,18 @@ class RunFailureMetadataTests(unittest.TestCase):
         cursor = connection.cursor.return_value.__enter__.return_value
         get_db_conn.return_value = connection
         claim = claimed_run()
+        claim = type(claim)(
+            **{
+                **claim.__dict__,
+                "result_metadata": {
+                    "deployment_pipeline": {
+                        "stage": "qa_succeeded",
+                        "candidate_commit": "a" * 40,
+                    },
+                    "discarded": True,
+                },
+            }
+        )
         lock_owned_run.return_value = {
             "card_status": "planning",
             "phase": "planning",
@@ -894,12 +1116,15 @@ class RunFailureMetadataTests(unittest.TestCase):
         fail_run(claim, error_message="boom")
 
         run_update_sql, run_update_parameters = cursor.execute.call_args_list[0].args
-        self.assertIn("result_metadata = '{}'::jsonb", run_update_sql)
+        self.assertIn("result_metadata = %s::jsonb", run_update_sql)
         self.assertEqual(run_update_sql.count("%s"), len(run_update_parameters))
         self.assertEqual(
-            run_update_parameters,
-            ("failed", "boom", claim.id),
+            run_update_parameters[0:2],
+            ("failed", "boom"),
         )
+        self.assertIn('"deployment_pipeline"', run_update_parameters[2])
+        self.assertNotIn("discarded", run_update_parameters[2])
+        self.assertEqual(run_update_parameters[3], claim.id)
         insert_message.assert_called_once()
         insert_event.assert_called_once()
         connection.commit.assert_called_once_with()

@@ -8,7 +8,8 @@ invoke `sudo`.
 
 `backend.core.agent_deployment_trigger` writes one exact request marker:
 
-- `/run/remihub-agent/deployment-trigger/backend.request`
+- `/run/remihub-agent/deployment-trigger/backend-qa.request`
+- `/run/remihub-agent/deployment-trigger/backend-production.request`
 - `/run/remihub-agent/deployment-trigger/android.request`
 
 The runtime directory is created by
@@ -18,8 +19,13 @@ mode `0750`. Marker creation is the only API-side operation.
 Root-owned systemd path units observe those exact marker files. Their paired
 oneshot services consume the marker and invoke the fixed-scope
 `/usr/local/libexec/remihub-agent-deployment-trigger` helper. The helper retains
-an exact allowlist of the two protected deployment services and starts them with
+an exact allowlist of the protected deployment services and starts them with
 `systemctl --no-block`.
+
+Fresh backend deployment approvals and normal deployment retries request the QA
+deployment worker first. Backend production wakeups are explicit and reserved
+for production-stage retries such as GitHub synchronization recovery. Android
+wakeups keep their existing request marker and target service.
 
 This design remains compatible with `remihub.service` running under
 `NoNewPrivileges=yes`. No sudoers entry is installed for the HTTP-service user.
@@ -33,7 +39,14 @@ Independent calendar timers poll the queue even when a marker cannot be
 created or consumed:
 
 - Android at every minute boundary;
-- backend at thirty seconds past every minute.
+- backend QA at fifteen seconds past every minute;
+- backend production at thirty seconds past every minute.
+
+The QA timer targets `remihub-agent-deployment-qa.service`; the production
+timer targets `remihub-agent-deployment-production.service`. Production polling
+remains necessary because a QA-successful backend deployment is requeued with
+the same run/card/candidate and becomes production-eligible only after
+`deployment_pipeline.stage = "qa_succeeded"` is recorded.
 
 Calendar scheduling is intentional. A transition-relative
 `OnUnitInactiveSec=` timer can become permanently `active (elapsed)` if it is

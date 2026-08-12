@@ -42,9 +42,11 @@ Environment=PYTHONUNBUFFERED=1
 Environment=GIT_OPTIONAL_LOCKS=0
 Environment=GIT_CONFIG_NOSYSTEM=1
 Environment=GIT_CONFIG_GLOBAL=/opt/remihub-agent/deployment/config/git-safe-directory.ini
-Environment=REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/qa-worker.ini
+Environment=REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/prod-worker.ini
 Environment=REMIHUB_AGENT_ENVIRONMENT=qa
+Environment=REMIHUB_AGENT_QUEUE_ENVIRONMENT=production
 Environment=REMIHUB_AGENT_EXECUTOR=git-backend-deployment
+Environment=REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT=qa
 Environment=REMIHUB_AGENT_REPOSITORY=/opt/remihub-agent/repositories/remihub-implementation.git
 Environment=REMIHUB_AGENT_WORKTREE_ROOT=/opt/remihub-agent/implementation/worktrees
 Environment=REMIHUB_AGENT_ARTIFACT_ROOT=/opt/remihub-agent/implementation/artifacts

@@ -1615,6 +1615,7 @@ class GitBackendDeploymentManager:
         runtime: DeploymentRuntime,
         frontend_builder: FrontendArtifactBuilder | None = None,
         qa_history_reader: MigrationHistoryReader | None = None,
+        qa_candidate_repository: str | Path | None = None,
         git_binary: str = "git",
         command_timeout_seconds: int = 120,
     ):
@@ -1636,6 +1637,7 @@ class GitBackendDeploymentManager:
             environment=normalized_environment,
         )
         self.qa_history_reader = qa_history_reader
+        self.qa_candidate_repository = None
 
         self.source_repository = _required_absolute_directory(
             source_repository,
@@ -1678,6 +1680,19 @@ class GitBackendDeploymentManager:
             raise AgentWorkerConfigurationError(
                 "Production backend deployment requires QA migration parity reader"
             )
+        if self.environment == "production":
+            if qa_candidate_repository is None:
+                raise AgentWorkerConfigurationError(
+                    "Production backend deployment requires QA candidate repository"
+                )
+            self.qa_candidate_repository = _required_absolute_directory(
+                qa_candidate_repository,
+                field="REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY",
+            )
+        elif qa_candidate_repository is not None:
+            raise AgentWorkerConfigurationError(
+                "QA candidate repository verification is restricted to production"
+            )
 
         self._run_git(
             self.source_repository,
@@ -1701,6 +1716,20 @@ class GitBackendDeploymentManager:
             raise AgentWorkerConfigurationError(
                 "Deployment target must be separate from implementation source"
             )
+        if self.qa_candidate_repository is not None:
+            self._run_git(
+                self.qa_candidate_repository,
+                "rev-parse",
+                "--git-dir",
+                error_context="The QA candidate repository is not a Git repository",
+            )
+            qa_candidate_common_directory = self._common_git_directory(
+                self.qa_candidate_repository
+            )
+            if qa_candidate_common_directory == self.target_common_directory:
+                raise AgentWorkerConfigurationError(
+                    "Production deployment target must be separate from QA candidate repository"
+                )
         if self._run_git(
             self.target_repository,
             "rev-parse",
@@ -1749,6 +1778,7 @@ class GitBackendDeploymentManager:
                 candidate_branch, candidate_commit, candidate_path = (
                     self._materialize_candidate(claim, approved)
                 )
+                self._verify_qa_candidate(claim, candidate_commit)
                 migration_plan = self._migration_plan(
                     approved.base_commit,
                     candidate_commit,
@@ -1866,6 +1896,46 @@ class GitBackendDeploymentManager:
                 self._write_manifest(manifest_path, manifest)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _qa_candidate_commit_from_pipeline(self, claim: ClaimedRun) -> str:
+        pipeline = claim.result_metadata.get("deployment_pipeline")
+        if (
+            not isinstance(pipeline, dict)
+            or pipeline.get("stage") != "qa_succeeded"
+        ):
+            raise AgentDeploymentError(
+                "Production deployment requires QA-succeeded pipeline metadata"
+            )
+        candidate_commit = pipeline.get("candidate_commit")
+        if not isinstance(candidate_commit, str) or not re.fullmatch(
+            r"[0-9a-f]{40}",
+            candidate_commit,
+        ):
+            raise AgentDeploymentError(
+                "Production deployment requires QA candidate commit metadata"
+            )
+        return candidate_commit
+
+    def _verify_qa_candidate(
+        self,
+        claim: ClaimedRun,
+        candidate_commit: str,
+    ) -> None:
+        if self.environment != "production":
+            return
+        assert self.qa_candidate_repository is not None
+        if self._qa_candidate_commit_from_pipeline(claim) != candidate_commit:
+            raise AgentDeploymentError(
+                "Production candidate does not match the QA-validated candidate"
+            )
+        qa_head = self._resolve_commit(
+            self.qa_candidate_repository,
+            "qa-main",
+        )
+        if qa_head != candidate_commit:
+            raise AgentDeploymentError(
+                "Production candidate does not match the QA-validated candidate"
+            )
 
 
     def _execute_candidate(
@@ -2463,6 +2533,29 @@ class GitBackendDeploymentManager:
 
         target_head = self._resolve_commit(self.target_repository, self.target_branch)
         existing_candidate = self._branch_commit(candidate_branch)
+        qa_candidate_commit = None
+        if self.environment == "production":
+            qa_candidate_commit = self._qa_candidate_commit_from_pipeline(claim)
+            if target_head not in {approved.base_commit, existing_candidate}:
+                raise AgentDeploymentError(
+                    "Deployment target advanced before candidate creation"
+                )
+            if existing_candidate is None:
+                assert self.qa_candidate_repository is not None
+                self._run_git(
+                    self.target_repository,
+                    "fetch",
+                    str(self.qa_candidate_repository),
+                    f"{qa_candidate_commit}:refs/heads/{candidate_branch}",
+                    error_context=(
+                        "Unable to import the QA-validated deployment candidate"
+                    ),
+                )
+                existing_candidate = self._branch_commit(candidate_branch)
+            if existing_candidate != qa_candidate_commit:
+                raise AgentDeploymentError(
+                    "Production candidate does not match the QA-validated candidate"
+                )
         if target_head not in {approved.base_commit, existing_candidate}:
             raise AgentDeploymentError(
                 "Deployment target advanced before candidate creation"
@@ -2510,7 +2603,7 @@ class GitBackendDeploymentManager:
             )
 
         branch_head = self._resolve_commit(candidate_path, "HEAD")
-        if branch_head == approved.base_commit:
+        if branch_head == approved.base_commit and self.environment != "production":
             self._require_clean(candidate_path)
             self._run_git(
                 candidate_path,
@@ -2542,6 +2635,14 @@ class GitBackendDeploymentManager:
             candidate_commit = self._resolve_commit(candidate_path, "HEAD")
         else:
             candidate_commit = branch_head
+
+        if (
+            qa_candidate_commit is not None
+            and candidate_commit != qa_candidate_commit
+        ):
+            raise AgentDeploymentError(
+                "Production candidate does not match the QA-validated candidate"
+            )
 
         self._validate_candidate_commit(candidate_commit, approved)
         self._require_clean(candidate_path)
@@ -3615,12 +3716,31 @@ Changed files:
 """.strip()
         return ExecutionResult(
             message=message,
-            card_status=CardStatus.COMPLETED,
+            card_status=(
+                CardStatus.DEPLOYMENT_QUEUED
+                if candidate.environment == "qa"
+                else CardStatus.COMPLETED
+            ),
             metadata={
                 "executor": "git_backend_deployment",
                 "phase": claim.phase.value,
                 "environment": candidate.environment,
                 "mode": "backend-qa-to-production",
+                "deployment_pipeline": {
+                    "stage": (
+                        "qa_succeeded"
+                        if candidate.environment == "qa"
+                        else "production_succeeded"
+                    ),
+                    "card_id": claim.card_id,
+                    "deployment_run_id": claim.id,
+                    "candidate_commit": candidate.candidate_commit,
+                    "qa_candidate_repository": (
+                        str(self.deployment_manager.target_repository)
+                        if candidate.environment == "qa"
+                        else None
+                    ),
+                },
                 "candidate": asdict(candidate),
                 "github_sync": github_sync,
                 "deployment_recovery": deployment_recovery_metadata(

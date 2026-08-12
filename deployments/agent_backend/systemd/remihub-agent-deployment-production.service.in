@@ -11,6 +11,7 @@ ConditionPathIsDirectory=/opt/remihub-agent/implementation/artifacts
 ConditionPathIsDirectory=/opt/remihub-agent/deployment/production/repository.git
 ConditionPathIsDirectory=/opt/remihub-agent/deployment/production/worktrees
 ConditionPathIsDirectory=/opt/remihub-agent/deployment/production/artifacts
+ConditionPathIsDirectory=/opt/remihub-agent/deployment/qa/repository.git
 ConditionPathIsDirectory=/var/cache/remihub-agent/npm
 ConditionPathIsDirectory=/var/lib/remihub-agent/npm-prep
 ConditionFileIsExecutable=/opt/remihub-agent/runtime/venv/bin/python
@@ -49,6 +50,7 @@ Environment=GIT_CONFIG_GLOBAL=/opt/remihub-agent/deployment/config/git-safe-dire
 Environment=REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/prod-worker.ini
 Environment=REMIHUB_AGENT_ENVIRONMENT=production
 Environment=REMIHUB_AGENT_EXECUTOR=git-backend-deployment
+Environment=REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT=production
 Environment=REMIHUB_AGENT_REPOSITORY=/opt/remihub-agent/repositories/remihub-implementation.git
 Environment=REMIHUB_AGENT_WORKTREE_ROOT=/opt/remihub-agent/implementation/worktrees
 Environment=REMIHUB_AGENT_ARTIFACT_ROOT=/opt/remihub-agent/implementation/artifacts
@@ -56,6 +58,7 @@ Environment=REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY=/opt/remihub-agent/deploy
 Environment=REMIHUB_AGENT_DEPLOYMENT_WORKTREE_ROOT=/opt/remihub-agent/deployment/production/worktrees
 Environment=REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT=/opt/remihub-agent/deployment/production/artifacts
 Environment=REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH=production-main
+Environment=REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY=/opt/remihub-agent/deployment/qa/repository.git
 Environment=REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/prod-migrator.ini
 Environment=REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE=remihub
 Environment=REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/qa-parity-reader.ini
@@ -94,6 +97,7 @@ IPAddressAllow=localhost
 ReadWritePaths=/opt/remihub
 ReadWritePaths=/opt/remihub-agent/repositories/remihub-planning
 ReadWritePaths=/opt/remihub-agent/repositories/remihub-implementation.git
+ReadOnlyPaths=/opt/remihub-agent/deployment/qa/repository.git
 ReadWritePaths=/opt/remihub-agent/deployment/production/repository.git
 ReadWritePaths=/opt/remihub-agent/deployment/production/worktrees
 ReadWritePaths=/opt/remihub-agent/deployment/production/artifacts

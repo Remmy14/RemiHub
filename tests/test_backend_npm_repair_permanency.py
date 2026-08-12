@@ -47,6 +47,13 @@ SANDBOX_PATH = (
 )
 INSTALLER_PATH = ROOT / "deployments" / "agent_backend" / "install-package.sh"
 SYSTEMD_PATH = ROOT / "deployments" / "agent_backend" / "systemd"
+COMMON_SYSTEMD_PATH = ROOT / "deployments" / "agent_common" / "systemd"
+BACKEND_TRIGGER_STATE_UNITS = (
+    "remihub-agent-backend-deployment-trigger.path",
+    "remihub-agent-backend-production-deployment-trigger.path",
+    "remihub-agent-backend-qa-deployment.timer",
+    "remihub-agent-backend-deployment.timer",
+)
 
 
 def _load_cache_control():
@@ -72,6 +79,18 @@ def _load_deployment_control():
     unittest.addModuleCleanup(sys.modules.pop, loader.name, None)
     loader.exec_module(module)
     return module
+
+
+def _function_body(source: str, name: str) -> str:
+    marker = f"\n  {name}() {{"
+    start = source.index(marker)
+    next_function = source.find("\n  ", start + len(marker))
+    while next_function != -1:
+        candidate = source.find("() {", next_function, source.find("\n", next_function))
+        if candidate != -1:
+            return source[start:next_function]
+        next_function = source.find("\n  ", next_function + 1)
+    return source[start:]
 
 
 npm_cache = _load_cache_control()
@@ -662,6 +681,269 @@ class PermanentAssetContractTests(unittest.TestCase):
                     "ReadWritePaths=/var/cache/remihub-agent/npm", source
                 )
                 self.assertNotIn("zzzz-npm-auto-hotfix.conf", source)
+                self.assertNotIn(
+                    "backend-deployment-qa-sequencing-hotfix-v1.0.3-cccc863d",
+                    source,
+                )
+
+    def test_worker_units_have_permanent_qa_production_sequencing_config(self):
+        qa = (
+            SYSTEMD_PATH / "remihub-agent-deployment-qa.service.in"
+        ).read_text(encoding="utf-8")
+        production = (
+            SYSTEMD_PATH / "remihub-agent-deployment-production.service.in"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Environment=REMIHUB_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/prod-worker.ini",
+            qa,
+        )
+        self.assertIn("Environment=REMIHUB_AGENT_ENVIRONMENT=qa", qa)
+        self.assertIn("Environment=REMIHUB_AGENT_QUEUE_ENVIRONMENT=production", qa)
+        self.assertIn("Environment=REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT=qa", qa)
+        self.assertIn(
+            "Environment=REMIHUB_AGENT_DEPLOYMENT_TARGET_REPOSITORY=/opt/remihub-agent/deployment/qa/repository.git",
+            qa,
+        )
+        self.assertIn(
+            "Environment=REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG=/opt/remihub-agent/deployment/config/qa-migrator.ini",
+            qa,
+        )
+        self.assertIn(
+            "Environment=REMIHUB_AGENT_ENVIRONMENT=production",
+            production,
+        )
+        self.assertIn(
+            "Environment=REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT=production",
+            production,
+        )
+        self.assertIn(
+            "Environment=REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY=/opt/remihub-agent/deployment/qa/repository.git",
+            production,
+        )
+        self.assertIn(
+            "ReadOnlyPaths=/opt/remihub-agent/deployment/qa/repository.git",
+            production,
+        )
+
+    def test_permanent_qa_wakeup_assets_are_source_controlled(self):
+        qa_timer = (
+            COMMON_SYSTEMD_PATH / "remihub-agent-backend-qa-deployment.timer"
+        ).read_text(encoding="utf-8")
+        production_timer = (
+            COMMON_SYSTEMD_PATH / "remihub-agent-backend-deployment.timer"
+        ).read_text(encoding="utf-8")
+        backend_trigger = (
+            COMMON_SYSTEMD_PATH / "remihub-agent-backend-deployment-trigger.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Unit=remihub-agent-deployment-qa.service", qa_timer)
+        self.assertIn("Persistent=true", qa_timer)
+        self.assertIn(
+            "Unit=remihub-agent-deployment-production.service",
+            production_timer,
+        )
+        self.assertIn(
+            "remihub-agent-deployment-trigger backend-qa",
+            backend_trigger,
+        )
+        for source in (qa_timer, production_timer, backend_trigger):
+            self.assertNotIn("98-qa-sequencing-hotfix.conf", source)
+            self.assertNotIn(
+                "backend-deployment-qa-sequencing-hotfix-v1.0.3-cccc863d",
+                source,
+            )
+
+    def test_installer_permanentizes_backend_qa_wakeup_assets(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "/etc/systemd/system/remihub-agent-backend-qa-deployment.timer",
+            source,
+        )
+        self.assertIn(
+            "/etc/systemd/system/remihub-agent-backend-deployment.timer",
+            source,
+        )
+        self.assertIn(
+            "/usr/local/libexec/remihub-agent-deployment-trigger",
+            source,
+        )
+        self.assertIn(
+            "remihub-agent-backend-qa-deployment.timer",
+            source,
+        )
+        self.assertIn(
+            "remihub-agent-backend-deployment-trigger.path",
+            source,
+        )
+        self.assertIn(
+            "remihub-agent-backend-production-deployment-trigger.path",
+            source,
+        )
+        self.assertIn("systemd-analyze verify", source)
+        self.assertIn("systemctl enable --now", source)
+
+    def test_installer_captures_exact_trigger_timer_rollback_state(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("DEPLOYMENT_TRIGGER_STATE_UNITS=(", source)
+        for unit in BACKEND_TRIGGER_STATE_UNITS:
+            self.assertIn(unit, source)
+        self.assertIn(
+            'unit_path="/etc/systemd/system/$unit"',
+            source,
+        )
+        self.assertIn(
+            'enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"',
+            source,
+        )
+        self.assertIn(
+            'active_state="$(systemctl is-active "$unit" 2>/dev/null || true)"',
+            source,
+        )
+        self.assertIn(
+            '>>"$BACKUP/deployment-trigger-unit-state.tsv"',
+            source,
+        )
+        capture_call = source.index(
+            "\n  capture_deployment_trigger_unit_state\n",
+        )
+        self.assertLess(source.index("\n  backup_system_paths\n"), capture_call)
+        self.assertLess(capture_call, source.index("SYSTEM_MUTATED=1"))
+        self.assertIn("DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED=0", source)
+        capture_body = _function_body(
+            source,
+            "capture_deployment_trigger_unit_state",
+        )
+        self.assertIn("DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED=1", capture_body)
+
+    def test_early_rollback_before_trigger_state_capture_does_not_touch_units(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        rollback_body = _function_body(source, "rollback")
+
+        guarded_stop = (
+            'if [[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]]; then'
+        )
+        guard_index = rollback_body.index(guarded_stop)
+        restore_guard_index = rollback_body.index(
+            'elif [[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]]; then'
+        )
+        first_bounded_unit_index = min(
+            rollback_body.index(unit)
+            for unit in BACKEND_TRIGGER_STATE_UNITS
+        )
+        self.assertGreater(first_bounded_unit_index, guard_index)
+        self.assertIn(
+            "restore_deployment_trigger_unit_state ||",
+            rollback_body[restore_guard_index:],
+        )
+        self.assertNotIn(
+            "restore_deployment_trigger_unit_state ||",
+            rollback_body[:restore_guard_index],
+        )
+        for command in ("start", "enable", "disable"):
+            for unit in BACKEND_TRIGGER_STATE_UNITS:
+                self.assertNotIn(
+                    f"systemctl {command} {unit}",
+                    rollback_body,
+                )
+
+    def test_installer_quiesces_schedulers_only_after_capture(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        quiesce_body = _function_body(source, "quiesce_deployment_trigger_units")
+
+        self.assertIn(
+            '[[ "$DEPLOYMENT_TRIGGER_UNIT_STATE_CAPTURED" -eq 1 ]]',
+            quiesce_body,
+        )
+        for unit in BACKEND_TRIGGER_STATE_UNITS:
+            self.assertIn(unit, quiesce_body)
+        self.assertIn("systemctl stop \\", quiesce_body)
+        self.assertIn("|| true", quiesce_body)
+
+        capture_call = source.index("\n  capture_deployment_trigger_unit_state\n")
+        quiesce_call = source.index("\n  quiesce_deployment_trigger_units\n")
+        system_mutated = source.index("SYSTEM_MUTATED=1")
+        self.assertLess(capture_call, quiesce_call)
+        self.assertLess(quiesce_call, system_mutated)
+
+    def test_installer_keeps_schedulers_quiesced_until_final_checks(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        production_verification = source.index(
+            'echo "[10/10] Final consistency checks and service restoration"'
+        )
+        final_postcheck = source.index('echo "CRITICAL_PARENT_POSTCHECK=PASS"')
+        final_enable = source.index("systemctl enable --now \\", final_postcheck)
+
+        for unit in BACKEND_TRIGGER_STATE_UNITS:
+            self.assertNotIn(
+                f"systemctl enable --now {unit}",
+                source[:final_enable],
+            )
+            self.assertNotIn(
+                f"systemctl start {unit}",
+                source[:final_enable],
+            )
+        self.assertLess(production_verification, final_enable)
+        for unit in BACKEND_TRIGGER_STATE_UNITS:
+            self.assertIn(unit, source[final_enable:])
+        self.assertIn(
+            'printf \'installed_commit=%s\\nrelease=%s\\nbackup=%s\\n\'',
+            source[final_enable:],
+        )
+
+    def test_installer_restores_trigger_timer_enablement_and_activity(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        restore_body = _function_body(
+            source,
+            "restore_deployment_trigger_unit_state",
+        )
+
+        self.assertIn('systemctl enable "$unit" || true', restore_body)
+        self.assertIn('systemctl enable --runtime "$unit" || true', restore_body)
+        self.assertIn('systemctl disable "$unit" || true', restore_body)
+        self.assertIn('systemctl start "$unit" || true', restore_body)
+        self.assertIn('systemctl stop "$unit" || true', restore_body)
+        self.assertIn('systemctl reset-failed "$unit" || true', restore_body)
+        self.assertIn(
+            'echo "Unexpected deployment trigger unit in restore manifest: $unit"',
+            restore_body,
+        )
+        self.assertIn(
+            'echo "Deployment trigger unit state was not captured; refusing restore."',
+            restore_body,
+        )
+        self.assertNotIn("/etc/systemd/system/*.wants", source)
+        self.assertNotIn("rm -rf -- /etc/systemd/system", source)
+
+        restore_index = source.index("restore_system_paths()")
+        reload_index = source.index("systemctl daemon-reload || true", restore_index)
+        state_restore_index = source.index(
+            "restore_deployment_trigger_unit_state",
+            reload_index,
+        )
+        self.assertLess(reload_index, state_restore_index)
+
+    def test_successful_install_enables_all_backend_trigger_and_timer_units(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        final_postcheck = source.index('echo "CRITICAL_PARENT_POSTCHECK=PASS"')
+        final_enable = source.index("systemctl enable --now \\", final_postcheck)
+        final_success_record = source.index(
+            "printf 'installed_commit=%s\\nrelease=%s\\nbackup=%s\\n'",
+            final_postcheck,
+        )
+        enable_block = source[
+            final_enable:final_success_record
+        ]
+
+        self.assertIn("remihub-agent-backend-deployment-trigger.path", enable_block)
+        self.assertIn(
+            "remihub-agent-backend-production-deployment-trigger.path",
+            enable_block,
+        )
+        self.assertIn("remihub-agent-backend-qa-deployment.timer", enable_block)
+        self.assertIn("remihub-agent-backend-deployment.timer", enable_block)
 
     def test_validator_executes_network_behavioral_probe(self):
         source = SANDBOX_PATH.read_text(encoding="utf-8")

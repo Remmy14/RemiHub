@@ -69,6 +69,7 @@ def _boolean(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class AgentWorkerSettings:
     environment: str
+    queue_environment: str
     executor_name: str
     worker_id: str
     poll_seconds: int
@@ -90,7 +91,9 @@ class AgentWorkerSettings:
     deployment_target_repository: str | None
     deployment_worktree_root: str | None
     deployment_artifact_root: str | None
+    deployment_environment: str | None
     deployment_target_branch: str
+    deployment_qa_candidate_repository: str | None
     deployment_database_config: str | None
     deployment_database_owner_role: str | None
     deployment_qa_parity_database_config: str | None
@@ -122,6 +125,18 @@ class AgentWorkerSettings:
         if environment not in {"qa", "production"}:
             raise AgentWorkerConfigurationError(
                 "REMIHUB_AGENT_ENVIRONMENT must be qa or production"
+            )
+        queue_environment = (
+            os.environ.get(
+                "REMIHUB_AGENT_QUEUE_ENVIRONMENT",
+                environment,
+            )
+            .strip()
+            .lower()
+        )
+        if queue_environment not in {"qa", "production"}:
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_QUEUE_ENVIRONMENT must be qa or production"
             )
 
         executor_name = (
@@ -183,6 +198,21 @@ class AgentWorkerSettings:
         deployment_artifact_root = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_ARTIFACT_ROOT"
         )
+        deployment_environment = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT"
+        )
+        normalized_deployment_environment = (
+            deployment_environment.strip().lower()
+            if deployment_environment and deployment_environment.strip()
+            else None
+        )
+        if (
+            normalized_deployment_environment is not None
+            and normalized_deployment_environment not in {"qa", "production"}
+        ):
+            raise AgentWorkerConfigurationError(
+                "REMIHUB_AGENT_DEPLOYMENT_ENVIRONMENT must be qa or production"
+            )
         deployment_target_branch = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_TARGET_BRANCH",
             "qa-main" if environment == "qa" else "production-main",
@@ -193,6 +223,9 @@ class AgentWorkerSettings:
             )
         deployment_database_config = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_DATABASE_CONFIG"
+        )
+        deployment_qa_candidate_repository = os.environ.get(
+            "REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY"
         )
         deployment_database_owner_role = os.environ.get(
             "REMIHUB_AGENT_DEPLOYMENT_DATABASE_OWNER_ROLE"
@@ -232,6 +265,7 @@ class AgentWorkerSettings:
 
         return cls(
             environment=environment,
+            queue_environment=queue_environment,
             executor_name=executor_name,
             worker_id=worker_id,
             poll_seconds=_positive_int("REMIHUB_AGENT_POLL_SECONDS", 5),
@@ -305,7 +339,23 @@ class AgentWorkerSettings:
                 if deployment_artifact_root and deployment_artifact_root.strip()
                 else None
             ),
+            deployment_environment=(
+                normalized_deployment_environment
+                if normalized_deployment_environment is not None
+                else (
+                    environment
+                    if executor_name
+                    in {"git-backend-deployment", "git-deployment-qa"}
+                    else None
+                )
+            ),
             deployment_target_branch=deployment_target_branch,
+            deployment_qa_candidate_repository=(
+                deployment_qa_candidate_repository.strip()
+                if deployment_qa_candidate_repository
+                and deployment_qa_candidate_repository.strip()
+                else None
+            ),
             deployment_database_config=(
                 deployment_database_config.strip()
                 if deployment_database_config and deployment_database_config.strip()
@@ -615,6 +665,9 @@ def build_executor(
             required_paths["REMIHUB_AGENT_DEPLOYMENT_QA_PARITY_DATABASE_CONFIG"] = (
                 settings.deployment_qa_parity_database_config
             )
+            required_paths["REMIHUB_AGENT_DEPLOYMENT_QA_CANDIDATE_REPOSITORY"] = (
+                settings.deployment_qa_candidate_repository
+            )
         missing = [name for name, value in required_paths.items() if value is None]
         if missing:
             raise AgentWorkerConfigurationError(
@@ -658,6 +711,7 @@ def build_executor(
             database=database,
             runtime=runtime,
             qa_history_reader=qa_history_reader,
+            qa_candidate_repository=settings.deployment_qa_candidate_repository,
             command_timeout_seconds=settings.git_timeout_seconds,
         )
         github_synchronizer = None
@@ -678,7 +732,10 @@ def build_executor(
 
 
 def run_worker(settings: AgentWorkerSettings) -> None:
-    queue = DatabaseAgentQueue(environment=settings.environment)
+    queue = DatabaseAgentQueue(
+        environment=settings.queue_environment,
+        deployment_environment=settings.deployment_environment,
+    )
     executor = build_executor(settings, queue=queue)
     identity = queue.verify_identity()
     logger.info(
