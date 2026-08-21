@@ -88,23 +88,44 @@ def send_fcm_notification(
 def get_unsent_notifications(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, title, body, data
+            SELECT notifications.id,
+                   notifications.title,
+                   notifications.body,
+                   notifications.data
             FROM public.notifications
-            WHERE sent = FALSE
+            WHERE notifications.sent = FALSE
+              AND (
+                  NOT (notifications.data ? 'user_id')
+                  OR EXISTS (
+                      SELECT 1
+                      FROM public.device_push_tokens
+                      WHERE device_push_tokens.is_active = TRUE
+                        AND device_push_tokens.user_id::text = notifications.data->>'user_id'
+                  )
+              )
             ORDER BY created_at ASC
             LIMIT 10;
         """)
         return cur.fetchall()
 
 
-def get_active_device_tokens(conn):
+def get_active_device_tokens(conn, *, user_id: str | None = None):
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, device_id, fcm_token, device_name, platform
-            FROM public.device_push_tokens
-            WHERE is_active = TRUE
-            ORDER BY updated_at DESC NULLS LAST, created_at DESC;
-        """)
+        if user_id:
+            cur.execute("""
+                SELECT id, device_id, fcm_token, device_name, platform
+                FROM public.device_push_tokens
+                WHERE is_active = TRUE
+                  AND user_id = %s
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC;
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT id, device_id, fcm_token, device_name, platform
+                FROM public.device_push_tokens
+                WHERE is_active = TRUE
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC;
+            """)
         return cur.fetchall()
 
 
@@ -156,7 +177,8 @@ def process_notification(
     body: str,
     data: dict | None = None,
 ):
-    device_rows = get_active_device_tokens(conn)
+    target_user_id = data.get("user_id") if isinstance(data, dict) else None
+    device_rows = get_active_device_tokens(conn, user_id=target_user_id)
 
     if not device_rows:
         logger.info(f"No active device tokens found for notification {notif_id}")

@@ -36,6 +36,7 @@ from backend.routers import (
         weather,
         weightlifting,
         kids_investing,
+        mead,
         spotify,
     )
 from backend.tasks import (
@@ -48,6 +49,7 @@ from backend.tasks import (
         weather_monitor,
         finance_worker,
         kids_investing_worker,
+        mead_task_worker,
     )
 
 TEST_MODE = False
@@ -89,6 +91,7 @@ async def lifespan(app: FastAPI):
             weather_monitor.run_weather_monitor,
             finance_worker.run_finance_worker,
             kids_investing_worker.run_kids_investing_worker,
+            mead_task_worker.run_mead_task_worker,
         ]
 
         # 0 - Kick off the Threads
@@ -133,6 +136,7 @@ protected_routers = [
     rh_storage.router,
     finance.router,
     kids_investing.router,
+    mead.router,
     weightlifting.router,
     spotify.router,
 ]

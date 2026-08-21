@@ -29,6 +29,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0005", "agent_repository_scope"),
                 ("0006", "weightlifting_foundation"),
                 ("0007", "service_health_current_snapshot"),
+                ("0008", "mead_foundation"),
             ],
         )
 
@@ -45,6 +46,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0005", "agent_repository_scope"),
                 ("0006", "weightlifting_foundation"),
                 ("0007", "service_health_current_snapshot"),
+                ("0008", "mead_foundation"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
@@ -101,6 +103,20 @@ class MigrationDiscoveryTests(unittest.TestCase):
     def test_service_health_current_snapshot_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0007_service_health_current_snapshot.up.sql"
         down = MIGRATIONS_DIR / "0007_service_health_current_snapshot.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_mead_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0008_mead_foundation.up.sql"
+        down = MIGRATIONS_DIR / "0008_mead_foundation.down.sql"
 
         GitBackendDeploymentManager._validate_migration_sql(
             up,
