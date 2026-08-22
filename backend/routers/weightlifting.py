@@ -191,20 +191,27 @@ def upsert_entry(
     principal: AuthenticatedPrincipal = Depends(require_current_principal),
 ):
     try:
+        kwargs = {
+            "user_id": principal.id,
+            "exercise_id": str(request.exercise_id),
+            "week_start": request.week_start,
+            "workout_day_slot": request.workout_day_slot,
+            "workout_date": request.workout_date,
+            "weight": request.weight,
+            "reps": request.reps,
+            "sets": request.sets,
+            "notes": request.notes,
+            "completed": request.completed,
+        }
+        if "fitness_scheduled_workout_id" in request.model_fields_set:
+            kwargs["fitness_scheduled_workout_id"] = (
+                str(request.fitness_scheduled_workout_id)
+                if request.fitness_scheduled_workout_id
+                else None
+            )
         return {
             "success": True,
-            "data": weightlifting_service.upsert_entry(
-                user_id=principal.id,
-                exercise_id=str(request.exercise_id),
-                week_start=request.week_start,
-                workout_day_slot=request.workout_day_slot,
-                workout_date=request.workout_date,
-                weight=request.weight,
-                reps=request.reps,
-                sets=request.sets,
-                notes=request.notes,
-                completed=request.completed,
-            ),
+            "data": weightlifting_service.upsert_entry(**kwargs),
         }
     except ValueError as exc:
         raise _handle_service_error(exc)
@@ -217,12 +224,17 @@ def update_entry(
     principal: AuthenticatedPrincipal = Depends(require_current_principal),
 ):
     try:
+        payload = request.model_dump(exclude_unset=True)
+        if payload.get("fitness_scheduled_workout_id") is not None:
+            payload["fitness_scheduled_workout_id"] = str(
+                payload["fitness_scheduled_workout_id"]
+            )
         return {
             "success": True,
             "data": weightlifting_service.update_entry(
                 principal.id,
                 entry_id,
-                **request.model_dump(exclude_unset=True),
+                **payload,
             ),
         }
     except ValueError as exc:

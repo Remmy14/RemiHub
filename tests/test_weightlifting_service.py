@@ -56,6 +56,7 @@ DAY_ROWS = [
     (2, "Day 2", "wednesday"),
     (3, "Day 3", "friday"),
 ]
+DAY_ROWS_FOUR = DAY_ROWS + [(4, "Day 4", "saturday")]
 EXERCISE_COLUMNS = [
     "id",
     "name",
@@ -110,6 +111,16 @@ ENTRY_ROW = (
     NOW,
     NOW,
 )
+
+
+def configured_slot_responses(slot: int = 1):
+    return [
+        ([], []),
+        ([], []),
+        ([], []),
+        ([], []),
+        (["exists"], [(1,)] if slot else []),
+    ]
 
 
 class FakeCursor:
@@ -259,11 +270,26 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
         self.assertEqual([day["slot"] for day in settings["days"]], [1, 2, 3])
         self.assertEqual(connection.commits, 1)
 
+    def test_settings_update_rejects_empty_day_configuration(self):
+        with self.assertRaisesRegex(
+            weightlifting_service.WeightliftingValidationError,
+            "at least one",
+        ):
+            weightlifting_service.update_settings(
+                user_id=USER_ID,
+                weight_unit="lb",
+                default_weight_increment=Decimal("5"),
+                default_target_reps=12,
+                default_sets=3,
+                days=[],
+            )
+
     def test_week_start_is_normalized_when_upserting_all_slots(self):
         for slot in (1, 2, 3):
             connection, patches = self.patch_connection(
                 [
                     (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                    *configured_slot_responses(slot),
                     (ENTRY_COLUMNS, [ENTRY_ROW]),
                 ]
             )
@@ -280,7 +306,7 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
                     notes=None,
                     completed=True,
                 )
-            insert_params = connection.cursor_instance.executed[1][1]
+            insert_params = connection.cursor_instance.executed[6][1]
             self.assertEqual(insert_params[2], date(2026, 8, 3))
             self.assertEqual(insert_params[3], slot)
 
@@ -288,6 +314,7 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
         connection, patches = self.patch_connection(
             [
                 (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                *configured_slot_responses(1),
                 (ENTRY_COLUMNS, [ENTRY_ROW]),
             ]
         )
@@ -306,12 +333,142 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
                 completed=True,
             )
 
-        upsert_sql = connection.cursor_instance.executed[1][0]
+        upsert_sql = connection.cursor_instance.executed[6][0]
         self.assertIn(
             "ON CONFLICT (exercise_id, week_start, workout_day_slot)",
             upsert_sql,
         )
+        self.assertIn("ELSE weightlifting_entries.fitness_scheduled_workout_id", upsert_sql)
+        self.assertFalse(connection.cursor_instance.executed[6][1][-1])
         self.assertEqual(entry["weight"], 47.5)
+
+    def test_upsert_rejects_invalid_fitness_scheduled_workout_linkage(self):
+        connection, patches = self.patch_connection(
+            [
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                *configured_slot_responses(1),
+                (["id"], []),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(
+                weightlifting_service.WeightliftingValidationError,
+                "same-user scheduled LIFTING workout",
+            ):
+                weightlifting_service.upsert_entry(
+                    user_id=USER_ID,
+                    exercise_id=EXERCISE_ID,
+                    week_start=date(2026, 8, 3),
+                    workout_day_slot=1,
+                    workout_date=date(2026, 8, 3),
+                    weight=Decimal("47.5"),
+                    reps=12,
+                    sets=3,
+                    notes=None,
+                    completed=True,
+                    fitness_scheduled_workout_id="55555555-5555-4555-8555-555555555555",
+                )
+
+        linkage_sql = connection.cursor_instance.executed[6][0]
+        self.assertIn("template.workout_type = 'LIFTING'", linkage_sql)
+        self.assertIn("scheduled.user_id = %s", linkage_sql)
+
+    def test_upsert_rejects_running_or_cross_user_scheduled_workout_linkage(self):
+        rejection_cases = ("running scheduled workout", "cross-user scheduled workout")
+        for rejection_case in rejection_cases:
+            with self.subTest(rejection_case=rejection_case):
+                connection, patches = self.patch_connection(
+                    [
+                        (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                        *configured_slot_responses(1),
+                        (["id"], []),
+                    ]
+                )
+
+                with patches:
+                    with self.assertRaisesRegex(
+                        weightlifting_service.WeightliftingValidationError,
+                        "same-user scheduled LIFTING workout",
+                    ):
+                        weightlifting_service.upsert_entry(
+                            user_id=USER_ID,
+                            exercise_id=EXERCISE_ID,
+                            week_start=date(2026, 8, 3),
+                            workout_day_slot=1,
+                            workout_date=date(2026, 8, 3),
+                            weight=Decimal("47.5"),
+                            reps=12,
+                            sets=3,
+                            notes=None,
+                            completed=True,
+                            fitness_scheduled_workout_id="55555555-5555-4555-8555-555555555555",
+                        )
+
+                linkage_sql = connection.cursor_instance.executed[6][0]
+                self.assertIn("template.workout_type = 'LIFTING'", linkage_sql)
+                self.assertIn("scheduled.user_id = %s", linkage_sql)
+
+    def test_upsert_accepts_same_user_lifting_scheduled_workout_linkage(self):
+        scheduled_workout_id = "55555555-5555-4555-8555-555555555555"
+        linked_entry = list(ENTRY_ROW)
+        linked_entry.insert(10, scheduled_workout_id)
+        linked_columns = ENTRY_COLUMNS[:10] + ["fitness_scheduled_workout_id"] + ENTRY_COLUMNS[10:]
+        connection, patches = self.patch_connection(
+            [
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                *configured_slot_responses(1),
+                (["id"], [(scheduled_workout_id,)]),
+                (linked_columns, [tuple(linked_entry)]),
+            ]
+        )
+
+        with patches:
+            entry = weightlifting_service.upsert_entry(
+                user_id=USER_ID,
+                exercise_id=EXERCISE_ID,
+                week_start=date(2026, 8, 3),
+                workout_day_slot=1,
+                workout_date=date(2026, 8, 3),
+                weight=Decimal("47.5"),
+                reps=12,
+                sets=3,
+                notes=None,
+                completed=True,
+                fitness_scheduled_workout_id=scheduled_workout_id,
+            )
+
+        linkage_sql = connection.cursor_instance.executed[6][0]
+        upsert_params = connection.cursor_instance.executed[7][1]
+        self.assertIn("template.workout_type = 'LIFTING'", linkage_sql)
+        self.assertTrue(upsert_params[-1])
+        self.assertEqual(entry["fitness_scheduled_workout_id"], scheduled_workout_id)
+
+    def test_upsert_rejects_slot_that_is_not_currently_configured(self):
+        connection, patches = self.patch_connection(
+            [
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                *configured_slot_responses(0),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(
+                weightlifting_service.WeightliftingValidationError,
+                "currently configured",
+            ):
+                weightlifting_service.upsert_entry(
+                    user_id=USER_ID,
+                    exercise_id=EXERCISE_ID,
+                    week_start=date(2026, 8, 3),
+                    workout_day_slot=4,
+                    workout_date=date(2026, 8, 3),
+                    weight=Decimal("47.5"),
+                    reps=12,
+                    sets=3,
+                    notes=None,
+                    completed=True,
+                )
 
     def test_weekly_grid_aggregates_entries_and_empty_combinations(self):
         connection, patches = self.patch_connection(
@@ -345,6 +502,160 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
             exercise["suggested_next"]["reason_code"],
             "target_met_increase",
         )
+
+    def test_weekly_grid_dynamically_includes_fourth_slot(self):
+        connection, patches = self.patch_connection(
+            [
+                ([], []),
+                ([], []),
+                ([], []),
+                ([], []),
+                (GRID_SETTINGS_COLUMNS, [GRID_SETTINGS_ROW]),
+                (DAY_COLUMNS, DAY_ROWS_FOUR),
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                (ENTRY_COLUMNS, [ENTRY_ROW]),
+                (ENTRY_COLUMNS, [ENTRY_ROW]),
+            ]
+        )
+
+        with patches:
+            grid = weightlifting_service.get_weekly_grid(
+                user_id=USER_ID,
+                week_start=date(2026, 8, 5),
+            )
+
+        self.assertEqual([day["slot"] for day in grid["days"]], [1, 2, 3, 4])
+        self.assertEqual(grid["days"][3]["date"], "2026-08-08")
+        self.assertIn("4", grid["exercises"][0]["entries"])
+        self.assertIsNone(grid["exercises"][0]["entries"]["4"])
+
+    def test_weekly_grid_ignores_historical_entry_for_removed_slot(self):
+        slot_four_entry = list(ENTRY_ROW)
+        slot_four_entry[3] = 4
+        connection, patches = self.patch_connection(
+            [
+                ([], []),
+                ([], []),
+                ([], []),
+                ([], []),
+                (GRID_SETTINGS_COLUMNS, [GRID_SETTINGS_ROW]),
+                (DAY_COLUMNS, DAY_ROWS),
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                (ENTRY_COLUMNS, [tuple(slot_four_entry)]),
+                (ENTRY_COLUMNS, [tuple(slot_four_entry)]),
+            ]
+        )
+
+        with patches:
+            grid = weightlifting_service.get_weekly_grid(
+                user_id=USER_ID,
+                week_start=date(2026, 8, 5),
+            )
+
+        exercise = grid["exercises"][0]
+        self.assertEqual(set(exercise["entries"].keys()), {"1", "2", "3"})
+        self.assertIsNone(exercise["entries"]["1"])
+        self.assertEqual(exercise["previous_performance"]["workout_day_slot"], 4)
+
+    def test_exercise_history_retains_removed_slot_entry(self):
+        slot_four_entry = list(ENTRY_ROW)
+        slot_four_entry[3] = 4
+        connection, patches = self.patch_connection(
+            [
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                (ENTRY_COLUMNS, [tuple(slot_four_entry)]),
+            ]
+        )
+
+        with patches:
+            history = weightlifting_service.get_exercise_history(
+                user_id=USER_ID,
+                exercise_id=EXERCISE_ID,
+            )
+
+        self.assertEqual(history["entries"][0]["workout_day_slot"], 4)
+        self.assertEqual(history["series"][0]["workout_day_slot"], 4)
+
+    def test_removed_slot_sequence_keeps_old_grid_and_history_readable(self):
+        slot_four_entry = list(ENTRY_ROW)
+        slot_four_entry[3] = 4
+        slot_four_entry[4] = date(2026, 8, 8)
+        slot_four_entry = tuple(slot_four_entry)
+        connection, patches = self.patch_connection(
+            [
+                *[([], []) for _ in range(10)],
+                (SETTINGS_COLUMNS, [SETTINGS_ROW]),
+                (DAY_COLUMNS, DAY_ROWS_FOUR),
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                *configured_slot_responses(4),
+                (ENTRY_COLUMNS, [slot_four_entry]),
+                *[([], []) for _ in range(9)],
+                (SETTINGS_COLUMNS, [SETTINGS_ROW]),
+                (DAY_COLUMNS, DAY_ROWS),
+                *[([], []) for _ in range(4)],
+                (GRID_SETTINGS_COLUMNS, [GRID_SETTINGS_ROW]),
+                (DAY_COLUMNS, DAY_ROWS),
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                (ENTRY_COLUMNS, [slot_four_entry]),
+                (ENTRY_COLUMNS, [slot_four_entry]),
+                (EXERCISE_COLUMNS, [EXERCISE_ROW]),
+                (ENTRY_COLUMNS, [slot_four_entry]),
+            ]
+        )
+
+        with patches:
+            four_day_settings = weightlifting_service.update_settings(
+                user_id=USER_ID,
+                weight_unit="lb",
+                default_weight_increment=Decimal("5"),
+                default_target_reps=12,
+                default_sets=3,
+                days=[
+                    {"slot": 1, "label": "Day 1", "weekday": "monday"},
+                    {"slot": 2, "label": "Day 2", "weekday": "wednesday"},
+                    {"slot": 3, "label": "Day 3", "weekday": "friday"},
+                    {"slot": 4, "label": "Day 4", "weekday": "saturday"},
+                ],
+            )
+            recorded = weightlifting_service.upsert_entry(
+                user_id=USER_ID,
+                exercise_id=EXERCISE_ID,
+                week_start=date(2026, 8, 3),
+                workout_day_slot=4,
+                workout_date=date(2026, 8, 8),
+                weight=Decimal("47.5"),
+                reps=12,
+                sets=3,
+                notes=None,
+                completed=True,
+            )
+            three_day_settings = weightlifting_service.update_settings(
+                user_id=USER_ID,
+                weight_unit="lb",
+                default_weight_increment=Decimal("5"),
+                default_target_reps=12,
+                default_sets=3,
+                days=[
+                    {"slot": 1, "label": "Day 1", "weekday": "monday"},
+                    {"slot": 2, "label": "Day 2", "weekday": "wednesday"},
+                    {"slot": 3, "label": "Day 3", "weekday": "friday"},
+                ],
+            )
+            grid = weightlifting_service.get_weekly_grid(
+                user_id=USER_ID,
+                week_start=date(2026, 8, 3),
+            )
+            history = weightlifting_service.get_exercise_history(
+                user_id=USER_ID,
+                exercise_id=EXERCISE_ID,
+            )
+
+        self.assertEqual([day["slot"] for day in four_day_settings["days"]], [1, 2, 3, 4])
+        self.assertEqual(recorded["workout_day_slot"], 4)
+        self.assertEqual([day["slot"] for day in three_day_settings["days"]], [1, 2, 3])
+        self.assertEqual(set(grid["exercises"][0]["entries"].keys()), {"1", "2", "3"})
+        self.assertEqual(grid["exercises"][0]["previous_performance"]["workout_day_slot"], 4)
+        self.assertEqual(history["entries"][0]["workout_day_slot"], 4)
 
     def test_exercise_history_is_newest_first_with_chronological_series(self):
         older = list(ENTRY_ROW)
@@ -410,16 +721,33 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
         self.assertFalse(result["deleted"])
         self.assertEqual(result["week_start"], "2026-08-03")
 
-    def test_invalid_slot_is_rejected(self):
+    def test_fourth_slot_is_allowed_for_flexible_schedules(self):
+        connection, patches = self.patch_connection(
+            [
+                (["id"], []),
+            ]
+        )
+        with patches:
+            result = weightlifting_service.clear_entry(
+                user_id=USER_ID,
+                exercise_id=EXERCISE_ID,
+                week_start=date(2026, 8, 3),
+                workout_day_slot=4,
+            )
+
+        self.assertFalse(result["deleted"])
+        self.assertEqual(result["workout_day_slot"], 4)
+
+    def test_non_positive_slot_is_rejected(self):
         with self.assertRaisesRegex(
             weightlifting_service.WeightliftingValidationError,
-            "1, 2, or 3",
+            "positive",
         ):
             weightlifting_service.clear_entry(
                 user_id=USER_ID,
                 exercise_id=EXERCISE_ID,
                 week_start=date(2026, 8, 3),
-                workout_day_slot=4,
+                workout_day_slot=0,
             )
 
 

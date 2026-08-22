@@ -22,6 +22,7 @@ pool.ThreadedConnectionPool = OfflineThreadedConnectionPool
 
 from backend.tasks import mead_task_worker
 from backend.tasks import notification_worker
+from backend.notifications.notifications import Notification, insert_notification
 
 
 TASK_ID = "33333333-3333-4333-8333-333333333333"
@@ -67,6 +68,19 @@ class FakeConnection:
         self.rollbacks += 1
 
 
+class InsertNotificationCursor(FakeCursor):
+    def __init__(self):
+        super().__init__(columns=["id"], rows=[(42,)])
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+
+    def fetchone(self):
+        if not self.rows:
+            return None
+        return self.rows.pop(0)
+
+
 class MeadTaskWorkerTests(unittest.TestCase):
     def due_task(self):
         return {
@@ -95,6 +109,26 @@ class MeadTaskWorkerTests(unittest.TestCase):
         self.assertEqual(notice.data["batch_id"], BATCH_ID)
         self.assertEqual(notice.data["task_id"], TASK_ID)
         self.assertEqual(notice.data["user_id"], USER_ID)
+
+    def test_insert_notification_does_not_commit_caller_owned_connection(self):
+        cursor = InsertNotificationCursor()
+        conn = FakeConnection(cursor)
+
+        notification_id = insert_notification(
+            Notification(
+                title="Workout still incomplete",
+                body="Full Body has not been completed.",
+                module="Fitness",
+                data={"user_id": USER_ID},
+            ),
+            conn=conn,
+        )
+
+        sql, _params = cursor.executed[0]
+        self.assertIn("RETURNING id", sql)
+        self.assertEqual(notification_id, 42)
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 0)
 
     def test_due_query_selects_only_pending_unnotified_due_tasks(self):
         cursor = FakeCursor(columns=["id"], rows=[(TASK_ID,)])

@@ -25,6 +25,7 @@ from backend.routers import (
         auto_logins,
         autographs,
         fieldwatch,
+        fitness,
         finance,
         health,
         notifications,
@@ -43,6 +44,7 @@ from backend.tasks import (
         swimming_pool_monitor,
         plex_dl_monitor,
         notification_worker,
+        fitness_notification_worker,
         field_status_watcher,
         # jury_watch,
         speed_test_worker,
@@ -83,6 +85,7 @@ async def lifespan(app: FastAPI):
 
         threads = [
             notification_worker.run_notification_worker,
+            fitness_notification_worker.run_fitness_notification_worker,
             swimming_pool_monitor.run_pool_monitor,
             plex_dl_monitor.main,
             field_status_watcher.run_monitor,
@@ -134,6 +137,7 @@ protected_routers = [
     autographs.router,
     weather.router,
     rh_storage.router,
+    fitness.router,
     finance.router,
     kids_investing.router,
     mead.router,

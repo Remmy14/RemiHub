@@ -29,9 +29,16 @@ class Weekday(str, Enum):
 
 
 class WeightliftingDaySlot(BaseModel):
-    slot: int = Field(ge=1, le=3)
+    slot: int = Field(ge=1)
     label: str = Field(min_length=1, max_length=80)
     weekday: Weekday | None = None
+
+
+def _validate_contiguous_slots(days: list[WeightliftingDaySlot]) -> None:
+    slots = [day.slot for day in days]
+    expected = list(range(1, len(slots) + 1))
+    if sorted(slots) != expected:
+        raise ValueError("days must contain unique contiguous slots starting at 1")
 
 
 class WeightliftingSettings(BaseModel):
@@ -39,7 +46,7 @@ class WeightliftingSettings(BaseModel):
     default_weight_increment: Decimal = Field(ge=0, le=200)
     default_target_reps: int = Field(ge=1, le=500)
     default_sets: int | None = Field(default=None, ge=1, le=100)
-    days: list[WeightliftingDaySlot] = Field(min_length=3, max_length=3)
+    days: list[WeightliftingDaySlot] = Field(min_length=1)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -49,13 +56,11 @@ class WeightliftingSettingsUpdate(WeightliftingRequestModel):
     default_weight_increment: Decimal = Field(default=Decimal("5"), ge=0, le=200)
     default_target_reps: int = Field(default=12, ge=1, le=500)
     default_sets: int | None = Field(default=3, ge=1, le=100)
-    days: list[WeightliftingDaySlot] = Field(min_length=3, max_length=3)
+    days: list[WeightliftingDaySlot] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_slots(self):
-        slots = [day.slot for day in self.days]
-        if sorted(slots) != [1, 2, 3]:
-            raise ValueError("days must contain exactly one slot for each of 1, 2, and 3")
+        _validate_contiguous_slots(self.days)
         return self
 
 
@@ -91,13 +96,14 @@ class WeightliftingExerciseReorder(WeightliftingRequestModel):
 class WeightliftingEntryUpsert(WeightliftingRequestModel):
     exercise_id: UUID
     week_start: date
-    workout_day_slot: int = Field(ge=1, le=3)
+    workout_day_slot: int = Field(ge=1)
     workout_date: date | None = None
     weight: Decimal = Field(ge=0, le=2000)
     reps: int = Field(ge=1, le=500)
     sets: int | None = Field(default=None, ge=1, le=100)
     notes: str | None = Field(default=None, max_length=2000)
     completed: bool = True
+    fitness_scheduled_workout_id: UUID | None = None
 
 
 class WeightliftingEntryUpdate(WeightliftingRequestModel):
@@ -107,12 +113,13 @@ class WeightliftingEntryUpdate(WeightliftingRequestModel):
     sets: int | None = Field(default=None, ge=1, le=100)
     notes: str | None = Field(default=None, max_length=2000)
     completed: bool | None = None
+    fitness_scheduled_workout_id: UUID | None = None
 
 
 class WeightliftingEntryClear(WeightliftingRequestModel):
     exercise_id: UUID
     week_start: date
-    workout_day_slot: int = Field(ge=1, le=3)
+    workout_day_slot: int = Field(ge=1)
 
 
 class WeightliftingSuccessResponse(BaseModel):

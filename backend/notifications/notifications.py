@@ -114,7 +114,8 @@ def insert_notification(notification: Notification, conn=None):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO public.notifications (title, body, module, priority, data)
-                VALUES (%s, %s, %s, %s, %s);
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id;
             """, (
                 notification.title,
                 notification.body,
@@ -122,8 +123,15 @@ def insert_notification(notification: Notification, conn=None):
                 notification.priority,
                 Json(notification.data),
             ))
+            row = cur.fetchone()
 
-        conn.commit()
+        if new_conn:
+            conn.commit()
+        return row[0] if row else None
+    except Exception:
+        if new_conn:
+            conn.rollback()
+        raise
     finally:
         if new_conn:
             from backend.database.database import put_db_conn

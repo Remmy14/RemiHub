@@ -30,6 +30,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0006", "weightlifting_foundation"),
                 ("0007", "service_health_current_snapshot"),
                 ("0008", "mead_foundation"),
+                ("0009", "fitness_foundation"),
             ],
         )
 
@@ -47,6 +48,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0006", "weightlifting_foundation"),
                 ("0007", "service_health_current_snapshot"),
                 ("0008", "mead_foundation"),
+                ("0009", "fitness_foundation"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))

@@ -26,6 +26,7 @@ DEFAULT_DAY_SLOTS = (
     {"slot": 2, "label": "Day 2", "weekday": "wednesday"},
     {"slot": 3, "label": "Day 3", "weekday": "friday"},
 )
+UNCHANGED = object()
 
 
 class WeightliftingNotFoundError(ValueError):
@@ -85,8 +86,19 @@ def _normalize_week_start(value: date) -> date:
 
 
 def _validate_slot(slot: int) -> None:
-    if slot not in (1, 2, 3):
-        raise WeightliftingValidationError("workout_day_slot must be 1, 2, or 3")
+    if slot < 1:
+        raise WeightliftingValidationError("workout_day_slot must be positive")
+
+
+def _validate_contiguous_days(days: list[dict]) -> None:
+    if not days:
+        raise WeightliftingValidationError("days must contain at least one slot")
+    slots = [int(day["slot"]) for day in days]
+    expected = list(range(1, len(slots) + 1))
+    if sorted(slots) != expected:
+        raise WeightliftingValidationError(
+            "days must contain unique contiguous slots starting at 1"
+        )
 
 
 def _ensure_settings(cur, user_id: str) -> None:
@@ -185,9 +197,7 @@ def update_settings(
     default_sets: int | None,
     days: list[dict],
 ) -> dict:
-    slots = sorted(day["slot"] for day in days)
-    if slots != [1, 2, 3]:
-        raise WeightliftingValidationError("days must contain slots 1, 2, and 3")
+    _validate_contiguous_days(days)
 
     conn = get_db_conn()
     try:
@@ -214,15 +224,29 @@ def update_settings(
             for day in days:
                 cur.execute(
                     """
-                    UPDATE public.weightlifting_day_slots
-                    SET label = %s,
-                        weekday = %s,
+                    INSERT INTO public.weightlifting_day_slots (
+                        user_id,
+                        slot,
+                        label,
+                        weekday
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, slot)
+                    DO UPDATE SET
+                        label = EXCLUDED.label,
+                        weekday = EXCLUDED.weekday,
                         updated_at = now()
-                    WHERE user_id = %s
-                      AND slot = %s
                     """,
-                    (day["label"], day.get("weekday"), user_id, day["slot"]),
+                    (user_id, day["slot"], day["label"], day.get("weekday")),
                 )
+            cur.execute(
+                """
+                DELETE FROM public.weightlifting_day_slots
+                WHERE user_id = %s
+                  AND slot <> ALL(%s::integer[])
+                """,
+                (user_id, [day["slot"] for day in days]),
+            )
             cur.execute(
                 """
                 SELECT user_id,
@@ -530,10 +554,55 @@ def _entry_select() -> str:
                sets,
                notes,
                completed,
+               fitness_scheduled_workout_id,
                created_at,
                updated_at
         FROM public.weightlifting_entries
     """
+
+
+def _validate_fitness_lifting_workout(
+    cur,
+    *,
+    user_id: str,
+    fitness_scheduled_workout_id: str | None,
+) -> None:
+    if not fitness_scheduled_workout_id:
+        return
+    cur.execute(
+        """
+        SELECT scheduled.id
+        FROM public.fitness_scheduled_workouts AS scheduled
+        JOIN public.fitness_workout_templates AS template
+          ON template.id = scheduled.workout_template_id
+        WHERE scheduled.id = %s
+          AND scheduled.user_id = %s
+          AND template.user_id = scheduled.user_id
+          AND template.workout_type = 'LIFTING'
+        """,
+        (fitness_scheduled_workout_id, user_id),
+    )
+    if not cur.fetchone():
+        raise WeightliftingValidationError(
+            "fitness_scheduled_workout_id must reference a same-user scheduled LIFTING workout"
+        )
+
+
+def _validate_configured_slot(cur, *, user_id: str, workout_day_slot: int) -> None:
+    _ensure_settings(cur, user_id)
+    cur.execute(
+        """
+        SELECT 1
+        FROM public.weightlifting_day_slots
+        WHERE user_id = %s
+          AND slot = %s
+        """,
+        (user_id, workout_day_slot),
+    )
+    if not cur.fetchone():
+        raise WeightliftingValidationError(
+            "workout_day_slot must be currently configured in Weightlifting settings"
+        )
 
 
 def _get_active_exercise(cur, *, user_id: str, exercise_id: str) -> dict:
@@ -564,6 +633,7 @@ def upsert_entry(
     sets: int | None,
     notes: str | None,
     completed: bool,
+    fitness_scheduled_workout_id=UNCHANGED,
 ) -> dict:
     _validate_slot(workout_day_slot)
     normalized_week = _normalize_week_start(week_start)
@@ -571,6 +641,19 @@ def upsert_entry(
     try:
         with conn.cursor() as cur:
             _get_active_exercise(cur, user_id=user_id, exercise_id=exercise_id)
+            _validate_configured_slot(
+                cur,
+                user_id=user_id,
+                workout_day_slot=workout_day_slot,
+            )
+            linkage_was_supplied = fitness_scheduled_workout_id is not UNCHANGED
+            linkage_value = None if not linkage_was_supplied else fitness_scheduled_workout_id
+            if linkage_was_supplied:
+                _validate_fitness_lifting_workout(
+                    cur,
+                    user_id=user_id,
+                    fitness_scheduled_workout_id=linkage_value,
+                )
             cur.execute(
                 """
                 INSERT INTO public.weightlifting_entries (
@@ -583,9 +666,10 @@ def upsert_entry(
                     reps,
                     sets,
                     notes,
-                    completed
+                    completed,
+                    fitness_scheduled_workout_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (exercise_id, week_start, workout_day_slot)
                 DO UPDATE SET
                     workout_date = EXCLUDED.workout_date,
@@ -594,6 +678,10 @@ def upsert_entry(
                     sets = EXCLUDED.sets,
                     notes = EXCLUDED.notes,
                     completed = EXCLUDED.completed,
+                    fitness_scheduled_workout_id = CASE
+                        WHEN %s THEN EXCLUDED.fitness_scheduled_workout_id
+                        ELSE weightlifting_entries.fitness_scheduled_workout_id
+                    END,
                     updated_at = now()
                 WHERE weightlifting_entries.user_id = EXCLUDED.user_id
                 RETURNING id,
@@ -606,6 +694,7 @@ def upsert_entry(
                           sets,
                           notes,
                           completed,
+                          fitness_scheduled_workout_id,
                           created_at,
                           updated_at
                 """,
@@ -620,6 +709,8 @@ def upsert_entry(
                     sets,
                     notes,
                     completed,
+                    linkage_value,
+                    linkage_was_supplied,
                 ),
             )
             row = cur.fetchone()
@@ -635,7 +726,15 @@ def upsert_entry(
 
 
 def update_entry(user_id: str, entry_id: str, **fields) -> dict:
-    allowed = {"workout_date", "weight", "reps", "sets", "notes", "completed"}
+    allowed = {
+        "workout_date",
+        "weight",
+        "reps",
+        "sets",
+        "notes",
+        "completed",
+        "fitness_scheduled_workout_id",
+    }
     updates = []
     values = []
     for key, value in fields.items():
@@ -650,6 +749,12 @@ def update_entry(user_id: str, entry_id: str, **fields) -> dict:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            if "fitness_scheduled_workout_id" in fields:
+                _validate_fitness_lifting_workout(
+                    cur,
+                    user_id=user_id,
+                    fitness_scheduled_workout_id=fields["fitness_scheduled_workout_id"],
+                )
             cur.execute(
                 f"""
                 UPDATE public.weightlifting_entries
@@ -666,6 +771,7 @@ def update_entry(user_id: str, entry_id: str, **fields) -> dict:
                           sets,
                           notes,
                           completed,
+                          fitness_scheduled_workout_id,
                           created_at,
                           updated_at
                 """,
@@ -798,8 +904,9 @@ def get_weekly_grid(*, user_id: str, week_start: date) -> dict:
             )
             exercises = _rows_to_dicts(cur, cur.fetchall())
             exercise_ids = [exercise["id"] for exercise in exercises]
+            entry_slots = [str(day["slot"]) for day in days]
             entries_by_exercise: dict[str, dict[str, dict]] = {
-                exercise_id: {"1": None, "2": None, "3": None}
+                exercise_id: {slot: None for slot in entry_slots}
                 for exercise_id in exercise_ids
             }
             if exercise_ids:
@@ -814,9 +921,9 @@ def get_weekly_grid(*, user_id: str, week_start: date) -> dict:
                     (user_id, normalized_week, exercise_ids),
                 )
                 for entry in _rows_to_dicts(cur, cur.fetchall()):
-                    entries_by_exercise[entry["exercise_id"]][
-                        str(entry["workout_day_slot"])
-                    ] = entry
+                    slot_key = str(entry["workout_day_slot"])
+                    if slot_key in entries_by_exercise[entry["exercise_id"]]:
+                        entries_by_exercise[entry["exercise_id"]][slot_key] = entry
             latest_by_exercise = _latest_completed_entries(
                 cur,
                 user_id=user_id,

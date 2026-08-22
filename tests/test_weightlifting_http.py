@@ -88,7 +88,33 @@ class WeightliftingHttpTests(unittest.TestCase):
         update_settings.assert_called_once()
         self.assertEqual(update_settings.call_args.kwargs["user_id"], USER.id)
 
-    def test_rejects_settings_without_exact_three_slots(self):
+    def test_accepts_variable_contiguous_settings_slots(self):
+        one_day = WeightliftingSettingsUpdate(
+            weight_unit="lb",
+            default_weight_increment=5,
+            default_target_reps=12,
+            default_sets=3,
+            days=[
+                {"slot": 1, "label": "A", "weekday": "monday"},
+            ],
+        )
+        four_days = WeightliftingSettingsUpdate(
+            weight_unit="lb",
+            default_weight_increment=5,
+            default_target_reps=12,
+            default_sets=3,
+            days=[
+                {"slot": 1, "label": "A", "weekday": "monday"},
+                {"slot": 2, "label": "B", "weekday": "tuesday"},
+                {"slot": 3, "label": "C", "weekday": "thursday"},
+                {"slot": 4, "label": "D", "weekday": "saturday"},
+            ],
+        )
+
+        self.assertEqual([day.slot for day in one_day.days], [1])
+        self.assertEqual([day.slot for day in four_days.days], [1, 2, 3, 4])
+
+    def test_rejects_duplicate_or_noncontiguous_settings_slots(self):
         with self.assertRaises(ValidationError):
             WeightliftingSettingsUpdate(
                 weight_unit="lb",
@@ -98,6 +124,17 @@ class WeightliftingHttpTests(unittest.TestCase):
                 days=[
                     {"slot": 1, "label": "A", "weekday": "monday"},
                     {"slot": 1, "label": "B", "weekday": "wednesday"},
+                    {"slot": 3, "label": "C", "weekday": "friday"},
+                ],
+            )
+        with self.assertRaises(ValidationError):
+            WeightliftingSettingsUpdate(
+                weight_unit="lb",
+                default_weight_increment=5,
+                default_target_reps=12,
+                default_sets=3,
+                days=[
+                    {"slot": 1, "label": "A", "weekday": "monday"},
                     {"slot": 3, "label": "C", "weekday": "friday"},
                 ],
             )
@@ -146,6 +183,29 @@ class WeightliftingHttpTests(unittest.TestCase):
 
         self.assertTrue(response["success"])
         self.assertEqual(str(upsert_entry.call_args.kwargs["weight"]), "47.5")
+        self.assertNotIn("fitness_scheduled_workout_id", upsert_entry.call_args.kwargs)
+
+    def test_fitness_linkage_is_forwarded_only_when_supplied(self):
+        upsert_entry = MagicMock(return_value={"id": "entry"})
+        request = WeightliftingEntryUpsert(
+            exercise_id="22222222-2222-4222-8222-222222222222",
+            week_start="2026-08-03",
+            workout_day_slot=1,
+            weight="47.5",
+            reps=12,
+            fitness_scheduled_workout_id="33333333-3333-4333-8333-333333333333",
+        )
+
+        with patch(
+            "backend.routers.weightlifting.weightlifting_service.upsert_entry",
+            upsert_entry,
+        ):
+            weightlifting.upsert_entry(request, principal=USER)
+
+        self.assertEqual(
+            upsert_entry.call_args.kwargs["fitness_scheduled_workout_id"],
+            "33333333-3333-4333-8333-333333333333",
+        )
 
     def test_archiving_and_restoring_delegate_to_active_state(self):
         set_active = MagicMock()

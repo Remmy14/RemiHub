@@ -1,0 +1,504 @@
+from __future__ import annotations
+
+from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from backend.core.auth import AuthenticatedPrincipal, require_current_principal
+from backend.models.fitness_models import (
+    LiftingTemplateExercisesReplace,
+    PlanInstantiateRequest,
+    PlanTemplateCreate,
+    PlanTemplateItemsReplace,
+    PlanTemplateUpdate,
+    ScheduledWorkoutCreate,
+    WorkoutCompleteRequest,
+    WorkoutRescheduleRequest,
+    WorkoutTemplateCreate,
+    WorkoutTemplateUpdate,
+)
+from backend.services import fitness_service
+
+
+router = APIRouter(prefix="/fitness", tags=["Fitness"])
+
+
+def _handle_service_error(exc: ValueError) -> HTTPException:
+    if isinstance(exc, fitness_service.FitnessNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, fitness_service.FitnessConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/workout-templates")
+def list_workout_templates(
+    include_archived: bool = False,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.list_workout_templates(
+            user_id=principal.id,
+            include_archived=include_archived,
+        ),
+    }
+
+
+@router.post("/workout-templates", status_code=status.HTTP_201_CREATED)
+def create_workout_template(
+    request: WorkoutTemplateCreate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.create_workout_template(
+                user_id=principal.id,
+                name=request.name,
+                workout_type=request.type.value,
+                notes=request.notes,
+                planned_distance_miles=request.planned_distance_miles,
+                exercises=[item.model_dump(mode="json") for item in request.exercises],
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/workout-templates/{template_id}")
+def get_workout_template(
+    template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_workout_template(
+                user_id=principal.id,
+                template_id=template_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.patch("/workout-templates/{template_id}")
+def update_workout_template(
+    template_id: str,
+    request: WorkoutTemplateUpdate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.update_workout_template(
+                principal.id,
+                template_id,
+                **request.model_dump(mode="json", exclude_unset=True),
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/workout-templates/{template_id}/archive")
+def archive_workout_template(
+    template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.set_workout_template_active(
+                user_id=principal.id,
+                template_id=template_id,
+                active=False,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/workout-templates/{template_id}/restore")
+def restore_workout_template(
+    template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.set_workout_template_active(
+                user_id=principal.id,
+                template_id=template_id,
+                active=True,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.put("/workout-templates/{template_id}/lifting-exercises")
+def replace_lifting_template_exercises(
+    template_id: str,
+    request: LiftingTemplateExercisesReplace,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.replace_lifting_template_exercises(
+                user_id=principal.id,
+                template_id=template_id,
+                exercises=[item.model_dump(mode="json") for item in request.exercises],
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/plan-templates")
+def list_plan_templates(
+    include_archived: bool = False,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.list_plan_templates(
+            user_id=principal.id,
+            include_archived=include_archived,
+        ),
+    }
+
+
+@router.post("/plan-templates", status_code=status.HTTP_201_CREATED)
+def create_plan_template(
+    request: PlanTemplateCreate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.create_plan_template(
+                user_id=principal.id,
+                name=request.name,
+                notes=request.notes,
+                items=[item.model_dump(mode="json") for item in request.items],
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/plan-templates/{plan_template_id}")
+def get_plan_template(
+    plan_template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_plan_template(
+                user_id=principal.id,
+                plan_template_id=plan_template_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.patch("/plan-templates/{plan_template_id}")
+def update_plan_template(
+    plan_template_id: str,
+    request: PlanTemplateUpdate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.update_plan_template(
+                principal.id,
+                plan_template_id,
+                **request.model_dump(mode="json", exclude_unset=True),
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-templates/{plan_template_id}/archive")
+def archive_plan_template(
+    plan_template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.set_plan_template_active(
+                user_id=principal.id,
+                plan_template_id=plan_template_id,
+                active=False,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-templates/{plan_template_id}/restore")
+def restore_plan_template(
+    plan_template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.set_plan_template_active(
+                user_id=principal.id,
+                plan_template_id=plan_template_id,
+                active=True,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.put("/plan-templates/{plan_template_id}/items")
+def replace_plan_template_items(
+    plan_template_id: str,
+    request: PlanTemplateItemsReplace,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.replace_plan_template_items(
+                user_id=principal.id,
+                plan_template_id=plan_template_id,
+                items=[item.model_dump(mode="json") for item in request.items],
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-templates/{plan_template_id}/instances", status_code=status.HTTP_201_CREATED)
+def instantiate_plan_template(
+    plan_template_id: str,
+    request: PlanInstantiateRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.instantiate_plan_template(
+                user_id=principal.id,
+                plan_template_id=plan_template_id,
+                start_date=request.start_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/plan-instances")
+def list_plan_instances(
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.list_plan_instances(user_id=principal.id),
+    }
+
+
+@router.get("/plan-instances/current")
+def get_current_plan_instance(
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.get_current_plan_instance(user_id=principal.id),
+    }
+
+
+@router.get("/plan-instances/{plan_instance_id}")
+def get_plan_instance(
+    plan_instance_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_plan_instance(
+                user_id=principal.id,
+                instance_id=plan_instance_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-instances/{plan_instance_id}/complete")
+def complete_plan_instance(
+    plan_instance_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.complete_plan_instance(
+                user_id=principal.id,
+                instance_id=plan_instance_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/scheduled-workouts")
+def list_scheduled_workouts(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.list_scheduled_workouts(
+                user_id=principal.id,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/today")
+def today_workouts(
+    target_date: date | None = Query(default=None, alias="date"),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        selected_date = target_date if isinstance(target_date, date) else None
+        return {
+            "success": True,
+            "data": fitness_service.today_workouts(
+                user_id=principal.id,
+                target_date=selected_date or fitness_service.current_fitness_date(),
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/history")
+def list_workout_history(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.list_workout_history(
+                user_id=principal.id,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts", status_code=status.HTTP_201_CREATED)
+def create_scheduled_workout(
+    request: ScheduledWorkoutCreate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.create_scheduled_workout(
+                user_id=principal.id,
+                workout_template_id=str(request.workout_template_id),
+                scheduled_date=request.scheduled_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/scheduled-workouts/{scheduled_workout_id}")
+def get_scheduled_workout(
+    scheduled_workout_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/complete")
+def complete_scheduled_workout(
+    scheduled_workout_id: str,
+    request: WorkoutCompleteRequest | None = None,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.complete_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+                running=(
+                    request.running.model_dump(mode="json")
+                    if request and request.running
+                    else None
+                ),
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/skip")
+def skip_scheduled_workout(
+    scheduled_workout_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.skip_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/reschedule")
+def reschedule_scheduled_workout(
+    scheduled_workout_id: str,
+    request: WorkoutRescheduleRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.reschedule_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+                scheduled_date=request.scheduled_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
