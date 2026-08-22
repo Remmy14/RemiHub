@@ -4,6 +4,7 @@ import type { FormEvent, ReactNode } from "react";
 import AgentScreen from "./AgentScreen";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import DraftCompanionScreen from "./DraftCompanionScreen";
+import FitnessScreen from "./FitnessScreen";
 import HealthScreen from "./HealthScreen";
 import RaceScreen from "./RaceScreen";
 import RhStorageStatusScreen from "./RhStorageStatusScreen";
@@ -30,6 +31,12 @@ const modules: ModuleEntry[] = [
     href: "/race/draft",
     status: "Public",
     publicModule: true,
+  },
+  {
+    name: "Fitness",
+    description: "Scheduled workouts, running, reusable templates, and training plans.",
+    href: "/portal/fitness",
+    status: "Authenticated",
   },
   {
     name: "RH-Storage",
@@ -255,6 +262,14 @@ function PrivateApp() {
     return (
       <PortalLayout>
         <HealthScreen />
+      </PortalLayout>
+    );
+  }
+
+  if (path.startsWith("/portal/fitness")) {
+    return (
+      <PortalLayout>
+        <FitnessScreen />
       </PortalLayout>
     );
   }
