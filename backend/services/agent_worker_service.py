@@ -669,6 +669,79 @@ def persist_codex_thread_id(claim: ClaimedRun, *, thread_id: str) -> None:
         put_db_conn(conn)
 
 
+def rollover_codex_thread_id(
+    claim: ClaimedRun,
+    *,
+    old_thread_id: str,
+    new_thread_id: str,
+    reason: str,
+) -> None:
+    normalized_old_thread_id = old_thread_id.strip()
+    normalized_new_thread_id = new_thread_id.strip()
+    normalized_reason = reason.strip()
+    if not normalized_old_thread_id:
+        raise ValueError("old_thread_id must not be blank")
+    if not normalized_new_thread_id:
+        raise ValueError("new_thread_id must not be blank")
+    if normalized_old_thread_id == normalized_new_thread_id:
+        raise ValueError("new_thread_id must differ from old_thread_id")
+    if len(normalized_old_thread_id) > 500 or len(normalized_new_thread_id) > 500:
+        raise ValueError("Codex thread ids must be at most 500 characters")
+    if not normalized_reason:
+        raise ValueError("reason must not be blank")
+    if len(normalized_reason) > 200:
+        raise ValueError("reason must be at most 200 characters")
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _lock_owned_run(
+                cur,
+                claim,
+                statuses=(RunStatus.RUNNING.value,),
+            )
+            cur.execute(
+                """
+                UPDATE agent.cards
+                SET codex_thread_id = %s
+                WHERE id = %s
+                  AND codex_thread_id = %s
+                """,
+                (
+                    normalized_new_thread_id,
+                    claim.card_id,
+                    normalized_old_thread_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise AgentQueueStateError(
+                    f"Card {claim.card_id} no longer owns Codex thread "
+                    f"{normalized_old_thread_id}"
+                )
+            _insert_event(
+                cur,
+                card_id=claim.card_id,
+                event_type="codex.thread_rolled_over",
+                actor_type="worker",
+                actor_user_id=None,
+                payload={
+                    "card_revision": claim.card_revision,
+                    "new_thread_id": normalized_new_thread_id,
+                    "old_thread_id": normalized_old_thread_id,
+                    "phase": claim.phase.value,
+                    "reason": normalized_reason,
+                    "run_id": claim.id,
+                    "worker_id": claim.worker_id,
+                },
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def persist_implementation_workspace(
     claim: ClaimedRun,
     *,
@@ -1119,6 +1192,21 @@ class DatabaseAgentQueue:
         thread_id: str,
     ) -> None:
         persist_codex_thread_id(claim, thread_id=thread_id)
+
+    def rollover_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        old_thread_id: str,
+        new_thread_id: str,
+        reason: str,
+    ) -> None:
+        rollover_codex_thread_id(
+            claim,
+            old_thread_id=old_thread_id,
+            new_thread_id=new_thread_id,
+            reason=reason,
+        )
 
     def persist_implementation_workspace(
         self,

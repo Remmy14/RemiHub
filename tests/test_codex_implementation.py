@@ -17,10 +17,12 @@ from backend.core.agent_workspace import ImplementationWorkspace, WorkspaceSnaps
 from backend.core.codex_implementation import (
     IMPLEMENTATION_OUTPUT_SCHEMA,
     CodexImplementationExecutor,
+    CodexImplementationRemoteCompactNotFound,
     CodexImplementationTemporaryFailure,
     CodexImplementationTurn,
     OpenAICodexImplementationGateway,
     _implementation_prompt,
+    _is_remote_compact_not_found,
     _parse_implementation_response,
 )
 from tests.test_agent_worker import claimed_run
@@ -69,9 +71,12 @@ class RecordingGateway:
         self.calls.append(arguments)
         if self.error:
             raise self.error
+        thread_id = arguments["thread_id"] or "thr_rollover"
+        if arguments["thread_id"] is None:
+            arguments["on_thread_created"](thread_id)
         arguments["on_turn_control"](self._interrupt)
         return CodexImplementationTurn(
-            thread_id=arguments["thread_id"],
+            thread_id=thread_id,
             turn_id="turn_implementation",
             final_response=json.dumps(
                 {
@@ -232,6 +237,70 @@ class CodexImplementationExecutorTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.retry_after_seconds, 600)
 
+    def test_remote_compact_404_rolls_thread_and_continues_same_run(self):
+        class RolloverGateway(RecordingGateway):
+            def __init__(self):
+                super().__init__()
+                self.first = True
+
+            def run_turn(self, **arguments):
+                if self.first:
+                    self.first = False
+                    self.calls.append(arguments)
+                    raise CodexImplementationRemoteCompactNotFound(
+                        "Error running remote compact task: unexpected status "
+                        "404 Not Found, url: https://chatgpt.com/backend-api/"
+                        "codex/responses/compact"
+                    )
+                return super().run_turn(**arguments)
+
+        gateway = RolloverGateway()
+
+        result = self.executor(gateway).execute(self.claim)
+
+        self.assertEqual(result.card_status, CardStatus.REVIEW_READY)
+        self.assertEqual(gateway.calls[0]["thread_id"], "thr_existing")
+        self.assertIsNone(gateway.calls[1]["thread_id"])
+        self.assertIn("may already have modified files", gateway.calls[1]["prompt"])
+        self.assertIn("Do not reset", gateway.calls[1]["prompt"])
+        self.store.rollover_codex_thread_id.assert_called_once_with(
+            self.claim,
+            old_thread_id="thr_existing",
+            new_thread_id="thr_rollover",
+            reason="remote_compact_404",
+        )
+        self.assertEqual(result.metadata["thread_id"], "thr_rollover")
+        self.assertEqual(
+            result.metadata["thread_rollover"],
+            {
+                "old_thread_id": "thr_existing",
+                "new_thread_id": "thr_rollover",
+                "reason": "remote_compact_404",
+            },
+        )
+
+    def test_second_remote_compact_failure_is_not_retried_again(self):
+        class AlwaysCompactGateway:
+            def __init__(self):
+                self.calls = []
+
+            def run_turn(self, **arguments):
+                self.calls.append(arguments)
+                if arguments["thread_id"] is None:
+                    arguments["on_thread_created"]("thr_rollover")
+                raise CodexImplementationRemoteCompactNotFound(
+                    "Error running remote compact task: unexpected status "
+                    "404 Not Found, url: /codex/responses/compact"
+                )
+
+        gateway = AlwaysCompactGateway()
+
+        with self.assertRaises(CodexImplementationRemoteCompactNotFound):
+            self.executor(gateway).execute(self.claim)
+
+        self.assertEqual(len(gateway.calls), 2)
+        self.store.rollover_codex_thread_id.assert_called_once()
+
     def test_missing_planning_thread_fails_closed(self):
         with self.assertRaisesRegex(AgentWorkerConfigurationError, "persistent"):
             self.executor(RecordingGateway()).execute(
@@ -260,6 +329,23 @@ class CodexImplementationExecutorTests(unittest.TestCase):
 
         executor.cancel(self.claim)
         self.assertEqual(interrupted, [True])
+
+
+class CodexImplementationCompactionClassifierTests(unittest.TestCase):
+    def test_exact_remote_compact_404_is_recognized(self):
+        error = RuntimeError(
+            "Error running remote compact task: unexpected status 404 Not Found: "
+            '{"detail":"Not Found"}, url: https://chatgpt.com/backend-api/'
+            "codex/responses/compact"
+        )
+        self.assertTrue(_is_remote_compact_not_found(error))
+
+    def test_arbitrary_404_is_not_recognized(self):
+        self.assertFalse(
+            _is_remote_compact_not_found(
+                RuntimeError("404 Not Found: /some/other/path")
+            )
+        )
 
 
 class ImplementationResponseTests(unittest.TestCase):
@@ -356,6 +442,7 @@ class OpenAICodexImplementationGatewayTests(unittest.TestCase):
                     repository_path=Path("/tmp/worktree"),
                     prompt="Implement this",
                     model=None,
+                    on_thread_created=lambda _thread_id: None,
                     on_turn_control=controls.append,
                 )
 
@@ -376,6 +463,84 @@ class OpenAICodexImplementationGatewayTests(unittest.TestCase):
         self.assertTrue(callable(controls[0]))
         self.assertIsNone(controls[-1])
         self.assertEqual(result.thread_id, "thr_existing")
+
+    def test_gateway_can_start_persistent_successor_thread(self):
+        calls = {}
+
+        class ApprovalMode:
+            deny_all = "deny-all"
+
+        class Sandbox:
+            workspace_write = "workspace-write"
+
+        class CodexConfig:
+            def __init__(self, **arguments):
+                calls["config"] = arguments
+
+        class Result:
+            id = "turn_new"
+            final_response = json.dumps(
+                {"response_markdown": "Done", "tests": []}
+            )
+            duration_ms = 10
+            usage = None
+
+        class Handle:
+            def interrupt(self):
+                return None
+
+            def run(self):
+                return Result()
+
+        class Thread:
+            id = "thr_new"
+
+            def turn(self, _prompt, **_arguments):
+                return Handle()
+
+        class Codex:
+            def __init__(self, _config):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def thread_start(self, **arguments):
+                calls["start"] = arguments
+                return Thread()
+
+        fake_sdk = types.ModuleType("openai_codex")
+        fake_sdk.__version__ = "test-sdk"
+        fake_sdk.ApprovalMode = ApprovalMode
+        fake_sdk.Codex = Codex
+        fake_sdk.CodexConfig = CodexConfig
+        fake_sdk.Sandbox = Sandbox
+        fake_sdk.is_retryable_error = lambda _exc: False
+
+        created = []
+        controls = []
+        with tempfile.NamedTemporaryFile() as wrapper_file:
+            wrapper_path = Path(wrapper_file.name)
+            wrapper_path.chmod(0o700)
+            with patch.dict(sys.modules, {"openai_codex": fake_sdk}):
+                result = OpenAICodexImplementationGateway(
+                    codex_bin=str(wrapper_path)
+                ).run_turn(
+                    thread_id=None,
+                    repository_path=Path("/tmp/worktree"),
+                    prompt="Continue after rollover",
+                    model=None,
+                    on_thread_created=created.append,
+                    on_turn_control=controls.append,
+                )
+
+        self.assertEqual(created, ["thr_new"])
+        self.assertFalse(calls["start"]["ephemeral"])
+        self.assertEqual(result.thread_id, "thr_new")
+
 
 
 if __name__ == "__main__":

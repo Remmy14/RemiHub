@@ -90,6 +90,15 @@ class CodexThreadStore(Protocol):
         thread_id: str,
     ) -> None: ...
 
+    def rollover_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        old_thread_id: str,
+        new_thread_id: str,
+        reason: str,
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class CodexPlanningTurn:
@@ -114,6 +123,10 @@ class CodexPlanningGateway(Protocol):
 
 
 class CodexTemporaryFailure(RuntimeError):
+    pass
+
+
+class CodexRemoteCompactNotFound(RuntimeError):
     pass
 
 
@@ -171,6 +184,10 @@ class OpenAICodexPlanningGateway:
 
                 result = thread.run(prompt, **turn_arguments)
         except Exception as exc:
+            if _is_remote_compact_not_found(exc):
+                raise CodexRemoteCompactNotFound(
+                    str(exc).strip() or type(exc).__name__
+                ) from exc
             if _is_temporary_sdk_error(openai_codex, exc):
                 raise CodexTemporaryFailure(str(exc).strip() or type(exc).__name__) from exc
             raise
@@ -230,6 +247,7 @@ class CodexPlanningExecutor:
                 "The codex planning executor cannot run implementation or deployment"
             )
 
+        rollover_metadata = None
         try:
             turn = self.gateway.run_turn(
                 existing_thread_id=claim.codex_thread_id,
@@ -243,6 +261,38 @@ class CodexPlanningExecutor:
                     )
                 ),
             )
+        except CodexRemoteCompactNotFound as exc:
+            if not claim.codex_thread_id:
+                raise
+
+            old_thread_id = claim.codex_thread_id
+            rollover_metadata = {
+                "old_thread_id": old_thread_id,
+                "reason": "remote_compact_404",
+            }
+
+            def persist_rollover(new_thread_id: str) -> None:
+                self.thread_store.rollover_codex_thread_id(
+                    claim,
+                    old_thread_id=old_thread_id,
+                    new_thread_id=new_thread_id,
+                    reason="remote_compact_404",
+                )
+                rollover_metadata["new_thread_id"] = new_thread_id
+
+            try:
+                turn = self.gateway.run_turn(
+                    existing_thread_id=None,
+                    repository_path=self.repository_paths.cwd,
+                    prompt=_planning_rollover_prompt(claim),
+                    model=self.model,
+                    on_thread_created=persist_rollover,
+                )
+            except CodexTemporaryFailure as rollover_exc:
+                raise AgentTemporarilyBlockedError(
+                    f"Codex is temporarily unavailable: {rollover_exc}",
+                    retry_after_seconds=self.retry_after_seconds,
+                ) from rollover_exc
         except CodexTemporaryFailure as exc:
             raise AgentTemporarilyBlockedError(
                 f"Codex is temporarily unavailable: {exc}",
@@ -269,6 +319,8 @@ class CodexPlanningExecutor:
             "turn_id": turn.turn_id,
             "usage": turn.usage,
         }
+        if rollover_metadata is not None:
+            metadata["thread_rollover"] = rollover_metadata
         if self.repository_paths.dual_repository:
             metadata["planning_workspace"] = {
                 "android_repository": str(self.repository_paths.android),
@@ -323,6 +375,54 @@ between them before choosing repository_scope. Respond using the required
 structured planning schema. This is card revision {claim.card_revision} and
 run {claim.id}.
 """.strip()
+
+
+def _planning_rollover_prompt(claim: ClaimedRun) -> str:
+    return f"""
+The previous persistent Codex thread became unusable while attempting remote
+compaction and has been rolled over automatically. Continue the SAME RemiHub
+card and revision on this successor thread. Do not treat this as a new card.
+
+Card title: {claim.title}
+Card revision: {claim.card_revision}
+Original card request:
+{claim.description.strip()}
+
+Current user message:
+{_latest_user_message(claim)}
+
+Recent card discussion:
+{_recent_rollover_context(claim)}
+
+Inspect the repository or repositories as needed and continue planning from the
+existing card state. Remain read-only and respond using the required structured
+planning schema.
+""".strip()
+
+
+def _recent_rollover_context(claim: ClaimedRun) -> str:
+    remaining = 12000
+    selected: list[str] = []
+    for message in reversed(claim.messages):
+        author_type = str(message.get("author_type") or "").strip()
+        if author_type not in {"user", "agent"}:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        content = content[:3000]
+        entry = f"{author_type.upper()}: {content}"
+        if len(entry) > remaining:
+            if selected:
+                break
+            entry = entry[:remaining]
+        selected.append(entry)
+        remaining -= len(entry)
+        if remaining <= 0 or len(selected) >= 8:
+            break
+    if not selected:
+        return "(no prior user/agent messages available)"
+    return "\n\n".join(reversed(selected))
 
 
 def _parse_planning_response(value: str) -> tuple[str, bool, RepositoryScope]:
@@ -447,6 +547,15 @@ def _required_git_checkout(value: str | Path, *, field: str) -> Path:
             f"{field} is not a Git checkout: {resolved}"
         )
     return resolved
+
+
+def _is_remote_compact_not_found(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "error running remote compact task" in message
+        and "404 not found" in message
+        and "/codex/responses/compact" in message
+    )
 
 
 def _is_temporary_sdk_error(sdk, exc: Exception) -> bool:

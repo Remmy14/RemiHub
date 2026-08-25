@@ -18,6 +18,7 @@ from backend.services.agent_worker_service import (
     heartbeat_run,
     persist_codex_thread_id,
     persist_implementation_workspace,
+    rollover_codex_thread_id,
     verify_worker_identity,
 )
 from tests.test_agent_worker import claimed_run
@@ -518,6 +519,74 @@ class CodexThreadPersistenceTests(unittest.TestCase):
             persist_codex_thread_id(
                 claimed_run(),
                 thread_id="thr_conflict",
+            )
+
+        insert_event.assert_not_called()
+        connection.rollback.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_thread_rollover_is_compare_and_swap_audited_under_owned_lease(
+        self,
+        get_db_conn,
+        put_db_conn,
+        lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 1
+        get_db_conn.return_value = connection
+        claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
+
+        rollover_codex_thread_id(
+            claim,
+            old_thread_id="thr_old",
+            new_thread_id="thr_new",
+            reason="remote_compact_404",
+        )
+
+        lock_owned_run.assert_called_once()
+        sql, parameters = cursor.execute.call_args.args
+        self.assertIn("SET codex_thread_id = %s", sql)
+        self.assertIn("AND codex_thread_id = %s", sql)
+        self.assertEqual(parameters, ("thr_new", claim.card_id, "thr_old"))
+        insert_event.assert_called_once()
+        event = insert_event.call_args.kwargs
+        self.assertEqual(event["event_type"], "codex.thread_rolled_over")
+        self.assertEqual(event["payload"]["old_thread_id"], "thr_old")
+        self.assertEqual(event["payload"]["new_thread_id"], "thr_new")
+        self.assertEqual(event["payload"]["reason"], "remote_compact_404")
+        self.assertEqual(event["payload"]["run_id"], claim.id)
+        connection.commit.assert_called_once_with()
+        put_db_conn.assert_called_once_with(connection)
+
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_thread_rollover_rejects_stale_old_thread(
+        self,
+        get_db_conn,
+        put_db_conn,
+        _lock_owned_run,
+        insert_event,
+    ):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 0
+        get_db_conn.return_value = connection
+
+        with self.assertRaisesRegex(AgentQueueStateError, "no longer owns"):
+            rollover_codex_thread_id(
+                claimed_run(phase=RunPhase.IMPLEMENTATION),
+                old_thread_id="thr_old",
+                new_thread_id="thr_new",
+                reason="remote_compact_404",
             )
 
         insert_event.assert_not_called()

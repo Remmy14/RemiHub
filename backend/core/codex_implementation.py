@@ -99,6 +99,17 @@ class ImplementationWorkspaceStore(Protocol):
     ) -> None: ...
 
 
+class CodexThreadStore(Protocol):
+    def rollover_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        old_thread_id: str,
+        new_thread_id: str,
+        reason: str,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class CodexImplementationTurn:
     thread_id: str
@@ -117,15 +128,20 @@ class CodexImplementationGateway(Protocol):
     def run_turn(
         self,
         *,
-        thread_id: str,
+        thread_id: str | None,
         repository_path: Path,
         prompt: str,
         model: str | None,
+        on_thread_created: Callable[[str], None],
         on_turn_control: TurnControlCallback,
     ) -> CodexImplementationTurn: ...
 
 
 class CodexImplementationTemporaryFailure(RuntimeError):
+    pass
+
+
+class CodexImplementationRemoteCompactNotFound(RuntimeError):
     pass
 
 
@@ -152,10 +168,11 @@ class OpenAICodexImplementationGateway:
     def run_turn(
         self,
         *,
-        thread_id: str,
+        thread_id: str | None,
         repository_path: Path,
         prompt: str,
         model: str | None,
+        on_thread_created: Callable[[str], None],
         on_turn_control: TurnControlCallback,
     ) -> CodexImplementationTurn:
         try:
@@ -181,7 +198,14 @@ class OpenAICodexImplementationGateway:
                 cwd=str(repository_path),
             )
             with Codex(config) as codex:
-                thread = codex.thread_resume(thread_id, **lifecycle)
+                if thread_id:
+                    thread = codex.thread_resume(thread_id, **lifecycle)
+                else:
+                    thread = codex.thread_start(
+                        ephemeral=False,
+                        **lifecycle,
+                    )
+                    on_thread_created(thread.id)
                 turn_arguments = {
                     "approval_mode": ApprovalMode.deny_all,
                     "cwd": str(repository_path),
@@ -198,6 +222,10 @@ class OpenAICodexImplementationGateway:
                 finally:
                     on_turn_control(None)
         except Exception as exc:
+            if _is_remote_compact_not_found(exc):
+                raise CodexImplementationRemoteCompactNotFound(
+                    str(exc).strip() or type(exc).__name__
+                ) from exc
             if _is_temporary_sdk_error(openai_codex, exc):
                 raise CodexImplementationTemporaryFailure(
                     str(exc).strip() or type(exc).__name__
@@ -296,6 +324,7 @@ class CodexImplementationExecutor:
         *,
         workspace_manager: GitImplementationWorkspaceManager,
         workspace_store: ImplementationWorkspaceStore,
+        thread_store: CodexThreadStore | None = None,
         codex_bin: str | None = None,
         model: str | None = None,
         retry_after_seconds: int = 900,
@@ -310,6 +339,7 @@ class CodexImplementationExecutor:
         self.allowed_repository_scopes = frozenset({repository_scope})
         self.validator = validator
         self.workspace_store = workspace_store
+        self.thread_store = thread_store or workspace_store
         self.model = model.strip() if model and model.strip() else None
         self.retry_after_seconds = retry_after_seconds
         if gateway is None:
@@ -348,17 +378,47 @@ class CodexImplementationExecutor:
                 )
             ),
         ) as workspace:
+            rollover_metadata = None
             try:
-                turn = self.gateway.run_turn(
-                    thread_id=claim.codex_thread_id,
-                    repository_path=workspace.path,
-                    prompt=_implementation_prompt(claim, workspace),
-                    model=self.model,
-                    on_turn_control=lambda interrupt: self._set_turn_control(
-                        claim.id,
-                        interrupt,
-                    ),
-                )
+                try:
+                    turn = self.gateway.run_turn(
+                        thread_id=claim.codex_thread_id,
+                        repository_path=workspace.path,
+                        prompt=_implementation_prompt(claim, workspace),
+                        model=self.model,
+                        on_thread_created=lambda _thread_id: None,
+                        on_turn_control=lambda interrupt: self._set_turn_control(
+                            claim.id,
+                            interrupt,
+                        ),
+                    )
+                except CodexImplementationRemoteCompactNotFound:
+                    old_thread_id = claim.codex_thread_id
+                    rollover_metadata = {
+                        "old_thread_id": old_thread_id,
+                        "reason": "remote_compact_404",
+                    }
+
+                    def persist_rollover(new_thread_id: str) -> None:
+                        self.thread_store.rollover_codex_thread_id(
+                            claim,
+                            old_thread_id=old_thread_id,
+                            new_thread_id=new_thread_id,
+                            reason="remote_compact_404",
+                        )
+                        rollover_metadata["new_thread_id"] = new_thread_id
+
+                    turn = self.gateway.run_turn(
+                        thread_id=None,
+                        repository_path=workspace.path,
+                        prompt=_implementation_rollover_prompt(claim, workspace),
+                        model=self.model,
+                        on_thread_created=persist_rollover,
+                        on_turn_control=lambda interrupt: self._set_turn_control(
+                            claim.id,
+                            interrupt,
+                        ),
+                    )
             except CodexImplementationTemporaryFailure as exc:
                 raise AgentTemporarilyBlockedError(
                     f"Codex is temporarily unavailable: {exc}",
@@ -392,6 +452,7 @@ class CodexImplementationExecutor:
                 "tests": tests,
                 "repository_scope": self.repository_scope.value,
                 "trusted_validation": trusted_validation,
+                "thread_rollover": rollover_metadata,
                 "workspace": {
                     "artifact_patch": str(snapshot.patch_path),
                     "base_branch": workspace.base_branch,
@@ -482,6 +543,68 @@ implementation schema.
 """.strip()
 
 
+def _implementation_rollover_prompt(
+    claim: ClaimedRun,
+    workspace: ImplementationWorkspace,
+) -> str:
+    return f"""
+The previous persistent Codex thread became unusable while attempting remote
+compaction and has been rolled over automatically. Continue the SAME RemiHub
+card, revision, feature branch, and implementation worktree on this successor
+thread. Do not treat this as a new implementation.
+
+IMPORTANT: the failed turn may already have modified files in the assigned
+worktree before compaction failed. Inspect the existing worktree state and diff
+first. Preserve and continue valid partial work. Do not reset, revert, recreate,
+or discard existing changes merely because the conversational thread rolled
+over.
+
+Card title: {claim.title}
+Card revision: {claim.card_revision}
+Original card request:
+{claim.description.strip()}
+
+Current approved request or review feedback:
+{_latest_user_message(claim)}
+
+Recent card discussion:
+{_recent_rollover_context(claim)}
+
+Base branch: {workspace.base_branch}
+Feature branch: {workspace.feature_branch}
+Run: {claim.id}
+
+Remain inside the assigned worktree. Do not commit or deploy. Finish the current
+approved implementation from the worktree's existing state, run focused tests
+when possible, and respond using the required structured implementation schema.
+""".strip()
+
+
+def _recent_rollover_context(claim: ClaimedRun) -> str:
+    remaining = 12000
+    selected: list[str] = []
+    for message in reversed(claim.messages):
+        author_type = str(message.get("author_type") or "").strip()
+        if author_type not in {"user", "agent"}:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        content = content[:3000]
+        entry = f"{author_type.upper()}: {content}"
+        if len(entry) > remaining:
+            if selected:
+                break
+            entry = entry[:remaining]
+        selected.append(entry)
+        remaining -= len(entry)
+        if remaining <= 0 or len(selected) >= 8:
+            break
+    if not selected:
+        return "(no prior user/agent messages available)"
+    return "\n\n".join(reversed(selected))
+
+
 def _parse_implementation_response(value: str) -> tuple[str, list[dict]]:
     payload_text = value.strip()
     if payload_text.startswith("```json") and payload_text.endswith("```"):
@@ -558,6 +681,15 @@ def _completion_message(response: str, snapshot: WorkspaceSnapshot) -> str:
     if len(message) > 20000:
         message = message[:19997].rstrip() + "..."
     return message
+
+
+def _is_remote_compact_not_found(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "error running remote compact task" in message
+        and "404 not found" in message
+        and "/codex/responses/compact" in message
+    )
 
 
 def _is_temporary_sdk_error(sdk, exc: Exception) -> bool:

@@ -14,9 +14,11 @@ from backend.core.agent_worker import (
 from backend.core.codex_planning import (
     CodexPlanningExecutor,
     CodexPlanningTurn,
+    CodexRemoteCompactNotFound,
     CodexTemporaryFailure,
     OpenAICodexPlanningGateway,
     PLANNING_OUTPUT_SCHEMA,
+    _is_remote_compact_not_found,
     _parse_planning_response,
 )
 from tests.test_agent_worker import claimed_run
@@ -151,6 +153,82 @@ class CodexPlanningExecutorTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.retry_after_seconds, 600)
 
+    def test_remote_compact_404_rolls_thread_and_continues_planning(self):
+        class RolloverGateway(RecordingGateway):
+            def __init__(self):
+                super().__init__()
+                self.first = True
+
+            def run_turn(self, **arguments):
+                if self.first:
+                    self.first = False
+                    self.calls.append(arguments)
+                    raise CodexRemoteCompactNotFound(
+                        "Error running remote compact task: unexpected status "
+                        "404 Not Found, url: https://chatgpt.com/backend-api/"
+                        "codex/responses/compact"
+                    )
+                return super().run_turn(**arguments)
+
+        gateway = RolloverGateway()
+        claim = claimed_run()
+        claim = type(claim)(
+            **{
+                **claim.__dict__,
+                "codex_thread_id": "thr_existing",
+                "messages": (
+                    {"author_type": "user", "content": "Original request"},
+                    {"author_type": "agent", "content": "Earlier plan"},
+                    {"author_type": "user", "content": "Continue with this"},
+                ),
+            }
+        )
+
+        result = self.executor(gateway).execute(claim)
+
+        self.assertEqual(result.card_status, CardStatus.AWAITING_IMPLEMENTATION_APPROVAL)
+        self.assertEqual(gateway.calls[0]["existing_thread_id"], "thr_existing")
+        self.assertIsNone(gateway.calls[1]["existing_thread_id"])
+        self.assertIn("rolled over automatically", gateway.calls[1]["prompt"])
+        self.thread_store.rollover_codex_thread_id.assert_called_once_with(
+            claim,
+            old_thread_id="thr_existing",
+            new_thread_id="thr_new",
+            reason="remote_compact_404",
+        )
+        self.assertEqual(
+            result.metadata["thread_rollover"],
+            {
+                "old_thread_id": "thr_existing",
+                "new_thread_id": "thr_new",
+                "reason": "remote_compact_404",
+            },
+        )
+
+    def test_second_remote_compact_failure_is_not_retried_again(self):
+        class AlwaysCompactGateway:
+            def __init__(self):
+                self.calls = []
+
+            def run_turn(self, **arguments):
+                self.calls.append(arguments)
+                if arguments["existing_thread_id"] is None:
+                    arguments["on_thread_created"]("thr_new")
+                raise CodexRemoteCompactNotFound(
+                    "Error running remote compact task: unexpected status "
+                    "404 Not Found, url: /codex/responses/compact"
+                )
+
+        claim = claimed_run()
+        claim = type(claim)(**{**claim.__dict__, "codex_thread_id": "thr_existing"})
+        gateway = AlwaysCompactGateway()
+
+        with self.assertRaises(CodexRemoteCompactNotFound):
+            self.executor(gateway).execute(claim)
+
+        self.assertEqual(len(gateway.calls), 2)
+        self.thread_store.rollover_codex_thread_id.assert_called_once()
+
     def test_implementation_phase_is_rejected(self):
         with self.assertRaisesRegex(
             AgentWorkerConfigurationError,
@@ -218,6 +296,23 @@ class CodexPlanningExecutorTests(unittest.TestCase):
                 thread_store=self.thread_store,
                 gateway=RecordingGateway(),
             )
+
+
+class CodexPlanningCompactionClassifierTests(unittest.TestCase):
+    def test_exact_remote_compact_404_is_recognized(self):
+        error = RuntimeError(
+            "Error running remote compact task: unexpected status 404 Not Found: "
+            '{"detail":"Not Found"}, url: https://chatgpt.com/backend-api/'
+            "codex/responses/compact"
+        )
+        self.assertTrue(_is_remote_compact_not_found(error))
+
+    def test_arbitrary_404_is_not_recognized(self):
+        self.assertFalse(
+            _is_remote_compact_not_found(
+                RuntimeError("404 Not Found: /some/other/path")
+            )
+        )
 
 
 class PlanningResponseTests(unittest.TestCase):

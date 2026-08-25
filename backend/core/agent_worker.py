@@ -108,6 +108,15 @@ class AgentQueue(Protocol):
         thread_id: str,
     ) -> None: ...
 
+    def rollover_codex_thread_id(
+        self,
+        claim: ClaimedRun,
+        *,
+        old_thread_id: str,
+        new_thread_id: str,
+        reason: str,
+    ) -> None: ...
+
     def persist_implementation_workspace(
         self,
         claim: ClaimedRun,
