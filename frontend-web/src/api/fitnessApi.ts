@@ -313,6 +313,20 @@ export async function rescheduleScheduledWorkout(
   return response.data;
 }
 
+export async function replaceScheduledWorkoutTemplate(
+  workoutId: string,
+  workoutTemplateId: string,
+): Promise<FitnessScheduledWorkout> {
+  const response = await apiRequest<FitnessResponse<FitnessScheduledWorkout>>(
+    `/fitness/scheduled-workouts/${workoutId}/replace-template`,
+    {
+      method: "POST",
+      body: JSON.stringify({ workout_template_id: workoutTemplateId }),
+    },
+  );
+  return response.data;
+}
+
 export async function undoRescheduleScheduledWorkout(
   workoutId: string,
 ): Promise<{ original: FitnessScheduledWorkout; removed_replacement_scheduled_workout_id: string }> {

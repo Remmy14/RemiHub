@@ -105,6 +105,29 @@ class FitnessHttpTests(unittest.TestCase):
         self.assertEqual(remove.call_args.kwargs["user_id"], USER.id)
         self.assertEqual(remove.call_args.kwargs["scheduled_workout_id"], "scheduled")
 
+    def test_replace_scheduled_workout_template_route_delegates_owner(self):
+        replace = MagicMock(return_value={"id": "scheduled", "workout_template_id": "template"})
+        request = fitness.ScheduledWorkoutTemplateReplace(
+            workout_template_id="22222222-2222-4222-8222-222222222222",
+        )
+        with patch(
+            "backend.routers.fitness.fitness_service.replace_scheduled_workout_template",
+            replace,
+        ):
+            response = fitness.replace_scheduled_workout_template(
+                "scheduled",
+                request,
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(replace.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(replace.call_args.kwargs["scheduled_workout_id"], "scheduled")
+        self.assertEqual(
+            replace.call_args.kwargs["workout_template_id"],
+            "22222222-2222-4222-8222-222222222222",
+        )
+
     def test_training_calendar_route_delegates_owner(self):
         calendar = MagicMock(return_value={"weeks": []})
         with patch(

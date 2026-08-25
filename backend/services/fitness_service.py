@@ -1517,6 +1517,70 @@ def remove_scheduled_workout(*, user_id: str, scheduled_workout_id: str) -> dict
         put_db_conn(conn)
 
 
+def replace_scheduled_workout_template(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+    workout_template_id: str,
+) -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            workout = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+                lock=True,
+            )
+            if workout["status"] != "PLANNED":
+                raise FitnessConflictError("Only planned workouts can change templates")
+            if workout.get("running_result"):
+                raise FitnessConflictError("Workout has Running result data")
+            _assert_no_weightlifting_entries(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=workout["id"],
+            )
+            template = _assert_active_workout_template(
+                cur,
+                user_id=user_id,
+                template_id=workout_template_id,
+            )
+            if template["type"] != workout["type"]:
+                raise FitnessValidationError("Replacement template must match workout type")
+            cur.execute(
+                """
+                UPDATE public.fitness_scheduled_workouts
+                SET workout_template_id = %s,
+                    planned_distance_miles = %s,
+                    updated_at = now()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND status = 'PLANNED'
+                """,
+                (
+                    workout_template_id,
+                    _planned_distance_snapshot(template),
+                    scheduled_workout_id,
+                    user_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise FitnessConflictError("Only planned workouts can change templates")
+            result = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+            )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def undo_reschedule(*, user_id: str, scheduled_workout_id: str) -> dict:
     conn = get_db_conn()
     try:

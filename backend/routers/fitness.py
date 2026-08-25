@@ -14,6 +14,7 @@ from backend.models.fitness_models import (
     PlanTemplateUpdate,
     RecurringSeriesRequest,
     ScheduledWorkoutCreate,
+    ScheduledWorkoutTemplateReplace,
     WorkoutCompleteRequest,
     WorkoutRescheduleRequest,
     WorkoutTemplateCreate,
@@ -609,6 +610,25 @@ def undo_reschedule(
             "data": fitness_service.undo_reschedule(
                 user_id=principal.id,
                 scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/replace-template")
+def replace_scheduled_workout_template(
+    scheduled_workout_id: str,
+    request: ScheduledWorkoutTemplateReplace,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.replace_scheduled_workout_template(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+                workout_template_id=str(request.workout_template_id),
             ),
         }
     except ValueError as exc:

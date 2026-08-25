@@ -27,6 +27,8 @@ from backend.services import fitness_service
 USER_ID = "11111111-1111-4111-8111-111111111111"
 SCHEDULED_ID = "33333333-3333-4333-8333-333333333333"
 TEMPLATE_ID = "22222222-2222-4222-8222-222222222222"
+SECOND_TEMPLATE_ID = "88888888-8888-4888-8888-888888888888"
+SECOND_SCHEDULED_ID = "99999999-9999-4999-8999-999999999999"
 EXERCISE_ID = "77777777-7777-4777-8777-777777777777"
 SERIES_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
@@ -64,9 +66,18 @@ RUNNING_TEMPLATE_ROW = (
     NOW,
     NOW,
 )
+SECOND_RUNNING_TEMPLATE_ROW = (
+    SECOND_TEMPLATE_ID,
+    USER_ID,
+    "Easy Run",
+    "RUNNING",
+    None,
+    True,
+    Decimal("3.00"),
+    NOW,
+    NOW,
+)
 PLAN_TEMPLATE_ID = "66666666-6666-4666-8666-666666666666"
-SECOND_TEMPLATE_ID = "88888888-8888-4888-8888-888888888888"
-SECOND_SCHEDULED_ID = "99999999-9999-4999-8999-999999999999"
 PLAN_TEMPLATE_COLUMNS = [
     "id",
     "user_id",
@@ -501,6 +512,192 @@ class FitnessServiceTests(unittest.TestCase):
 
         insert_params = connection.cursor_instance.executed[1][1]
         self.assertEqual(insert_params[3], SERIES_ID)
+
+    def test_replace_scheduled_workout_template_updates_one_planned_occurrence(self):
+        original = list(PLANNED_RUNNING_ROW)
+        original[3] = PLAN_INSTANCE_ID
+        original[8] = SERIES_ID
+        updated = list(original)
+        updated[2] = SECOND_TEMPLATE_ID
+        updated[9] = Decimal("3.00")
+        updated[10] = "Easy Run"
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [tuple(original)]),
+                ([], []),
+                (TEMPLATE_COLUMNS, [SECOND_RUNNING_TEMPLATE_ROW]),
+                ([], []),
+                (SCHEDULED_COLUMNS, [tuple(updated)]),
+            ]
+        )
+
+        with patches:
+            result = fitness_service.replace_scheduled_workout_template(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+                workout_template_id=SECOND_TEMPLATE_ID,
+            )
+
+        update_sql, update_params = connection.cursor_instance.executed[3]
+        self.assertIn("UPDATE public.fitness_scheduled_workouts", update_sql)
+        self.assertIn("workout_template_id = %s", update_sql)
+        self.assertIn("planned_distance_miles = %s", update_sql)
+        self.assertIn("WHERE id = %s", update_sql)
+        self.assertIn("AND user_id = %s", update_sql)
+        self.assertIn("AND status = 'PLANNED'", update_sql)
+        self.assertEqual(update_params, (SECOND_TEMPLATE_ID, Decimal("3.00"), SCHEDULED_ID, USER_ID))
+        self.assertIn("FOR UPDATE", connection.cursor_instance.executed[0][0])
+        self.assertEqual(result["workout_template_id"], SECOND_TEMPLATE_ID)
+        self.assertEqual(result["planned_distance_miles"], 3.0)
+        self.assertEqual(result["scheduled_date"], "2026-08-21")
+        self.assertEqual(result["original_scheduled_date"], "2026-08-21")
+        self.assertEqual(result["plan_instance_id"], PLAN_INSTANCE_ID)
+        self.assertEqual(result["recurring_series_id"], SERIES_ID)
+        self.assertFalse(
+            any(
+                "UPDATE public.fitness_training_plan" in sql
+                or "UPDATE public.fitness_recurring_schedule_series" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+        self.assertEqual(connection.commits, 1)
+
+    def test_replace_scheduled_workout_template_rejects_incompatible_type(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                ([], []),
+                (TEMPLATE_COLUMNS, [LIFTING_TEMPLATE_ROW]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessValidationError, "match workout type"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=TEMPLATE_ID,
+                )
+
+        self.assertFalse(
+            any(
+                "UPDATE public.fitness_scheduled_workouts" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_replace_scheduled_workout_template_rejects_completed_workout(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [COMPLETED_RUNNING_ROW]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessConflictError, "planned"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=SECOND_TEMPLATE_ID,
+                )
+
+        self.assertFalse(
+            any(
+                "UPDATE public.fitness_scheduled_workouts" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+
+    def test_replace_scheduled_workout_template_enforces_scheduled_workout_ownership_first(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessNotFoundError, "Scheduled workout not found"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=SECOND_TEMPLATE_ID,
+                )
+
+        self.assertEqual(len(connection.cursor_instance.executed), 1)
+        lookup_sql, lookup_params = connection.cursor_instance.executed[0]
+        self.assertIn("WHERE scheduled.id = %s", lookup_sql)
+        self.assertIn("AND scheduled.user_id = %s", lookup_sql)
+        self.assertEqual(lookup_params, (SCHEDULED_ID, USER_ID))
+        self.assertFalse(
+            any(
+                "UPDATE public.fitness_scheduled_workouts" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_replace_scheduled_workout_template_rejects_running_result_linked_workout(self):
+        planned_with_result = list(COMPLETED_RUNNING_ROW)
+        planned_with_result[6] = "PLANNED"
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [tuple(planned_with_result)]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessConflictError, "Running result"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=SECOND_TEMPLATE_ID,
+                )
+
+    def test_replace_scheduled_workout_template_rejects_weightlifting_result_linked_workout(self):
+        lifting_workout = list(PLANNED_RUNNING_ROW)
+        lifting_workout[11] = "LIFTING"
+        lifting_workout[9] = None
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [tuple(lifting_workout)]),
+                (["?column?"], [(1,)]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessConflictError, "Weightlifting"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=TEMPLATE_ID,
+                )
+
+    def test_replace_scheduled_workout_template_enforces_template_ownership(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                ([], []),
+                (TEMPLATE_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessNotFoundError, "Workout template not found"):
+                fitness_service.replace_scheduled_workout_template(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    workout_template_id=SECOND_TEMPLATE_ID,
+                )
+
+        template_params = connection.cursor_instance.executed[2][1]
+        self.assertEqual(template_params, (SECOND_TEMPLATE_ID, USER_ID))
+        self.assertFalse(
+            any(
+                "UPDATE public.fitness_scheduled_workouts" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
 
     def test_recurrence_generator_uses_iso_weekdays_and_duration_range(self):
         end_date, weekdays, duration, dates = fitness_service._recurrence_dates(

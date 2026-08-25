@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { FormEvent, KeyboardEvent, MouseEvent, ReactNode } from "react";
 
 import {
   archivePlanTemplate,
@@ -22,6 +22,7 @@ import {
   previewRecurringSeries,
   replaceLiftingTemplateExercises,
   replacePlanTemplateItems,
+  replaceScheduledWorkoutTemplate,
   removeRemainingPlanWorkouts,
   removeRemainingRecurringWorkouts,
   removeScheduledWorkout,
@@ -553,6 +554,113 @@ function RescheduleDialog({
   );
 }
 
+function WorkoutTemplateReplaceDialog({
+  onClose,
+  onSubmit,
+  submitting,
+  workout,
+}: {
+  onClose: () => void;
+  onSubmit: (workoutTemplateId: string) => Promise<void>;
+  submitting: boolean;
+  workout: FitnessScheduledWorkout;
+}) {
+  const [templates, setTemplates] = useState<FitnessWorkoutTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState("");
+  const [state, setState] = useState<LoadState>("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let ignore = false;
+    const load = async () => {
+      setState("loading");
+      setError(null);
+      try {
+        const templateList = (await listWorkoutTemplates(false)).filter(
+          (template) => template.type === workout.type && template.id !== workout.workout_template_id,
+        );
+        if (!ignore) {
+          setTemplates(templateList);
+          setSelectedTemplateId("");
+        }
+      } catch (caught) {
+        if (!ignore) {
+          setError(messageFromError(caught, "Unable to load workout templates."));
+        }
+      } finally {
+        if (!ignore) {
+          setState("idle");
+        }
+      }
+    };
+    void load();
+    return () => {
+      ignore = true;
+    };
+  }, [workout.type, workout.workout_template_id]);
+
+  const selectedTemplate = templates.find((template) => template.id === selectedTemplateId);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    if (!selectedTemplateId) {
+      setError("Choose a compatible template.");
+      return;
+    }
+    try {
+      await onSubmit(selectedTemplateId);
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to update workout template."));
+    }
+  };
+
+  return (
+    <Dialog onClose={onClose} title={`Edit ${workout.workout_name}`}>
+      <form className="space-y-4" onSubmit={submit}>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Metric label="Scheduled" value={formatDate(workout.scheduled_date)} />
+          <Metric label="Current template" value={workout.workout_name} />
+          {workout.type === "RUNNING" && (
+            <Metric label="Current planned" value={distanceLabel(workout.planned_distance_miles)} />
+          )}
+          {workout.source?.label && <Metric label="From" value={workout.source.label} />}
+        </div>
+        <Field label="Replacement template">
+          <select
+            className={inputClasses}
+            disabled={submitting || state === "loading" || templates.length === 0}
+            onChange={(event) => setSelectedTemplateId(event.target.value)}
+            required
+            value={selectedTemplateId}
+          >
+            <option value="">Choose replacement template...</option>
+            {templates.map((template) => (
+              <option key={template.id} value={template.id}>
+                {template.name}
+                {template.type === "RUNNING" ? ` (${distanceLabel(template.planned_distance_miles)})` : " (Lifting)"}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {selectedTemplate && selectedTemplate.type === "RUNNING" && (
+          <Metric label="New planned" value={distanceLabel(selectedTemplate.planned_distance_miles)} />
+        )}
+        {templates.length === 0 && state !== "loading" && (
+          <EmptyState>No compatible active templates are available.</EmptyState>
+        )}
+        <ErrorState message={error} />
+        <DialogActions
+          onClose={onClose}
+          submitDisabled={state === "loading" || templates.length === 0 || !selectedTemplateId}
+          submitting={submitting}
+          submitLabel="Update workout"
+        />
+      </form>
+    </Dialog>
+  );
+}
+
 function Dialog({
   children,
   onClose,
@@ -584,10 +692,12 @@ function Dialog({
 
 function DialogActions({
   onClose,
+  submitDisabled = false,
   submitLabel,
   submitting,
 }: {
   onClose: () => void;
+  submitDisabled?: boolean;
   submitLabel: string;
   submitting: boolean;
 }) {
@@ -601,7 +711,7 @@ function DialogActions({
       >
         Cancel
       </button>
-      <button className={buttonClasses} disabled={submitting} type="submit">
+      <button className={buttonClasses} disabled={submitting || submitDisabled} type="submit">
         {submitting ? "Saving..." : submitLabel}
       </button>
     </div>
@@ -1042,8 +1152,159 @@ function ScheduleView({
   );
 }
 
+function MiniStat({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="min-w-0 rounded border border-slate-200 bg-slate-50 px-2 py-1.5">
+      <div className="truncate text-[0.65rem] font-black uppercase text-slate-500">{label}</div>
+      <div className="mt-0.5 truncate text-xs font-black text-slate-950">{value}</div>
+    </div>
+  );
+}
+
+function WeeklyMiniSummary({ summary }: { summary: FitnessTrainingCalendar["weeks"][number]["summary"] }) {
+  return (
+    <div className="grid grid-cols-2 gap-1.5 border-l border-slate-200 p-2 text-xs text-slate-700">
+      <MiniStat label="Run plan" value={distanceLabel(summary.planned_running_miles)} />
+      <MiniStat label="Run actual" value={distanceLabel(summary.actual_running_miles)} />
+      <MiniStat label="Long plan" value={distanceLabel(summary.longest_planned_run_miles)} />
+      <MiniStat label="Long actual" value={distanceLabel(summary.longest_completed_run_miles)} />
+      <MiniStat
+        label="Plan delta"
+        value={summary.planned_mileage_change === null ? "N/A" : distanceLabel(summary.planned_mileage_change)}
+      />
+      <MiniStat
+        label="Actual delta"
+        value={summary.actual_mileage_change === null ? "N/A" : distanceLabel(summary.actual_mileage_change)}
+      />
+      <MiniStat
+        label="Long %"
+        value={summary.planned_long_run_percentage === null ? "N/A" : `${summary.planned_long_run_percentage.toFixed(0)}%`}
+      />
+      <MiniStat label="Lifts" value={summary.completed_lifting_sessions} />
+    </div>
+  );
+}
+
+function CalendarWorkoutCard({
+  expanded,
+  onComplete,
+  onEdit,
+  onRemove,
+  onReschedule,
+  onSelect,
+  onSkip,
+  onUndoReschedule,
+  overflowOpen,
+  pending,
+  setOverflowOpen,
+  workout,
+}: {
+  expanded: boolean;
+  onComplete: (workout: FitnessScheduledWorkout) => void;
+  onEdit: (workout: FitnessScheduledWorkout) => void;
+  onRemove: (workout: FitnessScheduledWorkout) => void;
+  onReschedule: (workout: FitnessScheduledWorkout) => void;
+  onSelect: (workout: FitnessScheduledWorkout) => void;
+  onSkip: (workout: FitnessScheduledWorkout) => void;
+  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
+  overflowOpen: boolean;
+  pending: boolean;
+  setOverflowOpen: (open: boolean) => void;
+  workout: FitnessScheduledWorkout;
+}) {
+  const stopAction = (event: KeyboardEvent | MouseEvent) => {
+    event.stopPropagation();
+  };
+  const compactButtonClasses =
+    "rounded border border-slate-300 bg-white px-2 py-1 text-[0.7rem] font-black text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400";
+
+  return (
+    <article
+      aria-expanded={expanded}
+      className={`w-full cursor-pointer rounded-md border p-2 text-left text-xs shadow-sm ${
+        expanded ? "border-blue-400 bg-blue-50/40 ring-2 ring-blue-100" : "border-slate-200 bg-white"
+      }`}
+      onClick={() => onSelect(workout)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect(workout);
+        }
+      }}
+      role="button"
+      tabIndex={0}
+    >
+      <div className="font-black text-slate-950">{workout.workout_name}</div>
+      <div className="mt-1 flex flex-wrap gap-1">
+        <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+        <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
+      </div>
+      {workout.type === "RUNNING" && (
+        <div className="mt-1 font-semibold text-slate-600">{distanceLabel(workout.planned_distance_miles)}</div>
+      )}
+      {workout.source?.label && (
+        <div className="mt-1 text-slate-500">{workout.source.label}</div>
+      )}
+      {expanded && (
+        <div className="mt-2 flex flex-wrap gap-1" onClick={stopAction} onKeyDown={stopAction}>
+          {workout.status === "PLANNED" && (
+            <>
+              <button className={compactButtonClasses} disabled={pending} onClick={() => onComplete(workout)} type="button">
+                Complete
+              </button>
+              <button className={compactButtonClasses} disabled={pending} onClick={() => onEdit(workout)} type="button">
+                Edit
+              </button>
+              <button className={compactButtonClasses} disabled={pending} onClick={() => onReschedule(workout)} type="button">
+                Move
+              </button>
+              <div className="relative">
+                <button
+                  aria-label="More actions"
+                  className={compactButtonClasses}
+                  disabled={pending}
+                  onClick={() => setOverflowOpen(!overflowOpen)}
+                  type="button"
+                >
+                  ...
+                </button>
+                {overflowOpen && (
+                  <div className="absolute right-0 z-10 mt-1 w-24 rounded-md border border-slate-200 bg-white p-1 shadow-lg">
+                    <button
+                      className="block w-full rounded px-2 py-1 text-left text-[0.7rem] font-bold text-slate-700 hover:bg-slate-50"
+                      disabled={pending}
+                      onClick={() => onSkip(workout)}
+                      type="button"
+                    >
+                      Skip
+                    </button>
+                    <button
+                      className="block w-full rounded px-2 py-1 text-left text-[0.7rem] font-bold text-red-700 hover:bg-red-50"
+                      disabled={pending}
+                      onClick={() => onRemove(workout)}
+                      type="button"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          {workout.status === "RESCHEDULED" && workout.replacement_scheduled_workout_id && (
+            <button className={compactButtonClasses} disabled={pending} onClick={() => onUndoReschedule(workout)} type="button">
+              Undo
+            </button>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
 function TrainingCalendarView({
   onComplete,
+  onEdit,
   onRemove,
   onReschedule,
   onSkip,
@@ -1052,6 +1313,7 @@ function TrainingCalendarView({
   refreshToken,
 }: {
   onComplete: (workout: FitnessScheduledWorkout) => void;
+  onEdit: (workout: FitnessScheduledWorkout) => void;
   onRemove: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSkip: (workout: FitnessScheduledWorkout) => void;
@@ -1065,6 +1327,8 @@ function TrainingCalendarView({
   const [calendar, setCalendar] = useState<FitnessTrainingCalendar | null>(null);
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [selectedWorkoutId, setSelectedWorkoutId] = useState<string | null>(null);
+  const [overflowWorkoutId, setOverflowWorkoutId] = useState<string | null>(null);
 
   const normalizedStartDate = startOfIsoWeek(startDate);
   const endDate = addDays(normalizedStartDate, weeks * 7 - 1);
@@ -1084,6 +1348,11 @@ function TrainingCalendarView({
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    setSelectedWorkoutId(null);
+    setOverflowWorkoutId(null);
+  }, [refreshToken, normalizedStartDate, weeks]);
 
   return (
     <div className="space-y-4">
@@ -1126,47 +1395,31 @@ function TrainingCalendarView({
                     <div className="text-xs font-bold text-slate-500">{formatDate(day.date)}</div>
                     {day.workouts.map((workout) => {
                       const pending = pendingAction?.endsWith(workout.id) ?? false;
+                      const expanded = selectedWorkoutId === workout.id;
                       return (
-                        <div className="rounded-md border border-slate-200 bg-white p-2 text-xs shadow-sm" key={workout.id}>
-                          <div className="font-black text-slate-950">{workout.workout_name}</div>
-                          <div className="mt-1 flex flex-wrap gap-1">
-                            <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
-                            <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
-                          </div>
-                          {workout.type === "RUNNING" && (
-                            <div className="mt-1 font-semibold text-slate-600">{distanceLabel(workout.planned_distance_miles)}</div>
-                          )}
-                          {workout.source?.label && (
-                            <div className="mt-1 text-slate-500">{workout.source.label}</div>
-                          )}
-                          <div className="mt-2 flex flex-wrap gap-1">
-                            {workout.status === "PLANNED" && (
-                              <>
-                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onComplete(workout)} type="button">Complete</button>
-                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onSkip(workout)} type="button">Skip</button>
-                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onReschedule(workout)} type="button">Move</button>
-                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onRemove(workout)} type="button">Remove</button>
-                              </>
-                            )}
-                            {workout.status === "RESCHEDULED" && workout.replacement_scheduled_workout_id && (
-                              <button className={secondaryButtonClasses} disabled={pending} onClick={() => onUndoReschedule(workout)} type="button">Undo</button>
-                            )}
-                          </div>
-                        </div>
+                        <CalendarWorkoutCard
+                          expanded={expanded}
+                          key={workout.id}
+                          onComplete={onComplete}
+                          onEdit={onEdit}
+                          onRemove={onRemove}
+                          onReschedule={onReschedule}
+                          onSelect={(item) => {
+                            setSelectedWorkoutId((current) => (current === item.id ? null : item.id));
+                            setOverflowWorkoutId(null);
+                          }}
+                          onSkip={onSkip}
+                          onUndoReschedule={onUndoReschedule}
+                          overflowOpen={overflowWorkoutId === workout.id}
+                          pending={pending}
+                          setOverflowOpen={(open) => setOverflowWorkoutId(open ? workout.id : null)}
+                          workout={workout}
+                        />
                       );
                     })}
                   </div>
                 ))}
-                <div className="space-y-2 border-l border-slate-200 p-3 text-xs text-slate-700">
-                  <Metric label="Planned run" value={distanceLabel(week.summary.planned_running_miles)} />
-                  <Metric label="Actual run" value={distanceLabel(week.summary.actual_running_miles)} />
-                  <Metric label="Longest planned" value={distanceLabel(week.summary.longest_planned_run_miles)} />
-                  <Metric label="Longest actual" value={distanceLabel(week.summary.longest_completed_run_miles)} />
-                  <Metric label="Planned change" value={week.summary.planned_mileage_change === null ? "N/A" : distanceLabel(week.summary.planned_mileage_change)} />
-                  <Metric label="Actual change" value={week.summary.actual_mileage_change === null ? "N/A" : distanceLabel(week.summary.actual_mileage_change)} />
-                  <Metric label="Long-run %" value={week.summary.planned_long_run_percentage === null ? "N/A" : `${week.summary.planned_long_run_percentage.toFixed(0)}%`} />
-                  <Metric label="Lifts done" value={week.summary.completed_lifting_sessions} />
-                </div>
+                <WeeklyMiniSummary summary={week.summary} />
               </div>
             ))}
           </div>
@@ -1352,7 +1605,7 @@ function TemplatesView() {
             : updated;
         setSelected(detailed);
       } else {
-        const created = await createWorkoutTemplate({
+        await createWorkoutTemplate({
           name: name.trim(),
           type,
           notes: notes.trim() || null,
@@ -1360,7 +1613,7 @@ function TemplatesView() {
             ? { planned_distance_miles: Number(plannedDistance) }
             : { exercises: exercisePayload }),
         });
-        setSelected(created);
+        resetForm();
       }
       await load();
     } catch (caught) {
@@ -1443,12 +1696,17 @@ function TemplatesView() {
       <Panel>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-black text-slate-950">
-            {selected ? "Edit template" : "Create template"}
+            {selected ? "Update Template" : "Create Template"}
           </h2>
           <button className={secondaryButtonClasses} onClick={resetForm} type="button">
-            New
+            New Template
           </button>
         </div>
+        {selected && (
+          <p className="mt-2 text-sm font-semibold text-slate-600">
+            Editing {selected.name}
+          </p>
+        )}
         <form className="mt-4 space-y-4" onSubmit={submit}>
           <Field label="Type">
             <select
@@ -1489,7 +1747,7 @@ function TemplatesView() {
             </Field>
           )}
           <button className={buttonClasses} disabled={mutating} type="submit">
-            {mutating ? "Saving..." : "Save template"}
+            {mutating ? "Saving..." : selected ? "Update Template" : "Create Template"}
           </button>
         </form>
       </Panel>
@@ -1920,6 +2178,7 @@ function FitnessScreen() {
   );
   const [completeWorkout, setCompleteWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [rescheduleWorkout, setRescheduleWorkout] = useState<FitnessScheduledWorkout | null>(null);
+  const [editWorkout, setEditWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1982,6 +2241,28 @@ function FitnessScreen() {
       refresh();
     } catch (caught) {
       const message = messageFromError(caught, "Unable to reschedule workout.");
+      if (showRootError) {
+        setMutationError(message);
+      }
+      throw new Error(message);
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const replaceWorkoutTemplateAction = async (
+    workout: FitnessScheduledWorkout,
+    workoutTemplateId: string,
+    showRootError = true,
+  ) => {
+    setPendingAction(`edit:${workout.id}`);
+    setMutationError(null);
+    try {
+      await replaceScheduledWorkoutTemplate(workout.id, workoutTemplateId);
+      setEditWorkout(null);
+      refresh();
+    } catch (caught) {
+      const message = messageFromError(caught, "Unable to update workout template.");
       if (showRootError) {
         setMutationError(message);
       }
@@ -2108,6 +2389,7 @@ function FitnessScreen() {
         {activeTab === "calendar" && (
           <TrainingCalendarView
             onComplete={requestComplete}
+            onEdit={setEditWorkout}
             onRemove={(workout) => void removeWorkoutAction(workout)}
             onReschedule={setRescheduleWorkout}
             onSkip={(workout) => void skipWorkoutAction(workout)}
@@ -2135,6 +2417,14 @@ function FitnessScreen() {
           onSubmit={(date) => rescheduleWorkoutAction(rescheduleWorkout, date, false)}
           submitting={pendingAction === `reschedule:${rescheduleWorkout.id}`}
           workout={rescheduleWorkout}
+        />
+      )}
+      {editWorkout && (
+        <WorkoutTemplateReplaceDialog
+          onClose={() => setEditWorkout(null)}
+          onSubmit={(workoutTemplateId) => replaceWorkoutTemplateAction(editWorkout, workoutTemplateId, false)}
+          submitting={pendingAction === `edit:${editWorkout.id}`}
+          workout={editWorkout}
         />
       )}
     </main>

@@ -93,6 +93,10 @@ class ScheduledWorkoutCreate(FitnessRequestModel):
     scheduled_date: date
 
 
+class ScheduledWorkoutTemplateReplace(FitnessRequestModel):
+    workout_template_id: UUID
+
+
 class RunningCompletion(FitnessRequestModel):
     completed_distance_miles: Decimal = Field(ge=0, le=10000)
     duration_seconds: int = Field(ge=0, le=864000)
