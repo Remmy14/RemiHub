@@ -6,27 +6,39 @@ import {
   archiveWorkoutTemplate,
   completeScheduledWorkout,
   createPlanTemplate,
+  createRecurringSeries,
   createScheduledWorkout,
   createWorkoutTemplate,
+  getTrainingCalendar,
   getPlanTemplate,
   getScheduledWorkout,
   getWorkoutTemplate,
   instantiatePlanTemplate,
+  listPlanInstances,
   listPlanTemplates,
   listScheduledWorkouts,
   listTodayWorkouts,
   listWorkoutTemplates,
+  previewRecurringSeries,
   replaceLiftingTemplateExercises,
   replacePlanTemplateItems,
+  removeRemainingPlanWorkouts,
+  removeRemainingRecurringWorkouts,
+  removeScheduledWorkout,
+  removeUnstartedPlanInstance,
   rescheduleScheduledWorkout,
   restorePlanTemplate,
   restoreWorkoutTemplate,
   skipScheduledWorkout,
+  undoRescheduleScheduledWorkout,
   updatePlanTemplate,
   updateWorkoutTemplate,
 } from "./api/fitnessApi";
 import type {
   FitnessPlanTemplate,
+  FitnessPlanInstance,
+  FitnessRecurringSeries,
+  FitnessTrainingCalendar,
   FitnessPlanTemplateItem,
   FitnessScheduledWorkout,
   FitnessWorkoutTemplate,
@@ -38,12 +50,13 @@ import {
 } from "./api/weightliftingApi";
 import type { WeightliftingExercise } from "./api/weightliftingApi";
 
-type FitnessTab = "today" | "schedule" | "templates" | "plans" | "weightlifting";
+type FitnessTab = "today" | "schedule" | "calendar" | "templates" | "plans" | "weightlifting";
 type LoadState = "idle" | "loading" | "refreshing";
 
 const tabs: Array<{ id: FitnessTab; label: string; href: string }> = [
   { id: "today", label: "Today", href: "/portal/fitness" },
   { id: "schedule", label: "Schedule", href: "/portal/fitness/schedule" },
+  { id: "calendar", label: "Calendar", href: "/portal/fitness/calendar" },
   {
     id: "templates",
     label: "Workout Templates",
@@ -65,6 +78,16 @@ const typeStyles = {
   LIFTING: "border-violet-200 bg-violet-50 text-violet-800",
 };
 
+const isoWeekdays = [
+  { value: 1, label: "Mon" },
+  { value: 2, label: "Tue" },
+  { value: 3, label: "Wed" },
+  { value: 4, label: "Thu" },
+  { value: 5, label: "Fri" },
+  { value: 6, label: "Sat" },
+  { value: 7, label: "Sun" },
+];
+
 function localDateInputValue(date = new Date()): string {
   const offset = date.getTimezoneOffset() * 60000;
   return new Date(date.getTime() - offset).toISOString().slice(0, 10);
@@ -74,6 +97,18 @@ function addDays(dateValue: string, days: number): string {
   const [year, month, day] = dateValue.split("-").map(Number);
   const date = new Date(Date.UTC(year, month - 1, day + days));
   return date.toISOString().slice(0, 10);
+}
+
+function startOfIsoWeek(dateValue: string): string {
+  const [year, month, day] = dateValue.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const isoDay = date.getUTCDay() === 0 ? 7 : date.getUTCDay();
+  date.setUTCDate(date.getUTCDate() - (isoDay - 1));
+  return date.toISOString().slice(0, 10);
+}
+
+function newIdempotencyKey(): string {
+  return window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 }
 
 function normalizedPlanItems(
@@ -147,6 +182,9 @@ function messageFromError(error: unknown, fallback: string): string {
 function initialTabFromPath(path: string): FitnessTab {
   if (path.startsWith("/portal/fitness/schedule")) {
     return "schedule";
+  }
+  if (path.startsWith("/portal/fitness/calendar")) {
+    return "calendar";
   }
   if (path.startsWith("/portal/fitness/templates")) {
     return "templates";
@@ -227,15 +265,19 @@ function WorkoutSummary({
   workout,
   onComplete,
   onOpen,
+  onRemove,
   onReschedule,
   onSkip,
+  onUndoReschedule,
   pendingAction,
 }: {
   workout: FitnessScheduledWorkout;
   onComplete: (workout: FitnessScheduledWorkout) => void;
   onOpen?: (workout: FitnessScheduledWorkout) => void;
+  onRemove: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSkip: (workout: FitnessScheduledWorkout) => void;
+  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
   pendingAction: string | null;
 }) {
   const isPlanned = workout.status === "PLANNED";
@@ -260,6 +302,11 @@ function WorkoutSummary({
             <Pill className={statusStyles[workout.status]}>
               {workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
             </Pill>
+            {workout.source?.label && (
+              <Pill className="border-slate-200 bg-slate-50 text-slate-600">
+                {workout.source.label}
+              </Pill>
+            )}
           </div>
         </div>
         <div className="text-right text-sm font-semibold text-slate-600">
@@ -337,7 +384,25 @@ function WorkoutSummary({
             >
               Reschedule
             </button>
+            <button
+              className={secondaryButtonClasses}
+              disabled={pending}
+              onClick={() => onRemove(workout)}
+              type="button"
+            >
+              Remove
+            </button>
           </>
+        )}
+        {workout.status === "RESCHEDULED" && workout.replacement_scheduled_workout_id && (
+          <button
+            className={secondaryButtonClasses}
+            disabled={pending}
+            onClick={() => onUndoReschedule(workout)}
+            type="button"
+          >
+            Undo reschedule
+          </button>
         )}
       </div>
     </article>
@@ -545,14 +610,18 @@ function DialogActions({
 
 function TodayView({
   onComplete,
+  onRemove,
   onReschedule,
   onSkip,
+  onUndoReschedule,
   pendingAction,
   refreshToken,
 }: {
   onComplete: (workout: FitnessScheduledWorkout) => void;
+  onRemove: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSkip: (workout: FitnessScheduledWorkout) => void;
+  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
   pendingAction: string | null;
   refreshToken: number;
 }) {
@@ -610,8 +679,10 @@ function TodayView({
           <WorkoutSummary
             key={workout.id}
             onComplete={onComplete}
+            onRemove={onRemove}
             onReschedule={onReschedule}
             onSkip={onSkip}
+            onUndoReschedule={onUndoReschedule}
             pendingAction={pendingAction}
             workout={workout}
           />
@@ -626,14 +697,20 @@ function TodayView({
 
 function ScheduleView({
   onComplete,
+  onRemove,
+  onRemoveRemainingSeries,
   onReschedule,
   onSkip,
+  onUndoReschedule,
   pendingAction,
   refreshToken,
 }: {
   onComplete: (workout: FitnessScheduledWorkout) => void;
+  onRemove: (workout: FitnessScheduledWorkout) => void;
+  onRemoveRemainingSeries: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSkip: (workout: FitnessScheduledWorkout) => void;
+  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
   pendingAction: string | null;
   refreshToken: number;
 }) {
@@ -644,6 +721,12 @@ function ScheduleView({
   const [templates, setTemplates] = useState<FitnessWorkoutTemplate[]>([]);
   const [selectedTemplate, setSelectedTemplate] = useState("");
   const [scheduleDate, setScheduleDate] = useState(today);
+  const [repeatWeekly, setRepeatWeekly] = useState(false);
+  const [weekdays, setWeekdays] = useState<number[]>([1, 3, 5]);
+  const [durationWeeks, setDurationWeeks] = useState(5);
+  const [recurrenceKey, setRecurrenceKey] = useState(newIdempotencyKey);
+  const [recurrencePreview, setRecurrencePreview] = useState<FitnessRecurringSeries | null>(null);
+  const [recurrencePreviewSignature, setRecurrencePreviewSignature] = useState("");
   const [selectedWorkout, setSelectedWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [state, setState] = useState<LoadState>("idle");
   const [mutating, setMutating] = useState(false);
@@ -690,7 +773,24 @@ function ScheduleView({
     setMutating(true);
     setError(null);
     try {
-      await createScheduledWorkout(selectedTemplate, scheduleDate);
+      if (repeatWeekly) {
+        const payload = {
+          workout_template_id: selectedTemplate,
+          start_date: scheduleDate,
+          weekdays,
+          duration_weeks: durationWeeks,
+        };
+        const signature = JSON.stringify(payload);
+        if (!recurrencePreview || recurrencePreviewSignature !== signature || recurrencePreview.count === 0) {
+          throw new Error("Preview this recurrence before creating it.");
+        }
+        await createRecurringSeries({ ...payload, idempotency_key: recurrenceKey });
+        setRecurrencePreview(null);
+        setRecurrencePreviewSignature("");
+        setRecurrenceKey(newIdempotencyKey());
+      } else {
+        await createScheduledWorkout(selectedTemplate, scheduleDate);
+      }
       await load();
     } catch (caught) {
       setError(messageFromError(caught, "Unable to schedule workout."));
@@ -698,6 +798,55 @@ function ScheduleView({
       setMutating(false);
     }
   };
+
+  const previewRecurrence = async () => {
+    if (!selectedTemplate) {
+      setError("Choose a template before previewing recurrence.");
+      return;
+    }
+    setMutating(true);
+    setError(null);
+    try {
+      const payload = {
+        workout_template_id: selectedTemplate,
+        start_date: scheduleDate,
+        weekdays,
+        duration_weeks: durationWeeks,
+      };
+      setRecurrencePreview(
+        await previewRecurringSeries(payload),
+      );
+      setRecurrencePreviewSignature(JSON.stringify(payload));
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to preview recurrence."));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const toggleWeekday = (weekday: number) => {
+    setWeekdays((current) => {
+      const next = current.includes(weekday)
+        ? current.filter((item) => item !== weekday)
+        : [...current, weekday];
+      return next.sort((left, right) => left - right);
+    });
+    setRecurrencePreview(null);
+    setRecurrencePreviewSignature("");
+    setRecurrenceKey(newIdempotencyKey());
+  };
+
+  const currentRecurrenceSignature = JSON.stringify({
+    workout_template_id: selectedTemplate,
+    start_date: scheduleDate,
+    weekdays,
+    duration_weeks: durationWeeks,
+  });
+  const recurrenceReady =
+    !repeatWeekly ||
+    (recurrencePreview !== null &&
+      recurrencePreviewSignature === currentRecurrenceSignature &&
+      recurrencePreview.count > 0);
 
   const openWorkout = async (workout: FitnessScheduledWorkout) => {
     setSelectedWorkout(workout);
@@ -741,8 +890,10 @@ function ScheduleView({
                   key={workout.id}
                   onComplete={onComplete}
                   onOpen={(item) => void openWorkout(item)}
+                  onRemove={onRemove}
                   onReschedule={onReschedule}
                   onSkip={onSkip}
+                  onUndoReschedule={onUndoReschedule}
                   pendingAction={pendingAction}
                   workout={workout}
                 />
@@ -758,7 +909,12 @@ function ScheduleView({
             <Field label="Template">
               <select
                 className={inputClasses}
-                onChange={(event) => setSelectedTemplate(event.target.value)}
+                onChange={(event) => {
+                  setSelectedTemplate(event.target.value);
+                  setRecurrencePreview(null);
+                  setRecurrencePreviewSignature("");
+                  setRecurrenceKey(newIdempotencyKey());
+                }}
                 required
                 value={selectedTemplate}
               >
@@ -770,10 +926,81 @@ function ScheduleView({
               </select>
             </Field>
             <Field label="Date">
-              <input className={inputClasses} onChange={(event) => setScheduleDate(event.target.value)} required type="date" value={scheduleDate} />
+              <input
+                className={inputClasses}
+                onChange={(event) => {
+                  setScheduleDate(event.target.value);
+                  setRecurrencePreview(null);
+                  setRecurrencePreviewSignature("");
+                  setRecurrenceKey(newIdempotencyKey());
+                }}
+                required
+                type="date"
+                value={scheduleDate}
+              />
             </Field>
-            <button className={buttonClasses} disabled={mutating || templates.length === 0} type="submit">
-              Schedule workout
+            <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+              <input
+                checked={repeatWeekly}
+                onChange={(event) => {
+                  setRepeatWeekly(event.target.checked);
+                  setRecurrencePreview(null);
+                  setRecurrencePreviewSignature("");
+                }}
+                type="checkbox"
+              />
+              Repeat weekly
+            </label>
+            {repeatWeekly && (
+              <div className="space-y-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+                <Field label="Weekdays">
+                  <div className="flex flex-wrap gap-2">
+                    {isoWeekdays.map((weekday) => (
+                      <label className="flex items-center gap-1 text-sm font-bold text-slate-700" key={weekday.value}>
+                        <input
+                          checked={weekdays.includes(weekday.value)}
+                          onChange={() => toggleWeekday(weekday.value)}
+                          type="checkbox"
+                        />
+                        {weekday.label}
+                      </label>
+                    ))}
+                  </div>
+                </Field>
+                <Field label="Duration weeks">
+                  <input
+                    className={inputClasses}
+                    min="1"
+                    onChange={(event) => {
+                      setDurationWeeks(Number(event.target.value));
+                      setRecurrencePreview(null);
+                      setRecurrencePreviewSignature("");
+                      setRecurrenceKey(newIdempotencyKey());
+                    }}
+                    required
+                    type="number"
+                    value={durationWeeks}
+                  />
+                </Field>
+                <button className={secondaryButtonClasses} disabled={mutating || weekdays.length === 0} onClick={() => void previewRecurrence()} type="button">
+                  Preview recurrence
+                </button>
+                {recurrencePreview && (
+                  <div className="rounded-md bg-white p-3 text-sm text-slate-700">
+                    <div className="font-black text-slate-950">
+                      {recurrencePreview.count} workouts will be scheduled
+                    </div>
+                    <ol className="mt-2 max-h-44 space-y-1 overflow-y-auto">
+                      {(recurrencePreview.dates ?? []).map((date) => (
+                        <li key={date}>{formatDate(date)}</li>
+                      ))}
+                    </ol>
+                  </div>
+                )}
+              </div>
+            )}
+            <button className={buttonClasses} disabled={mutating || templates.length === 0 || !recurrenceReady} type="submit">
+              {repeatWeekly ? "Create series" : "Schedule workout"}
             </button>
           </form>
         </Panel>
@@ -784,11 +1011,26 @@ function ScheduleView({
               <div className="font-black text-slate-950">{selectedWorkout.workout_name}</div>
               <div>ID: {selectedWorkout.id}</div>
               <div>Template: {selectedWorkout.workout_template_id}</div>
+              {selectedWorkout.source?.label && (
+                <div>From: {selectedWorkout.source.label}</div>
+              )}
               {selectedWorkout.plan_instance_id && (
                 <div>Plan instance: {selectedWorkout.plan_instance_id}</div>
               )}
+              {selectedWorkout.recurring_series_id && (
+                <div>Recurring series: {selectedWorkout.recurring_series_id}</div>
+              )}
               {selectedWorkout.replacement_scheduled_workout_id && (
                 <div>Replacement: {selectedWorkout.replacement_scheduled_workout_id}</div>
+              )}
+              {selectedWorkout.recurring_series_id && (
+                <button
+                  className={secondaryButtonClasses}
+                  onClick={() => onRemoveRemainingSeries(selectedWorkout)}
+                  type="button"
+                >
+                  Remove remaining series workouts
+                </button>
               )}
             </div>
           ) : (
@@ -796,6 +1038,143 @@ function ScheduleView({
           )}
         </Panel>
       </aside>
+    </div>
+  );
+}
+
+function TrainingCalendarView({
+  onComplete,
+  onRemove,
+  onReschedule,
+  onSkip,
+  onUndoReschedule,
+  pendingAction,
+  refreshToken,
+}: {
+  onComplete: (workout: FitnessScheduledWorkout) => void;
+  onRemove: (workout: FitnessScheduledWorkout) => void;
+  onReschedule: (workout: FitnessScheduledWorkout) => void;
+  onSkip: (workout: FitnessScheduledWorkout) => void;
+  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
+  pendingAction: string | null;
+  refreshToken: number;
+}) {
+  const today = localDateInputValue();
+  const [startDate, setStartDate] = useState(today);
+  const [weeks, setWeeks] = useState(8);
+  const [calendar, setCalendar] = useState<FitnessTrainingCalendar | null>(null);
+  const [state, setState] = useState<LoadState>("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  const normalizedStartDate = startOfIsoWeek(startDate);
+  const endDate = addDays(normalizedStartDate, weeks * 7 - 1);
+
+  const load = useCallback(async () => {
+    setState((current) => (current === "idle" ? "loading" : "refreshing"));
+    setError(null);
+    try {
+      setCalendar(await getTrainingCalendar(normalizedStartDate, endDate));
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to load training calendar."));
+    } finally {
+      setState("idle");
+    }
+  }, [endDate, normalizedStartDate, refreshToken]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <div className="space-y-4">
+      <Panel>
+        <div className="grid gap-3 sm:grid-cols-[1fr_10rem_auto]">
+          <Field label="Start">
+            <input className={inputClasses} onChange={(event) => setStartDate(event.target.value)} type="date" value={startDate} />
+          </Field>
+          <Field label="Weeks">
+            <select className={inputClasses} onChange={(event) => setWeeks(Number(event.target.value))} value={weeks}>
+              {[5, 6, 8, 10, 12].map((value) => (
+                <option key={value} value={value}>{value}</option>
+              ))}
+            </select>
+          </Field>
+          <div className="flex items-end">
+            <button className={secondaryButtonClasses} onClick={() => void load()} type="button">
+              Refresh
+            </button>
+          </div>
+        </div>
+      </Panel>
+      <ErrorState message={error} />
+      {state === "loading" && <EmptyState>Loading calendar...</EmptyState>}
+      {calendar && (
+        <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+          <div className="min-w-[72rem]">
+            <div className="grid grid-cols-[7rem_repeat(7,minmax(7rem,1fr))_13rem] border-b border-slate-200 bg-slate-50 text-xs font-black uppercase text-slate-500">
+              <div className="p-3">Week</div>
+              {isoWeekdays.map((day) => (
+                <div className="border-l border-slate-200 p-3" key={day.value}>{day.label}</div>
+              ))}
+              <div className="border-l border-slate-200 p-3">Weekly</div>
+            </div>
+            {calendar.weeks.map((week) => (
+              <div className="grid grid-cols-[7rem_repeat(7,minmax(7rem,1fr))_13rem] border-b border-slate-200 last:border-b-0" key={week.week_start}>
+                <div className="p-3 text-sm font-black text-slate-900">{formatDate(week.week_start)}</div>
+                {week.days.map((day) => (
+                  <div className={`min-h-36 space-y-2 border-l border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : ""}`} key={day.date}>
+                    <div className="text-xs font-bold text-slate-500">{formatDate(day.date)}</div>
+                    {day.workouts.map((workout) => {
+                      const pending = pendingAction?.endsWith(workout.id) ?? false;
+                      return (
+                        <div className="rounded-md border border-slate-200 bg-white p-2 text-xs shadow-sm" key={workout.id}>
+                          <div className="font-black text-slate-950">{workout.workout_name}</div>
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+                            <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
+                          </div>
+                          {workout.type === "RUNNING" && (
+                            <div className="mt-1 font-semibold text-slate-600">{distanceLabel(workout.planned_distance_miles)}</div>
+                          )}
+                          {workout.source?.label && (
+                            <div className="mt-1 text-slate-500">{workout.source.label}</div>
+                          )}
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {workout.status === "PLANNED" && (
+                              <>
+                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onComplete(workout)} type="button">Complete</button>
+                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onSkip(workout)} type="button">Skip</button>
+                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onReschedule(workout)} type="button">Move</button>
+                                <button className={secondaryButtonClasses} disabled={pending} onClick={() => onRemove(workout)} type="button">Remove</button>
+                              </>
+                            )}
+                            {workout.status === "RESCHEDULED" && workout.replacement_scheduled_workout_id && (
+                              <button className={secondaryButtonClasses} disabled={pending} onClick={() => onUndoReschedule(workout)} type="button">Undo</button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+                <div className="space-y-2 border-l border-slate-200 p-3 text-xs text-slate-700">
+                  <Metric label="Planned run" value={distanceLabel(week.summary.planned_running_miles)} />
+                  <Metric label="Actual run" value={distanceLabel(week.summary.actual_running_miles)} />
+                  <Metric label="Longest planned" value={distanceLabel(week.summary.longest_planned_run_miles)} />
+                  <Metric label="Longest actual" value={distanceLabel(week.summary.longest_completed_run_miles)} />
+                  <Metric label="Planned change" value={week.summary.planned_mileage_change === null ? "N/A" : distanceLabel(week.summary.planned_mileage_change)} />
+                  <Metric label="Actual change" value={week.summary.actual_mileage_change === null ? "N/A" : distanceLabel(week.summary.actual_mileage_change)} />
+                  <Metric label="Long-run %" value={week.summary.planned_long_run_percentage === null ? "N/A" : `${week.summary.planned_long_run_percentage.toFixed(0)}%`} />
+                  <Metric label="Lifts done" value={week.summary.completed_lifting_sessions} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {state === "refreshing" && (
+        <div className="text-sm font-semibold text-slate-500">Refreshing...</div>
+      )}
     </div>
   );
 }
@@ -1202,6 +1581,7 @@ function PlanItemEditor({
 
 function PlansView() {
   const [plans, setPlans] = useState<FitnessPlanTemplate[]>([]);
+  const [instances, setInstances] = useState<FitnessPlanInstance[]>([]);
   const [templates, setTemplates] = useState<FitnessWorkoutTemplate[]>([]);
   const [selected, setSelected] = useState<FitnessPlanTemplate | null>(null);
   const [includeArchived, setIncludeArchived] = useState(false);
@@ -1222,7 +1602,9 @@ function PlansView() {
         listPlanTemplates(includeArchived),
         listWorkoutTemplates(false),
       ]);
+      const instanceList = await listPlanInstances();
       setPlans(planList);
+      setInstances(instanceList);
       setTemplates(templateList);
     } catch (caught) {
       setError(messageFromError(caught, "Unable to load training plans."));
@@ -1333,11 +1715,37 @@ function PlansView() {
     setSuccess(null);
     try {
       const instance = await instantiatePlanTemplate(selected.id, startDate);
+      await load();
       setSuccess(
         `Instantiated ${selected.name} from ${formatDate(startDate)} with ${instance.scheduled_workout_ids?.length ?? 0} scheduled workouts.`,
       );
     } catch (caught) {
       setError(messageFromError(caught, "Unable to instantiate training plan."));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const cleanupInstance = async (instance: FitnessPlanInstance, mode: "unstarted" | "remaining") => {
+    const message =
+      mode === "unstarted"
+        ? `Remove unstarted ${instance.plan_template_name} instance and its scheduled workouts?`
+        : `Remove remaining planned workouts from ${instance.plan_template_name}?`;
+    if (!window.confirm(message)) {
+      return;
+    }
+    setMutating(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result =
+        mode === "unstarted"
+          ? await removeUnstartedPlanInstance(instance.id)
+          : await removeRemainingPlanWorkouts(instance.id, localDateInputValue());
+      await load();
+      setSuccess(`Removed ${result.removed_count} scheduled workouts.`);
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to clean up plan instance."));
     } finally {
       setMutating(false);
     }
@@ -1395,6 +1803,33 @@ function PlansView() {
             </article>
           ))}
         </div>
+        <Panel>
+          <h2 className="text-lg font-black text-slate-950">Plan instances</h2>
+          <div className="mt-3 grid gap-3">
+            {instances.length === 0 && <EmptyState>No plan instances yet.</EmptyState>}
+            {instances.map((instance) => (
+              <article className="rounded-md border border-slate-200 bg-slate-50 p-3" key={instance.id}>
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="font-black text-slate-950">{instance.plan_template_name}</div>
+                    <div className="text-sm text-slate-600">Started {formatDate(instance.start_date)}</div>
+                  </div>
+                  <Pill className={instance.status === "ACTIVE" && instance.planning_status !== "STOPPED" ? statusStyles.PLANNED : statusStyles.RESCHEDULED}>
+                    {instance.status}{instance.planning_status === "STOPPED" ? " / STOPPED" : ""}
+                  </Pill>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button className={secondaryButtonClasses} disabled={mutating} onClick={() => void cleanupInstance(instance, "unstarted")} type="button">
+                    Remove unstarted
+                  </button>
+                  <button className={secondaryButtonClasses} disabled={mutating} onClick={() => void cleanupInstance(instance, "remaining")} type="button">
+                    Remove remaining
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </Panel>
       </div>
       <Panel>
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1556,6 +1991,54 @@ function FitnessScreen() {
     }
   };
 
+  const removeWorkoutAction = async (workout: FitnessScheduledWorkout) => {
+    if (!window.confirm(`Remove ${workout.workout_name} on ${formatDate(workout.scheduled_date)}?`)) {
+      return;
+    }
+    setPendingAction(`remove:${workout.id}`);
+    setMutationError(null);
+    try {
+      await removeScheduledWorkout(workout.id);
+      refresh();
+    } catch (caught) {
+      setMutationError(messageFromError(caught, "Unable to remove workout."));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const undoRescheduleAction = async (workout: FitnessScheduledWorkout) => {
+    setPendingAction(`undo:${workout.id}`);
+    setMutationError(null);
+    try {
+      await undoRescheduleScheduledWorkout(workout.id);
+      refresh();
+    } catch (caught) {
+      setMutationError(messageFromError(caught, "Unable to undo reschedule."));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const removeRemainingSeriesAction = async (workout: FitnessScheduledWorkout) => {
+    if (!workout.recurring_series_id) {
+      return;
+    }
+    if (!window.confirm(`Remove remaining planned workouts from ${workout.workout_name} series?`)) {
+      return;
+    }
+    setPendingAction(`series:${workout.id}`);
+    setMutationError(null);
+    try {
+      await removeRemainingRecurringWorkouts(workout.recurring_series_id, workout.scheduled_date);
+      refresh();
+    } catch (caught) {
+      setMutationError(messageFromError(caught, "Unable to remove remaining series workouts."));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
   const requestComplete = (workout: FitnessScheduledWorkout) => {
     if (workout.type === "RUNNING") {
       setCompleteWorkout(workout);
@@ -1602,8 +2085,10 @@ function FitnessScreen() {
         {activeTab === "today" && (
           <TodayView
             onComplete={requestComplete}
+            onRemove={(workout) => void removeWorkoutAction(workout)}
             onReschedule={setRescheduleWorkout}
             onSkip={(workout) => void skipWorkoutAction(workout)}
+            onUndoReschedule={(workout) => void undoRescheduleAction(workout)}
             pendingAction={pendingAction}
             refreshToken={refreshKey}
           />
@@ -1611,8 +2096,22 @@ function FitnessScreen() {
         {activeTab === "schedule" && (
           <ScheduleView
             onComplete={requestComplete}
+            onRemove={(workout) => void removeWorkoutAction(workout)}
+            onRemoveRemainingSeries={(workout) => void removeRemainingSeriesAction(workout)}
             onReschedule={setRescheduleWorkout}
             onSkip={(workout) => void skipWorkoutAction(workout)}
+            onUndoReschedule={(workout) => void undoRescheduleAction(workout)}
+            pendingAction={pendingAction}
+            refreshToken={refreshKey}
+          />
+        )}
+        {activeTab === "calendar" && (
+          <TrainingCalendarView
+            onComplete={requestComplete}
+            onRemove={(workout) => void removeWorkoutAction(workout)}
+            onReschedule={setRescheduleWorkout}
+            onSkip={(workout) => void skipWorkoutAction(workout)}
+            onUndoReschedule={(workout) => void undoRescheduleAction(workout)}
             pendingAction={pendingAction}
             refreshToken={refreshKey}
           />

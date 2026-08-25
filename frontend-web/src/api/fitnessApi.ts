@@ -26,6 +26,7 @@ export type FitnessScheduledWorkout = {
   user_id: string;
   workout_template_id: string;
   plan_instance_id: string | null;
+  recurring_series_id: string | null;
   scheduled_date: string;
   original_scheduled_date: string;
   status: FitnessWorkoutStatus;
@@ -33,9 +34,74 @@ export type FitnessScheduledWorkout = {
   planned_distance_miles: number | null;
   workout_name: string;
   type: FitnessWorkoutType;
+  source?: FitnessWorkoutSource;
   running_result: FitnessRunningResult | null;
   created_at: string | null;
   updated_at: string | null;
+};
+
+export type FitnessWorkoutSource = {
+  type: "INDIVIDUAL" | "RECURRING_SERIES" | "TRAINING_PLAN" | "RESCHEDULE_REPLACEMENT";
+  label: string;
+  recurring_series_id: string | null;
+  plan_instance_id: string | null;
+  plan_template_name: string | null;
+  recurring_series_weekdays: number[] | null;
+};
+
+export type FitnessRecurringSeriesRequest = {
+  workout_template_id: string;
+  start_date: string;
+  weekdays: number[];
+  duration_weeks?: number | null;
+  end_date?: string | null;
+  idempotency_key?: string | null;
+};
+
+export type FitnessRecurringSeries = {
+  id?: string;
+  user_id?: string;
+  workout_template_id: string;
+  workout_name: string;
+  type: FitnessWorkoutType;
+  start_date: string;
+  end_date: string;
+  duration_weeks: number | null;
+  weekdays: number[];
+  status?: "ACTIVE" | "STOPPED";
+  dates?: string[];
+  count: number;
+  scheduled_workout_ids?: string[];
+  scheduled_workouts?: FitnessScheduledWorkout[];
+};
+
+export type FitnessWeeklySummary = {
+  planned_running_miles: number;
+  actual_running_miles: number;
+  longest_planned_run_miles: number | null;
+  longest_completed_run_miles: number | null;
+  planned_mileage_change: number | null;
+  actual_mileage_change: number | null;
+  planned_long_run_percentage: number | null;
+  completed_lifting_sessions: number;
+};
+
+export type FitnessCalendarDay = {
+  date: string;
+  is_today: boolean;
+  workouts: FitnessScheduledWorkout[];
+};
+
+export type FitnessCalendarWeek = {
+  week_start: string;
+  days: FitnessCalendarDay[];
+  summary: FitnessWeeklySummary;
+};
+
+export type FitnessTrainingCalendar = {
+  start_date: string;
+  end_date: string;
+  weeks: FitnessCalendarWeek[];
 };
 
 export type FitnessLiftingTemplateExercise = {
@@ -85,6 +151,8 @@ export type FitnessPlanInstance = {
   plan_template_name: string;
   start_date: string;
   status: "ACTIVE" | "COMPLETED";
+  planning_status?: "ACTIVE" | "STOPPED";
+  stopped_at?: string | null;
   scheduled_workout_ids?: string[];
   scheduled_workouts?: FitnessScheduledWorkout[];
   created_at: string | null;
@@ -132,6 +200,19 @@ export async function listScheduledWorkouts(
   return response.data;
 }
 
+export async function getTrainingCalendar(
+  startDate: string,
+  endDate: string,
+): Promise<FitnessTrainingCalendar> {
+  const response = await apiRequest<FitnessResponse<FitnessTrainingCalendar>>(
+    `/fitness/training-calendar?${query({
+      start_date: startDate,
+      end_date: endDate,
+    })}`,
+  );
+  return response.data;
+}
+
 export async function getScheduledWorkout(
   workoutId: string,
 ): Promise<FitnessScheduledWorkout> {
@@ -154,6 +235,42 @@ export async function createScheduledWorkout(
         scheduled_date: scheduledDate,
       }),
     },
+  );
+  return response.data;
+}
+
+export async function previewRecurringSeries(
+  payload: FitnessRecurringSeriesRequest,
+): Promise<FitnessRecurringSeries> {
+  const response = await apiRequest<FitnessResponse<FitnessRecurringSeries>>(
+    "/fitness/recurring-series/preview",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+  return response.data;
+}
+
+export async function createRecurringSeries(
+  payload: FitnessRecurringSeriesRequest,
+): Promise<FitnessRecurringSeries> {
+  const response = await apiRequest<FitnessResponse<FitnessRecurringSeries>>(
+    "/fitness/recurring-series",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+  return response.data;
+}
+
+export async function removeScheduledWorkout(
+  workoutId: string,
+): Promise<{ removed_scheduled_workout_id: string }> {
+  const response = await apiRequest<FitnessResponse<{ removed_scheduled_workout_id: string }>>(
+    `/fitness/scheduled-workouts/${workoutId}`,
+    { method: "DELETE" },
   );
   return response.data;
 }
@@ -191,6 +308,34 @@ export async function rescheduleScheduledWorkout(
     {
       method: "POST",
       body: JSON.stringify({ scheduled_date: scheduledDate }),
+    },
+  );
+  return response.data;
+}
+
+export async function undoRescheduleScheduledWorkout(
+  workoutId: string,
+): Promise<{ original: FitnessScheduledWorkout; removed_replacement_scheduled_workout_id: string }> {
+  const response = await apiRequest<
+    FitnessResponse<{ original: FitnessScheduledWorkout; removed_replacement_scheduled_workout_id: string }>
+  >(
+    `/fitness/scheduled-workouts/${workoutId}/undo-reschedule`,
+    { method: "POST" },
+  );
+  return response.data;
+}
+
+export async function removeRemainingRecurringWorkouts(
+  seriesId: string,
+  fromDate?: string,
+): Promise<{ removed_count: number; removed_scheduled_workout_ids: string[] }> {
+  const response = await apiRequest<
+    FitnessResponse<{ removed_count: number; removed_scheduled_workout_ids: string[] }>
+  >(
+    `/fitness/recurring-series/${seriesId}/remove-remaining`,
+    {
+      method: "POST",
+      body: JSON.stringify(fromDate ? { from_date: fromDate } : {}),
     },
   );
   return response.data;
@@ -379,6 +524,39 @@ export async function instantiatePlanTemplate(
     {
       method: "POST",
       body: JSON.stringify({ start_date: startDate }),
+    },
+  );
+  return response.data;
+}
+
+export async function listPlanInstances(): Promise<FitnessPlanInstance[]> {
+  const response = await apiRequest<FitnessResponse<FitnessPlanInstance[]>>(
+    "/fitness/plan-instances",
+  );
+  return response.data;
+}
+
+export async function removeUnstartedPlanInstance(
+  planInstanceId: string,
+): Promise<{ removed_plan_instance_id: string; removed_count: number }> {
+  const response = await apiRequest<
+    FitnessResponse<{ removed_plan_instance_id: string; removed_count: number }>
+  >(
+    `/fitness/plan-instances/${planInstanceId}/remove-unstarted`,
+    { method: "POST" },
+  );
+  return response.data;
+}
+
+export async function removeRemainingPlanWorkouts(
+  planInstanceId: string,
+  fromDate?: string,
+): Promise<FitnessPlanInstance & { removed_count: number }> {
+  const response = await apiRequest<FitnessResponse<FitnessPlanInstance & { removed_count: number }>>(
+    `/fitness/plan-instances/${planInstanceId}/remove-remaining`,
+    {
+      method: "POST",
+      body: JSON.stringify(fromDate ? { from_date: fromDate } : {}),
     },
   );
   return response.data;

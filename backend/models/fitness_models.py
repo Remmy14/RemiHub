@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+FITNESS_RECURRENCE_MAX_WEEKS = 260
+
 
 class FitnessRequestModel(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -103,6 +105,32 @@ class WorkoutCompleteRequest(FitnessRequestModel):
 
 class WorkoutRescheduleRequest(FitnessRequestModel):
     scheduled_date: date
+
+
+class RecurringSeriesRequest(FitnessRequestModel):
+    workout_template_id: UUID
+    start_date: date
+    weekdays: list[int] = Field(min_length=1, max_length=7)
+    duration_weeks: int | None = Field(default=None, ge=1, le=FITNESS_RECURRENCE_MAX_WEEKS)
+    end_date: date | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=160)
+
+    @model_validator(mode="after")
+    def validate_rule(self):
+        if not self.duration_weeks and not self.end_date:
+            raise ValueError("duration_weeks or end_date is required")
+        if len(set(self.weekdays)) != len(self.weekdays):
+            raise ValueError("weekdays must be unique")
+        if any(day < 1 or day > 7 for day in self.weekdays):
+            raise ValueError("weekdays must use ISO values 1 through 7")
+        self.weekdays = sorted(self.weekdays)
+        if self.end_date and self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        return self
+
+
+class PlanInstanceCleanupRequest(FitnessRequestModel):
+    from_date: date | None = None
 
 
 class FitnessSuccessResponse(BaseModel):

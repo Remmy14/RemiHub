@@ -7,10 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from backend.core.auth import AuthenticatedPrincipal, require_current_principal
 from backend.models.fitness_models import (
     LiftingTemplateExercisesReplace,
+    PlanInstanceCleanupRequest,
     PlanInstantiateRequest,
     PlanTemplateCreate,
     PlanTemplateItemsReplace,
     PlanTemplateUpdate,
+    RecurringSeriesRequest,
     ScheduledWorkoutCreate,
     WorkoutCompleteRequest,
     WorkoutRescheduleRequest,
@@ -354,6 +356,42 @@ def complete_plan_instance(
         raise _handle_service_error(exc)
 
 
+@router.post("/plan-instances/{plan_instance_id}/remove-unstarted")
+def remove_unstarted_plan_instance(
+    plan_instance_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.remove_unstarted_plan_instance(
+                user_id=principal.id,
+                instance_id=plan_instance_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-instances/{plan_instance_id}/remove-remaining")
+def remove_remaining_plan_workouts(
+    plan_instance_id: str,
+    request: PlanInstanceCleanupRequest | None = None,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.remove_remaining_plan_workouts(
+                user_id=principal.id,
+                instance_id=plan_instance_id,
+                from_date=request.from_date if request else None,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
 @router.get("/scheduled-workouts")
 def list_scheduled_workouts(
     start_date: date = Query(...),
@@ -364,6 +402,25 @@ def list_scheduled_workouts(
         return {
             "success": True,
             "data": fitness_service.list_scheduled_workouts(
+                user_id=principal.id,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/training-calendar")
+def training_calendar(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.training_calendar(
                 user_id=principal.id,
                 start_date=start_date,
                 end_date=end_date,
@@ -410,6 +467,85 @@ def list_workout_history(
         raise _handle_service_error(exc)
 
 
+@router.post("/recurring-series/preview")
+def preview_recurring_series(
+    request: RecurringSeriesRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.preview_recurring_series(
+                user_id=principal.id,
+                workout_template_id=str(request.workout_template_id),
+                start_date=request.start_date,
+                weekdays=request.weekdays,
+                duration_weeks=request.duration_weeks,
+                end_date=request.end_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/recurring-series", status_code=status.HTTP_201_CREATED)
+def create_recurring_series(
+    request: RecurringSeriesRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.create_recurring_series(
+                user_id=principal.id,
+                workout_template_id=str(request.workout_template_id),
+                start_date=request.start_date,
+                weekdays=request.weekdays,
+                duration_weeks=request.duration_weeks,
+                end_date=request.end_date,
+                idempotency_key=request.idempotency_key,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/recurring-series/{series_id}")
+def get_recurring_series(
+    series_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_recurring_series(
+                user_id=principal.id,
+                series_id=series_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/recurring-series/{series_id}/remove-remaining")
+def remove_remaining_recurring_workouts(
+    series_id: str,
+    request: PlanInstanceCleanupRequest | None = None,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.remove_remaining_recurring_workouts(
+                user_id=principal.id,
+                series_id=series_id,
+                from_date=request.from_date if request else None,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
 @router.post("/scheduled-workouts", status_code=status.HTTP_201_CREATED)
 def create_scheduled_workout(
     request: ScheduledWorkoutCreate,
@@ -428,6 +564,23 @@ def create_scheduled_workout(
         raise _handle_service_error(exc)
 
 
+@router.delete("/scheduled-workouts/{scheduled_workout_id}")
+def remove_scheduled_workout(
+    scheduled_workout_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.remove_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
 @router.get("/scheduled-workouts/{scheduled_workout_id}")
 def get_scheduled_workout(
     scheduled_workout_id: str,
@@ -437,6 +590,23 @@ def get_scheduled_workout(
         return {
             "success": True,
             "data": fitness_service.get_scheduled_workout(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/undo-reschedule")
+def undo_reschedule(
+    scheduled_workout_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.undo_reschedule(
                 user_id=principal.id,
                 scheduled_workout_id=scheduled_workout_id,
             ),

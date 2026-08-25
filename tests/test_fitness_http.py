@@ -75,6 +75,51 @@ class FitnessHttpTests(unittest.TestCase):
         self.assertEqual(get_plan_instance.call_args.kwargs["user_id"], USER.id)
         self.assertEqual(get_plan_instance.call_args.kwargs["instance_id"], "plan-instance")
 
+    def test_recurring_preview_route_delegates_owner(self):
+        preview = MagicMock(return_value={"count": 15, "dates": []})
+        request = fitness.RecurringSeriesRequest(
+            workout_template_id="22222222-2222-4222-8222-222222222222",
+            start_date=date(2026, 8, 31),
+            weekdays=[1, 3, 5],
+            duration_weeks=5,
+        )
+        with patch(
+            "backend.routers.fitness.fitness_service.preview_recurring_series",
+            preview,
+        ):
+            response = fitness.preview_recurring_series(request, principal=USER)
+
+        self.assertTrue(response["success"])
+        self.assertEqual(preview.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(preview.call_args.kwargs["weekdays"], [1, 3, 5])
+
+    def test_remove_scheduled_workout_route_delegates_owner(self):
+        remove = MagicMock(return_value={"removed_scheduled_workout_id": "scheduled"})
+        with patch(
+            "backend.routers.fitness.fitness_service.remove_scheduled_workout",
+            remove,
+        ):
+            response = fitness.remove_scheduled_workout("scheduled", principal=USER)
+
+        self.assertTrue(response["success"])
+        self.assertEqual(remove.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(remove.call_args.kwargs["scheduled_workout_id"], "scheduled")
+
+    def test_training_calendar_route_delegates_owner(self):
+        calendar = MagicMock(return_value={"weeks": []})
+        with patch(
+            "backend.routers.fitness.fitness_service.training_calendar",
+            calendar,
+        ):
+            response = fitness.training_calendar(
+                start_date=date(2026, 8, 31),
+                end_date=date(2026, 10, 4),
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(calendar.call_args.kwargs["user_id"], USER.id)
+
 
 if __name__ == "__main__":
     unittest.main()
