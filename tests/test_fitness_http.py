@@ -4,6 +4,7 @@ import unittest
 from datetime import date
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
 from psycopg2 import pool
 
 
@@ -160,6 +161,53 @@ class FitnessHttpTests(unittest.TestCase):
         self.assertEqual(complete.call_args.kwargs["user_id"], USER.id)
         self.assertEqual(complete.call_args.kwargs["scheduled_workout_id"], "scheduled")
         self.assertEqual(complete.call_args.kwargs["activity_id"], "garmin-123")
+
+    def test_historical_efforts_route_requires_strict_principal_dependency(self):
+        route = next(
+            route
+            for route in fitness.router.routes
+            if getattr(route, "path", "") == "/fitness/scheduled-workouts/{scheduled_workout_id}/historical-efforts"
+            and "GET" in getattr(route, "methods", set())
+        )
+
+        dependency_calls = [
+            dependency.call
+            for dependency in route.dependant.dependencies
+        ]
+
+        self.assertIn(require_current_principal, dependency_calls)
+
+    def test_historical_efforts_route_delegates_owner_and_limit(self):
+        historical = MagicMock(return_value={"total_efforts": 0, "efforts": []})
+        with patch(
+            "backend.routers.fitness.fitness_service.get_historical_efforts",
+            historical,
+        ):
+            response = fitness.get_historical_efforts(
+                "scheduled",
+                limit="all",
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(historical.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(historical.call_args.kwargs["scheduled_workout_id"], "scheduled")
+        self.assertEqual(historical.call_args.kwargs["limit"], "all")
+
+    def test_historical_efforts_route_maps_validation_errors(self):
+        with patch(
+            "backend.routers.fitness.fitness_service.get_historical_efforts",
+            side_effect=fitness.fitness_service.FitnessValidationError("Historical efforts are not supported for LIFTING workouts"),
+        ):
+            with self.assertRaises(HTTPException) as caught:
+                fitness.get_historical_efforts(
+                    "scheduled",
+                    limit="5",
+                    principal=USER,
+                )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("not supported", caught.exception.detail)
 
     def test_training_calendar_route_delegates_owner(self):
         calendar = MagicMock(return_value={"weeks": []})

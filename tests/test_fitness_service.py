@@ -173,6 +173,31 @@ COMPLETED_RUNNING_ROW[19] = NOW
 COMPLETED_RUNNING_ROW[20] = NOW
 COMPLETED_RUNNING_ROW = tuple(COMPLETED_RUNNING_ROW)
 
+HISTORICAL_EFFORT_COLUMNS = [
+    "scheduled_workout_id",
+    "scheduled_date",
+    "status",
+    "completed_distance_miles",
+    "duration_seconds",
+    "moving_duration_seconds",
+    "average_hr",
+    "max_hr",
+    "training_load",
+    "aerobic_training_effect",
+    "anaerobic_training_effect",
+    "vo2_max",
+    "hr_zone_1_seconds",
+    "hr_zone_2_seconds",
+    "hr_zone_3_seconds",
+    "hr_zone_4_seconds",
+    "hr_zone_5_seconds",
+    "average_cadence_spm",
+    "average_power_watts",
+    "average_stride_length_meters",
+    "elevation_gain_meters",
+    "total_efforts",
+]
+
 PLAN_INSTANCE_COLUMNS = [
     "id",
     "user_id",
@@ -1511,6 +1536,220 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertEqual(hydrated["running_result"]["external_provider"], "GARMIN")
         self.assertEqual(hydrated["running_result"]["external_activity_id"], "garmin-1")
         self.assertEqual(hydrated["running_result"]["average_stride_length_meters"], Decimal("0.8809"))
+
+    def historical_effort_row(
+        self,
+        scheduled_id=SCHEDULED_ID,
+        scheduled_date=date(2026, 8, 29),
+        completed_distance_miles=Decimal("1.70"),
+        duration_seconds=1502,
+        total_efforts=3,
+        average_hr=Decimal("149"),
+    ):
+        return (
+            scheduled_id,
+            scheduled_date,
+            "COMPLETED",
+            completed_distance_miles,
+            duration_seconds,
+            1490,
+            average_hr,
+            Decimal("172"),
+            Decimal("51.5"),
+            Decimal("3.1"),
+            Decimal("0.2"),
+            Decimal("44"),
+            10,
+            20,
+            30,
+            40,
+            50,
+            Decimal("171.5"),
+            Decimal("240"),
+            Decimal("0.8809"),
+            Decimal("25.2"),
+            total_efforts,
+        )
+
+    def test_historical_efforts_enforces_reference_ownership_before_query(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessNotFoundError, "Scheduled workout not found"):
+                fitness_service.get_historical_efforts(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                )
+
+        self.assertEqual(len(connection.cursor_instance.executed), 1)
+        self.assertEqual(connection.cursor_instance.executed[0][1], (SCHEDULED_ID, USER_ID))
+
+    def test_historical_efforts_rejects_unsupported_workout_type(self):
+        lifting_row = list(PLANNED_RUNNING_ROW)
+        lifting_row[10] = "Full Body"
+        lifting_row[11] = "LIFTING"
+        lifting_row[15] = None
+        lifting_row[16] = None
+        lifting_row[17] = None
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [tuple(lifting_row)]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessValidationError, "not supported for LIFTING"):
+                fitness_service.get_historical_efforts(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                )
+
+        self.assertEqual(len(connection.cursor_instance.executed), 1)
+
+    def test_historical_efforts_running_cohort_query_uses_template_and_snapshot(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (HISTORICAL_EFFORT_COLUMNS, [self.historical_effort_row()]),
+            ]
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_running_activities"
+        ) as resolve_running, patch(
+            "backend.services.fitness_service.garmin_activity_provider.find_running_activity"
+        ) as find_running:
+            result = fitness_service.get_historical_efforts(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("JOIN public.fitness_running_workout_results AS result", sql)
+        self.assertIn("scheduled.status = 'COMPLETED'", sql)
+        self.assertIn("template.workout_type = 'RUNNING'", sql)
+        self.assertIn("scheduled.workout_template_id = %s", sql)
+        self.assertIn("scheduled.planned_distance_miles = %s", sql)
+        self.assertIn("ORDER BY scheduled.scheduled_date DESC, scheduled.updated_at DESC, scheduled.id DESC", sql)
+        self.assertEqual(params, (USER_ID, TEMPLATE_ID, 5.0, 5))
+        resolve_running.assert_not_called()
+        find_running.assert_not_called()
+        self.assertEqual(result["workout"]["workout_template_id"], TEMPLATE_ID)
+        self.assertEqual(result["workout"]["workout_type"], "RUNNING")
+        self.assertEqual(result["workout"]["planned_distance_miles"], 5.0)
+
+    def test_historical_efforts_returns_total_count_before_limit_and_metrics(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (
+                    HISTORICAL_EFFORT_COLUMNS,
+                    [
+                        self.historical_effort_row(
+                            scheduled_id="33333333-3333-4333-8333-333333333331",
+                            scheduled_date=date(2026, 8, 29),
+                            total_efforts=17,
+                        ),
+                        self.historical_effort_row(
+                            scheduled_id="33333333-3333-4333-8333-333333333330",
+                            scheduled_date=date(2026, 8, 27),
+                            completed_distance_miles=Decimal("2.00"),
+                            duration_seconds=1800,
+                            total_efforts=17,
+                            average_hr=None,
+                        ),
+                    ],
+                ),
+            ]
+        )
+
+        with patches:
+            result = fitness_service.get_historical_efforts(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+                limit="5",
+            )
+
+        self.assertEqual(result["total_efforts"], 17)
+        self.assertEqual(len(result["efforts"]), 2)
+        self.assertEqual(result["efforts"][0]["scheduled_date"], "2026-08-29")
+        values = result["efforts"][0]["values"]
+        self.assertAlmostEqual(values["pace_seconds_per_mile"], 883.5294117647059)
+        self.assertEqual(values["average_hr"], 149.0)
+        self.assertEqual(result["efforts"][1]["values"]["average_hr"], None)
+        metrics = {metric["key"]: metric for metric in result["metrics"]}
+        self.assertEqual(metrics["pace_seconds_per_mile"]["format"], "PACE_PER_MILE")
+        self.assertEqual(metrics["pace_seconds_per_mile"]["lower_is_better"], True)
+        self.assertIsNone(metrics["average_hr"]["lower_is_better"])
+        self.assertIsNone(metrics["training_load"]["lower_is_better"])
+        self.assertIsNone(metrics["average_power_watts"]["lower_is_better"])
+
+    def test_historical_efforts_includes_manual_runs_and_nulls_zero_distance_pace(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (
+                    HISTORICAL_EFFORT_COLUMNS,
+                    [
+                        self.historical_effort_row(
+                            scheduled_id="33333333-3333-4333-8333-333333333331",
+                            completed_distance_miles=Decimal("0.00"),
+                            duration_seconds=1200,
+                            average_hr=None,
+                        ),
+                        self.historical_effort_row(
+                            scheduled_id="33333333-3333-4333-8333-333333333330",
+                            completed_distance_miles=None,
+                            duration_seconds=1200,
+                            average_hr=None,
+                        ),
+                    ],
+                ),
+            ]
+        )
+
+        with patches:
+            result = fitness_service.get_historical_efforts(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+                limit="all",
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertNotIn("LIMIT %s", sql)
+        self.assertEqual(params, (USER_ID, TEMPLATE_ID, 5.0))
+        self.assertEqual(result["efforts"][0]["values"]["average_hr"], None)
+        self.assertIsNone(result["efforts"][0]["values"]["pace_seconds_per_mile"])
+        self.assertIsNone(result["efforts"][1]["values"]["pace_seconds_per_mile"])
+
+    def test_historical_effort_limits_are_validated(self):
+        self.assertEqual(fitness_service._normalize_historical_effort_limit(None), 5)
+        self.assertEqual(fitness_service._normalize_historical_effort_limit("10"), 10)
+        self.assertIsNone(fitness_service._normalize_historical_effort_limit("all"))
+        with self.assertRaisesRegex(fitness_service.FitnessValidationError, "limit must be one of"):
+            fitness_service._normalize_historical_effort_limit("0")
+
+    def test_historical_efforts_limit_ten_is_applied(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (HISTORICAL_EFFORT_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            result = fitness_service.get_historical_efforts(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+                limit="10",
+            )
+
+        self.assertEqual(result["total_efforts"], 0)
+        self.assertEqual(connection.cursor_instance.executed[1][1], (USER_ID, TEMPLATE_ID, 5.0, 10))
 
     def test_skip_planned_workout_and_reject_repeated_transition(self):
         skipped_row = list(PLANNED_RUNNING_ROW)

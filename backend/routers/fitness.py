@@ -600,6 +600,25 @@ def get_scheduled_workout(
         raise _handle_service_error(exc)
 
 
+@router.get("/scheduled-workouts/{scheduled_workout_id}/historical-efforts")
+def get_historical_efforts(
+    scheduled_workout_id: str,
+    limit: str | None = Query(default="5", pattern="^(5|10|all)$"),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.get_historical_efforts(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+                limit=limit,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
 @router.post("/scheduled-workouts/{scheduled_workout_id}/undo-reschedule")
 def undo_reschedule(
     scheduled_workout_id: str,

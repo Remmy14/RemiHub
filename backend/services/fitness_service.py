@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
@@ -50,6 +51,7 @@ GARMIN_RUNNING_RESULT_COLUMNS = (
 )
 FITNESS_TIMEZONE_ENV = "REMIHUB_FITNESS_TIMEZONE"
 DEFAULT_FITNESS_TIMEZONE = "America/New_York"
+HISTORICAL_EFFORT_LIMITS = {"5": 5, "10": 10, "all": None}
 
 
 class FitnessNotFoundError(ValueError):
@@ -62,6 +64,22 @@ class FitnessValidationError(ValueError):
 
 class FitnessConflictError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class HistoricalMetricDefinition:
+    key: str
+    label: str
+    format: str
+    lower_is_better: bool | None = None
+
+    def to_api_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "format": self.format,
+            "lower_is_better": self.lower_is_better,
+        }
 
 
 def _serialize_value(value):
@@ -1489,6 +1507,173 @@ def list_workout_history(
                 (user_id, start_date, end_date),
             )
             return _scheduled_rows_to_dicts(cur, cur.fetchall())
+    finally:
+        put_db_conn(conn)
+
+
+class HistoricalEffortAdapter:
+    workout_type: str
+    metrics: tuple[HistoricalMetricDefinition, ...]
+
+    def workout_summary(self, reference: dict) -> dict:
+        return {
+            "workout_template_id": reference["workout_template_id"],
+            "workout_type": reference["type"],
+            "workout_name": reference["workout_name"],
+        }
+
+    def list_efforts(self, cur, *, user_id: str, reference: dict, limit: int | None) -> tuple[int, list[dict]]:
+        raise NotImplementedError
+
+
+class RunningHistoricalEffortAdapter(HistoricalEffortAdapter):
+    workout_type = "RUNNING"
+    metrics = (
+        HistoricalMetricDefinition("pace_seconds_per_mile", "Pace", "PACE_PER_MILE", True),
+        HistoricalMetricDefinition("average_hr", "Avg HR", "BPM"),
+        HistoricalMetricDefinition("max_hr", "Max HR", "BPM"),
+        HistoricalMetricDefinition("average_cadence_spm", "Avg Cadence", "SPM"),
+        HistoricalMetricDefinition("average_power_watts", "Avg Power", "WATTS"),
+        HistoricalMetricDefinition("training_load", "Training Load", "DECIMAL"),
+        HistoricalMetricDefinition("aerobic_training_effect", "Aerobic Training Effect", "DECIMAL"),
+        HistoricalMetricDefinition("anaerobic_training_effect", "Anaerobic Training Effect", "DECIMAL"),
+        HistoricalMetricDefinition("average_stride_length_meters", "Avg Stride Length", "METERS"),
+        HistoricalMetricDefinition("elevation_gain_meters", "Elevation Gain", "METERS"),
+        HistoricalMetricDefinition("vo2_max", "VO2 Max", "DECIMAL"),
+        HistoricalMetricDefinition("moving_duration_seconds", "Moving Duration", "SECONDS", True),
+        HistoricalMetricDefinition("completed_distance_miles", "Completed Distance", "MILES"),
+        HistoricalMetricDefinition("duration_seconds", "Duration", "SECONDS", True),
+        HistoricalMetricDefinition("hr_zone_1_seconds", "HR Zone 1", "SECONDS"),
+        HistoricalMetricDefinition("hr_zone_2_seconds", "HR Zone 2", "SECONDS"),
+        HistoricalMetricDefinition("hr_zone_3_seconds", "HR Zone 3", "SECONDS"),
+        HistoricalMetricDefinition("hr_zone_4_seconds", "HR Zone 4", "SECONDS"),
+        HistoricalMetricDefinition("hr_zone_5_seconds", "HR Zone 5", "SECONDS"),
+    )
+    value_keys = tuple(metric.key for metric in metrics if metric.key != "pace_seconds_per_mile")
+
+    def workout_summary(self, reference: dict) -> dict:
+        summary = super().workout_summary(reference)
+        summary["planned_distance_miles"] = reference.get("planned_distance_miles")
+        return summary
+
+    def list_efforts(self, cur, *, user_id: str, reference: dict, limit: int | None) -> tuple[int, list[dict]]:
+        limit_clause = "" if limit is None else "\n                LIMIT %s"
+        params = [
+            user_id,
+            reference["workout_template_id"],
+            reference["planned_distance_miles"],
+        ]
+        if limit is not None:
+            params.append(limit)
+        cur.execute(
+            f"""
+                SELECT scheduled.id AS scheduled_workout_id,
+                       scheduled.scheduled_date,
+                       scheduled.status,
+                       result.completed_distance_miles,
+                       result.duration_seconds,
+                       result.moving_duration_seconds,
+                       result.average_hr,
+                       result.max_hr,
+                       result.training_load,
+                       result.aerobic_training_effect,
+                       result.anaerobic_training_effect,
+                       result.vo2_max,
+                       result.hr_zone_1_seconds,
+                       result.hr_zone_2_seconds,
+                       result.hr_zone_3_seconds,
+                       result.hr_zone_4_seconds,
+                       result.hr_zone_5_seconds,
+                       result.average_cadence_spm,
+                       result.average_power_watts,
+                       result.average_stride_length_meters,
+                       result.elevation_gain_meters,
+                       COUNT(*) OVER() AS total_efforts
+                FROM public.fitness_scheduled_workouts AS scheduled
+                JOIN public.fitness_workout_templates AS template
+                  ON template.id = scheduled.workout_template_id
+                JOIN public.fitness_running_workout_results AS result
+                  ON result.scheduled_workout_id = scheduled.id
+                WHERE scheduled.user_id = %s
+                  AND scheduled.status = 'COMPLETED'
+                  AND template.workout_type = 'RUNNING'
+                  AND scheduled.workout_template_id = %s
+                  AND scheduled.planned_distance_miles = %s
+                ORDER BY scheduled.scheduled_date DESC, scheduled.updated_at DESC, scheduled.id DESC{limit_clause}
+                """,
+            tuple(params),
+        )
+        rows = _rows_to_dicts(cur, cur.fetchall())
+        total_efforts = int(rows[0]["total_efforts"]) if rows else 0
+        return total_efforts, [self._effort_to_api(row) for row in rows]
+
+    def _effort_to_api(self, row: dict) -> dict:
+        values = {key: row.get(key) for key in self.value_keys}
+        values["pace_seconds_per_mile"] = _pace_seconds_per_mile(
+            completed_distance_miles=row.get("completed_distance_miles"),
+            duration_seconds=row.get("duration_seconds"),
+        )
+        return {
+            "scheduled_workout_id": row["scheduled_workout_id"],
+            "scheduled_date": row["scheduled_date"],
+            "status": row["status"],
+            "values": values,
+        }
+
+
+HISTORICAL_EFFORT_ADAPTERS = {
+    RunningHistoricalEffortAdapter.workout_type: RunningHistoricalEffortAdapter(),
+}
+
+
+def _pace_seconds_per_mile(*, completed_distance_miles, duration_seconds) -> float | None:
+    if completed_distance_miles is None or duration_seconds is None:
+        return None
+    distance = _decimal(completed_distance_miles)
+    if distance == 0:
+        return None
+    return _serialize_value(_decimal(duration_seconds) / distance)
+
+
+def _normalize_historical_effort_limit(limit: str | int | None) -> int | None:
+    normalized = "5" if limit is None else str(limit).strip().lower()
+    if normalized not in HISTORICAL_EFFORT_LIMITS:
+        raise FitnessValidationError("limit must be one of: 5, 10, all")
+    return HISTORICAL_EFFORT_LIMITS[normalized]
+
+
+def get_historical_efforts(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+    limit: str | int | None = None,
+) -> dict:
+    resolved_limit = _normalize_historical_effort_limit(limit)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            reference = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+            )
+            adapter = HISTORICAL_EFFORT_ADAPTERS.get(reference["type"])
+            if not adapter:
+                raise FitnessValidationError(
+                    f"Historical efforts are not supported for {reference['type']} workouts"
+                )
+            total_efforts, efforts = adapter.list_efforts(
+                cur,
+                user_id=user_id,
+                reference=reference,
+                limit=resolved_limit,
+            )
+            return {
+                "workout": adapter.workout_summary(reference),
+                "total_efforts": total_efforts,
+                "metrics": [metric.to_api_dict() for metric in adapter.metrics],
+                "efforts": efforts,
+            }
     finally:
         put_db_conn(conn)
 
