@@ -1,0 +1,39 @@
+DROP INDEX fitness_running_results_external_activity_uidx;
+
+ALTER TABLE public.fitness_running_workout_results
+    DROP CONSTRAINT fitness_running_results_secondary_check,
+    DROP CONSTRAINT fitness_running_results_efficiency_check,
+    DROP CONSTRAINT fitness_running_results_hr_zones_check,
+    DROP CONSTRAINT fitness_running_results_training_metrics_check,
+    DROP CONSTRAINT fitness_running_results_hr_check,
+    DROP CONSTRAINT fitness_running_results_average_speed_check,
+    DROP CONSTRAINT fitness_running_results_moving_duration_check,
+    DROP CONSTRAINT fitness_running_results_external_activity_check,
+    DROP CONSTRAINT fitness_running_results_external_provider_check;
+
+ALTER TABLE public.fitness_running_workout_results
+    DROP COLUMN steps,
+    DROP COLUMN calories,
+    DROP COLUMN elevation_loss_meters,
+    DROP COLUMN elevation_gain_meters,
+    DROP COLUMN average_stride_length_meters,
+    DROP COLUMN average_power_watts,
+    DROP COLUMN average_cadence_spm,
+    DROP COLUMN hr_zone_5_seconds,
+    DROP COLUMN hr_zone_4_seconds,
+    DROP COLUMN hr_zone_3_seconds,
+    DROP COLUMN hr_zone_2_seconds,
+    DROP COLUMN hr_zone_1_seconds,
+    DROP COLUMN vo2_max,
+    DROP COLUMN training_effect_label,
+    DROP COLUMN anaerobic_training_effect,
+    DROP COLUMN aerobic_training_effect,
+    DROP COLUMN training_load,
+    DROP COLUMN max_hr,
+    DROP COLUMN average_hr,
+    DROP COLUMN average_speed_meters_per_second,
+    DROP COLUMN moving_duration_seconds,
+    DROP COLUMN external_activity_name,
+    DROP COLUMN external_activity_uuid,
+    DROP COLUMN external_activity_id,
+    DROP COLUMN external_provider;

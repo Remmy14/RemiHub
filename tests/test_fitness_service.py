@@ -22,6 +22,7 @@ class OfflineThreadedConnectionPool:
 pool.ThreadedConnectionPool = OfflineThreadedConnectionPool
 
 from backend.services import fitness_service
+from backend.services import garmin_activity_provider
 
 
 USER_ID = "11111111-1111-4111-8111-111111111111"
@@ -448,6 +449,193 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertIn("AND status = 'PLANNED'", connection.cursor_instance.executed[2][0])
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(result["running_result"]["completed_distance_miles"], 5.1)
+        self.assertEqual(connection.commits, 1)
+
+    def garmin_activity(self, activity_id="garmin-1"):
+        return garmin_activity_provider.GarminRunningActivity(
+            external_provider="GARMIN",
+            external_activity_id=activity_id,
+            external_activity_uuid="uuid-1",
+            external_activity_name="Morning Run",
+            completed_distance_miles=Decimal("3.106855961186669707904048349"),
+            duration_seconds=1801,
+            moving_duration_seconds=1799,
+            average_speed_meters_per_second=Decimal("2.777778"),
+            average_hr=Decimal("150"),
+            max_hr=Decimal("180"),
+            training_load=Decimal("52.5"),
+            aerobic_training_effect=Decimal("3.2"),
+            anaerobic_training_effect=Decimal("0.4"),
+            training_effect_label="MAINTAINING",
+            vo2_max=Decimal("45"),
+            hr_zone_1_seconds=11,
+            hr_zone_2_seconds=20,
+            hr_zone_3_seconds=31,
+            hr_zone_4_seconds=40,
+            hr_zone_5_seconds=51,
+            average_cadence_spm=Decimal("172"),
+            average_power_watts=Decimal("245"),
+            average_stride_length_meters=Decimal("0.8809"),
+            elevation_gain_meters=Decimal("25.2"),
+            elevation_loss_meters=Decimal("24.7"),
+            calories=Decimal("410"),
+            steps=6400,
+        )
+
+    def test_garmin_completion_zero_results_returns_no_match_without_mutation(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+            ]
+        )
+        resolution = garmin_activity_provider.GarminActivityResolution(
+            activities=[],
+            candidates=[],
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_running_activities",
+            return_value=resolution,
+        ):
+            result = fitness_service.attempt_garmin_scheduled_workout_completion(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        self.assertEqual(result, {"status": "NO_MATCH"})
+        self.assertFalse(
+            any(
+                "INSERT INTO public.fitness_running_workout_results" in sql
+                or "UPDATE public.fitness_scheduled_workouts" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+        self.assertEqual(connection.commits, 0)
+
+    def test_garmin_completion_one_result_auto_matches_and_persists_linkage(self):
+        activity = self.garmin_activity()
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                ([], []),
+                ([], []),
+                (SCHEDULED_COLUMNS, [COMPLETED_RUNNING_ROW]),
+            ]
+        )
+        resolution = garmin_activity_provider.GarminActivityResolution(
+            activities=[activity],
+            candidates=[],
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_running_activities",
+            return_value=resolution,
+        ):
+            result = fitness_service.attempt_garmin_scheduled_workout_completion(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        insert_sql, insert_params = connection.cursor_instance.executed[2]
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertIn("external_provider", insert_sql)
+        self.assertIn("external_activity_id", insert_sql)
+        self.assertEqual(insert_params[1], 5.0)
+        self.assertEqual(insert_params[2], activity.completed_distance_miles)
+        self.assertEqual(insert_params[5], "GARMIN")
+        self.assertEqual(insert_params[6], "garmin-1")
+        self.assertEqual(connection.commits, 1)
+
+    def test_garmin_completion_multiple_results_returns_candidates_without_guessing(self):
+        candidate_one = garmin_activity_provider.GarminActivityCandidate(
+            activity_id="1",
+            activity_name="Morning Run",
+            start_time_local="2026-08-21 07:00:00",
+            distance=Decimal("5000"),
+            duration=1800,
+        )
+        candidate_two = garmin_activity_provider.GarminActivityCandidate(
+            activity_id="2",
+            activity_name="Evening Run",
+            start_time_local="2026-08-21 18:00:00",
+            distance=Decimal("3000"),
+            duration=1200,
+        )
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+            ]
+        )
+        resolution = garmin_activity_provider.GarminActivityResolution(
+            activities=[],
+            candidates=[candidate_one, candidate_two],
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_running_activities",
+            return_value=resolution,
+        ):
+            result = fitness_service.attempt_garmin_scheduled_workout_completion(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        self.assertEqual(result["status"], "AMBIGUOUS_MATCH")
+        self.assertEqual([candidate["activityId"] for candidate in result["candidates"]], ["1", "2"])
+        self.assertFalse(
+            any(
+                "INSERT INTO public.fitness_running_workout_results" in sql
+                for sql, _ in connection.cursor_instance.executed
+            )
+        )
+
+    def test_selected_garmin_activity_must_be_from_exact_date_query(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+            ]
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.find_running_activity",
+            return_value=None,
+        ) as find_activity:
+            with self.assertRaisesRegex(fitness_service.FitnessValidationError, "Selected Garmin activity"):
+                fitness_service.complete_scheduled_workout_with_garmin_activity(
+                    user_id=USER_ID,
+                    scheduled_workout_id=SCHEDULED_ID,
+                    activity_id="missing",
+                )
+
+        self.assertEqual(find_activity.call_args.kwargs["activity_id"], "missing")
+        self.assertEqual(find_activity.call_args.args[0], date(2026, 8, 21))
+        self.assertEqual(connection.commits, 0)
+
+    def test_selected_garmin_activity_persists_selected_activity(self):
+        activity = self.garmin_activity(activity_id="selected")
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                (SCHEDULED_COLUMNS, [PLANNED_RUNNING_ROW]),
+                ([], []),
+                ([], []),
+                (SCHEDULED_COLUMNS, [COMPLETED_RUNNING_ROW]),
+            ]
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.find_running_activity",
+            return_value=activity,
+        ):
+            result = fitness_service.complete_scheduled_workout_with_garmin_activity(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+                activity_id="selected",
+            )
+
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(connection.cursor_instance.executed[2][1][6], "selected")
         self.assertEqual(connection.commits, 1)
 
     def test_reschedule_copies_planned_distance_snapshot_to_replacement(self):
@@ -1285,6 +1473,44 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertIn("scheduled.status <> 'PLANNED'", connection.cursor_instance.executed[0][0])
         self.assertEqual(history[0]["running_result"]["planned_distance_miles"], 5.0)
         self.assertEqual(history[0]["running_result"]["duration_seconds"], 1860)
+
+    def test_running_result_exposes_persisted_garmin_metrics(self):
+        workout = dict(zip(SCHEDULED_COLUMNS, COMPLETED_RUNNING_ROW))
+        workout.update(
+            {
+                "external_provider": "GARMIN",
+                "external_activity_id": "garmin-1",
+                "external_activity_uuid": "uuid-1",
+                "external_activity_name": "Morning Run",
+                "moving_duration_seconds": 1799,
+                "average_speed_meters_per_second": Decimal("2.777778"),
+                "average_hr": Decimal("150"),
+                "max_hr": Decimal("180"),
+                "training_load": Decimal("52.5"),
+                "aerobic_training_effect": Decimal("3.2"),
+                "anaerobic_training_effect": Decimal("0.4"),
+                "training_effect_label": "MAINTAINING",
+                "vo2_max": Decimal("45"),
+                "hr_zone_1_seconds": 11,
+                "hr_zone_2_seconds": 20,
+                "hr_zone_3_seconds": 31,
+                "hr_zone_4_seconds": 40,
+                "hr_zone_5_seconds": 51,
+                "average_cadence_spm": Decimal("172"),
+                "average_power_watts": Decimal("245"),
+                "average_stride_length_meters": Decimal("0.8809"),
+                "elevation_gain_meters": Decimal("25.2"),
+                "elevation_loss_meters": Decimal("24.7"),
+                "calories": Decimal("410"),
+                "steps": 6400,
+            }
+        )
+
+        hydrated = fitness_service._with_running_result(workout)
+
+        self.assertEqual(hydrated["running_result"]["external_provider"], "GARMIN")
+        self.assertEqual(hydrated["running_result"]["external_activity_id"], "garmin-1")
+        self.assertEqual(hydrated["running_result"]["average_stride_length_meters"], Decimal("0.8809"))
 
     def test_skip_planned_workout_and_reject_repeated_transition(self):
         skipped_row = list(PLANNED_RUNNING_ROW)

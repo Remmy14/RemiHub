@@ -128,6 +128,39 @@ class FitnessHttpTests(unittest.TestCase):
             "22222222-2222-4222-8222-222222222222",
         )
 
+    def test_garmin_completion_attempt_route_delegates_owner(self):
+        attempt = MagicMock(return_value={"status": "NO_MATCH"})
+        with patch(
+            "backend.routers.fitness.fitness_service.attempt_garmin_scheduled_workout_completion",
+            attempt,
+        ):
+            response = fitness.attempt_garmin_scheduled_workout_completion(
+                "scheduled",
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(attempt.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(attempt.call_args.kwargs["scheduled_workout_id"], "scheduled")
+
+    def test_garmin_selection_route_delegates_owner_and_activity_id(self):
+        complete = MagicMock(return_value={"status": "COMPLETED", "workout": {"id": "scheduled"}})
+        request = fitness.GarminActivitySelectionRequest(activity_id="garmin-123")
+        with patch(
+            "backend.routers.fitness.fitness_service.complete_scheduled_workout_with_garmin_activity",
+            complete,
+        ):
+            response = fitness.complete_scheduled_workout_with_garmin_activity(
+                "scheduled",
+                request,
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(complete.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(complete.call_args.kwargs["scheduled_workout_id"], "scheduled")
+        self.assertEqual(complete.call_args.kwargs["activity_id"], "garmin-123")
+
     def test_training_calendar_route_delegates_owner(self):
         calendar = MagicMock(return_value={"weeks": []})
         with patch(

@@ -7,8 +7,11 @@ from decimal import Decimal, InvalidOperation
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from psycopg2 import errors
+
 from backend.database.database import get_db_conn, put_db_conn
 from backend.models.fitness_models import FITNESS_RECURRENCE_MAX_WEEKS
+from backend.services import garmin_activity_provider
 
 RUNNING_RESULT_COLUMNS = (
     "planned_distance_miles",
@@ -17,6 +20,33 @@ RUNNING_RESULT_COLUMNS = (
     "notes",
     "created_at",
     "updated_at",
+)
+GARMIN_RUNNING_RESULT_COLUMNS = (
+    "external_provider",
+    "external_activity_id",
+    "external_activity_uuid",
+    "external_activity_name",
+    "moving_duration_seconds",
+    "average_speed_meters_per_second",
+    "average_hr",
+    "max_hr",
+    "training_load",
+    "aerobic_training_effect",
+    "anaerobic_training_effect",
+    "training_effect_label",
+    "vo2_max",
+    "hr_zone_1_seconds",
+    "hr_zone_2_seconds",
+    "hr_zone_3_seconds",
+    "hr_zone_4_seconds",
+    "hr_zone_5_seconds",
+    "average_cadence_spm",
+    "average_power_watts",
+    "average_stride_length_meters",
+    "elevation_gain_meters",
+    "elevation_loss_meters",
+    "calories",
+    "steps",
 )
 FITNESS_TIMEZONE_ENV = "REMIHUB_FITNESS_TIMEZONE"
 DEFAULT_FITNESS_TIMEZONE = "America/New_York"
@@ -193,6 +223,31 @@ def _scheduled_select() -> str:
                result.notes AS result_notes,
                result.created_at AS result_created_at,
                result.updated_at AS result_updated_at,
+               result.external_provider,
+               result.external_activity_id,
+               result.external_activity_uuid,
+               result.external_activity_name,
+               result.moving_duration_seconds,
+               result.average_speed_meters_per_second,
+               result.average_hr,
+               result.max_hr,
+               result.training_load,
+               result.aerobic_training_effect,
+               result.anaerobic_training_effect,
+               result.training_effect_label,
+               result.vo2_max,
+               result.hr_zone_1_seconds,
+               result.hr_zone_2_seconds,
+               result.hr_zone_3_seconds,
+               result.hr_zone_4_seconds,
+               result.hr_zone_5_seconds,
+               result.average_cadence_spm,
+               result.average_power_watts,
+               result.average_stride_length_meters,
+               result.elevation_gain_meters,
+               result.elevation_loss_meters,
+               result.calories,
+               result.steps,
                scheduled.created_at,
                scheduled.updated_at
         FROM public.fitness_scheduled_workouts AS scheduled
@@ -220,6 +275,7 @@ def _with_running_result(workout: dict) -> dict:
             "result_notes",
             "result_created_at",
             "result_updated_at",
+            *GARMIN_RUNNING_RESULT_COLUMNS,
         )
     ):
         result = {
@@ -230,6 +286,12 @@ def _with_running_result(workout: dict) -> dict:
             "created_at": workout.get("result_created_at"),
             "updated_at": workout.get("result_updated_at"),
         }
+        result.update(
+            {
+                column: workout.get(column)
+                for column in GARMIN_RUNNING_RESULT_COLUMNS
+            }
+        )
     cleaned = {
         key: value
         for key, value in workout.items()
@@ -241,6 +303,7 @@ def _with_running_result(workout: dict) -> dict:
             "result_notes",
             "result_created_at",
             "result_updated_at",
+            *GARMIN_RUNNING_RESULT_COLUMNS,
         }
     }
     source_type = "INDIVIDUAL"
@@ -1436,6 +1499,179 @@ def today_workouts(*, user_id: str, target_date: date) -> list[dict]:
         start_date=target_date,
         end_date=target_date,
     )
+
+
+def _validate_garmin_completion_target(workout: dict) -> None:
+    if workout["status"] != "PLANNED":
+        raise FitnessConflictError("Only planned workouts can be completed")
+    if workout["type"] != "RUNNING":
+        raise FitnessValidationError("Garmin completion is only available for running workouts")
+
+
+def _translate_garmin_error(exc: garmin_activity_provider.GarminProviderError) -> FitnessValidationError:
+    return FitnessValidationError(f"{exc.code}: {exc}")
+
+
+def _running_result_insert_sql(extra_columns: tuple[str, ...]) -> str:
+    columns = (
+        "scheduled_workout_id",
+        "planned_distance_miles",
+        "completed_distance_miles",
+        "duration_seconds",
+        "notes",
+        *extra_columns,
+    )
+    placeholders = ", ".join(["%s"] * len(columns))
+    set_clause = ",\n                        ".join(
+        f"{column} = EXCLUDED.{column}"
+        for column in columns
+        if column != "scheduled_workout_id"
+    )
+    return f"""
+                    INSERT INTO public.fitness_running_workout_results (
+                        {", ".join(columns)}
+                    )
+                    VALUES ({placeholders})
+                    ON CONFLICT (scheduled_workout_id)
+                    DO UPDATE SET
+                        {set_clause},
+                        updated_at = now()
+                    """
+
+
+def _insert_garmin_running_result(
+    cur,
+    *,
+    scheduled_workout_id: str,
+    planned_distance_miles,
+    activity: garmin_activity_provider.GarminRunningActivity,
+) -> None:
+    values = activity.to_insert_params()
+    cur.execute(
+        _running_result_insert_sql(GARMIN_RUNNING_RESULT_COLUMNS),
+        (
+            scheduled_workout_id,
+            planned_distance_miles,
+            values["completed_distance_miles"],
+            values["duration_seconds"],
+            None,
+            *(values[column] for column in GARMIN_RUNNING_RESULT_COLUMNS),
+        ),
+    )
+
+
+def _complete_scheduled_running_workout_with_garmin_activity(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+    activity: garmin_activity_provider.GarminRunningActivity,
+) -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            workout = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+                lock=True,
+            )
+            _validate_garmin_completion_target(workout)
+            _insert_garmin_running_result(
+                cur,
+                scheduled_workout_id=scheduled_workout_id,
+                planned_distance_miles=workout["planned_distance_miles"],
+                activity=activity,
+            )
+            cur.execute(
+                """
+                UPDATE public.fitness_scheduled_workouts
+                SET status = 'COMPLETED',
+                    updated_at = now()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND status = 'PLANNED'
+                """,
+                (scheduled_workout_id, user_id),
+            )
+            if cur.rowcount != 1:
+                raise FitnessConflictError("Only planned workouts can be completed")
+            result = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+            )
+        conn.commit()
+        return result
+    except errors.UniqueViolation as exc:
+        conn.rollback()
+        raise FitnessConflictError("Garmin activity is already linked to a completed run") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def attempt_garmin_scheduled_workout_completion(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+) -> dict:
+    workout = get_scheduled_workout(
+        user_id=user_id,
+        scheduled_workout_id=scheduled_workout_id,
+    )
+    _validate_garmin_completion_target(workout)
+    scheduled_date = date.fromisoformat(workout["scheduled_date"])
+    try:
+        resolution = garmin_activity_provider.resolve_running_activities(scheduled_date)
+    except garmin_activity_provider.GarminProviderError as exc:
+        raise _translate_garmin_error(exc) from exc
+
+    activities = resolution.activities
+    if not activities:
+        if resolution.candidates:
+            return {
+                "status": "AMBIGUOUS_MATCH",
+                "candidates": [candidate.to_api_dict() for candidate in resolution.candidates],
+            }
+        return {"status": "NO_MATCH"}
+    completed = _complete_scheduled_running_workout_with_garmin_activity(
+        user_id=user_id,
+        scheduled_workout_id=scheduled_workout_id,
+        activity=activities[0],
+    )
+    return {"status": "COMPLETED", "workout": completed}
+
+
+def complete_scheduled_workout_with_garmin_activity(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+    activity_id: str,
+) -> dict:
+    workout = get_scheduled_workout(
+        user_id=user_id,
+        scheduled_workout_id=scheduled_workout_id,
+    )
+    _validate_garmin_completion_target(workout)
+    scheduled_date = date.fromisoformat(workout["scheduled_date"])
+    try:
+        activity = garmin_activity_provider.find_running_activity(
+            scheduled_date,
+            activity_id=activity_id,
+        )
+    except garmin_activity_provider.GarminProviderError as exc:
+        raise _translate_garmin_error(exc) from exc
+
+    if activity is None:
+        raise FitnessValidationError("Selected Garmin activity is not available for this scheduled date")
+    completed = _complete_scheduled_running_workout_with_garmin_activity(
+        user_id=user_id,
+        scheduled_workout_id=scheduled_workout_id,
+        activity=activity,
+    )
+    return {"status": "COMPLETED", "workout": completed}
 
 
 def _assert_no_weightlifting_entries(cur, *, user_id: str, scheduled_workout_id: str) -> None:

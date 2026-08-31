@@ -107,6 +107,10 @@ class WorkoutCompleteRequest(FitnessRequestModel):
     running: RunningCompletion | None = None
 
 
+class GarminActivitySelectionRequest(FitnessRequestModel):
+    activity_id: str = Field(min_length=1, max_length=160)
+
+
 class WorkoutRescheduleRequest(FitnessRequestModel):
     scheduled_date: date
 

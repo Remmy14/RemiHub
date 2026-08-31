@@ -32,6 +32,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0008", "mead_foundation"),
                 ("0009", "fitness_foundation"),
                 ("0010", "fitness_planning_v2"),
+                ("0011", "fitness_garmin_running_results"),
             ],
         )
 
@@ -51,6 +52,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0008", "mead_foundation"),
                 ("0009", "fitness_foundation"),
                 ("0010", "fitness_planning_v2"),
+                ("0011", "fitness_garmin_running_results"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
@@ -145,6 +147,31 @@ class MigrationDiscoveryTests(unittest.TestCase):
             direction="down",
         )
         GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_fitness_garmin_running_results_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0011_fitness_garmin_running_results.up.sql"
+        down = MIGRATIONS_DIR / "0011_fitness_garmin_running_results.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_fitness_garmin_migration_adds_partial_external_activity_uniqueness(self):
+        up = (MIGRATIONS_DIR / "0011_fitness_garmin_running_results.up.sql").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ALTER TABLE public.fitness_running_workout_results", up)
+        self.assertIn("external_provider text", up)
+        self.assertIn("external_activity_id text", up)
+        self.assertIn("fitness_running_results_external_activity_uidx", up)
+        self.assertIn("WHERE external_provider IS NOT NULL", up)
 
     def test_service_health_migration_is_current_state_only(self):
         up = (

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from backend.core.auth import AuthenticatedPrincipal, require_current_principal
 from backend.models.fitness_models import (
+    GarminActivitySelectionRequest,
     LiftingTemplateExercisesReplace,
     PlanInstanceCleanupRequest,
     PlanInstantiateRequest,
@@ -652,6 +653,42 @@ def complete_scheduled_workout(
                     if request and request.running
                     else None
                 ),
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/garmin/complete")
+def attempt_garmin_scheduled_workout_completion(
+    scheduled_workout_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.attempt_garmin_scheduled_workout_completion(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/scheduled-workouts/{scheduled_workout_id}/garmin/complete-selection")
+def complete_scheduled_workout_with_garmin_activity(
+    scheduled_workout_id: str,
+    request: GarminActivitySelectionRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.complete_scheduled_workout_with_garmin_activity(
+                user_id=principal.id,
+                scheduled_workout_id=scheduled_workout_id,
+                activity_id=request.activity_id,
             ),
         }
     except ValueError as exc:
