@@ -250,10 +250,11 @@ def fetch_running_activity_summaries(
     tokenstore: str | None = None,
 ) -> list[dict]:
     api = _runtime_api(tokenstore)
+    garmin_date = scheduled_date.isoformat()
     activities = _garmin_call(
         lambda: api.get_activities_by_date(
-            scheduled_date,
-            scheduled_date,
+            garmin_date,
+            garmin_date,
             activitytype="running",
             sortorder="asc",
         )

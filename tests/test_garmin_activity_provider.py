@@ -91,14 +91,19 @@ class GarminActivityProviderTests(unittest.TestCase):
 
         with self.patch_garmin():
             provider.fetch_running_activity_summaries(
-                date(2026, 8, 21),
+                date(2026, 8, 29),
                 tokenstore="/secure/garmin",
             )
 
+        start_date, end_date, activitytype, sortorder = FakeGarminApi.date_calls[0]
+        self.assertIsInstance(start_date, str)
+        self.assertIsInstance(end_date, str)
         self.assertEqual(
             FakeGarminApi.date_calls,
-            [(date(2026, 8, 21), date(2026, 8, 21), "running", "asc")],
+            [("2026-08-29", "2026-08-29", "running", "asc")],
         )
+        self.assertEqual(activitytype, "running")
+        self.assertEqual(sortorder, "asc")
         self.assertEqual(FakeGarminApi.prohibited_calls, [])
 
     def test_bootstrap_helper_constructs_password_login_inside_provider(self):
