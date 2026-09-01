@@ -87,6 +87,23 @@ def get_workout_template(
         raise _handle_service_error(exc)
 
 
+@router.get("/workout-templates/{template_id}/completed-workouts")
+def list_completed_workouts_for_template(
+    template_id: str,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.list_completed_workouts_for_template(
+                user_id=principal.id,
+                template_id=template_id,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
 @router.patch("/workout-templates/{template_id}")
 def update_workout_template(
     template_id: str,

@@ -278,6 +278,73 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertIn("No health components were returned", source)
         self.assertIn("Component details", source)
 
+    def test_fitness_frontend_has_one_completed_workout_detail_path(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        screen_source = (frontend_root / "src" / "FitnessScreen.tsx").read_text(
+            encoding="utf-8",
+        )
+        api_source = (frontend_root / "src" / "api" / "fitnessApi.ts").read_text(
+            encoding="utf-8",
+        )
+
+        self.assertEqual(screen_source.count("function CompletedWorkoutDetailDialog"), 1)
+        self.assertIn("const [detailWorkout, setDetailWorkout]", screen_source)
+        self.assertIn("const openCompletedDetail = async", screen_source)
+        self.assertIn("onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)}", screen_source)
+        self.assertIn("workout.status !== \"COMPLETED\"", screen_source)
+        self.assertIn("workout.status === \"COMPLETED\"", screen_source)
+        self.assertIn("getScheduledWorkout(workout.id)", screen_source)
+        self.assertIn("resultSourceLabel(workout)", screen_source)
+        self.assertIn("listCompletedWorkoutsForTemplate", api_source)
+        self.assertIn("/completed-workouts", api_source)
+
+    def test_fitness_frontend_models_optional_result_metrics(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "fitnessApi.ts"
+        ).read_text(encoding="utf-8")
+
+        for field in (
+            "external_provider: string | null",
+            "moving_duration_seconds: number | null",
+            "average_speed_meters_per_second: number | null",
+            "average_hr: number | null",
+            "max_hr: number | null",
+            "training_load: number | null",
+            "aerobic_training_effect: number | null",
+            "anaerobic_training_effect: number | null",
+            "training_effect_label: string | null",
+            "hr_zone_1_seconds: number | null",
+            "average_cadence_spm: number | null",
+            "average_power_watts: number | null",
+            "average_stride_length_meters: number | null",
+            "elevation_gain_meters: number | null",
+            "calories: number | null",
+            "steps: number | null",
+            "vo2_max: number | null",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, source)
+
+    def test_fitness_frontend_exposes_template_and_plan_history_by_id(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function TemplateHistoricalDialog", source)
+        self.assertIn("listCompletedWorkoutsForTemplate(template.id)", source)
+        self.assertIn("Historical", source)
+        self.assertIn("function PlansView({", source)
+        self.assertIn("getPlanInstance(instance.id)", source)
+        self.assertIn("scheduled_workouts", source)
+        self.assertIn("Open detail", source)
+
     def test_health_screen_does_not_duplicate_systemd_health_semantics(self):
         source = (
             Path(__file__).resolve().parents[1]

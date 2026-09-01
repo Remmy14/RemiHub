@@ -10,10 +10,12 @@ import {
   createScheduledWorkout,
   createWorkoutTemplate,
   getTrainingCalendar,
+  getPlanInstance,
   getPlanTemplate,
   getScheduledWorkout,
   getWorkoutTemplate,
   instantiatePlanTemplate,
+  listCompletedWorkoutsForTemplate,
   listPlanInstances,
   listPlanTemplates,
   listScheduledWorkouts,
@@ -174,6 +176,50 @@ function distanceLabel(value: number | null | undefined): string {
     return "No distance";
   }
   return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} mi`;
+}
+
+function numberLabel(
+  value: number | null | undefined,
+  suffix = "",
+  maximumFractionDigits = 1,
+): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits })}${suffix}`;
+}
+
+function paceLabel(
+  distanceMiles: number | null | undefined,
+  durationSeconds: number | null | undefined,
+): string | null {
+  if (!distanceMiles || distanceMiles <= 0 || durationSeconds === null || durationSeconds === undefined) {
+    return null;
+  }
+  const secondsPerMile = Math.round(durationSeconds / distanceMiles);
+  const minutes = Math.floor(secondsPerMile / 60);
+  const seconds = secondsPerMile % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")} / mi`;
+}
+
+function speedLabel(metersPerSecond: number | null | undefined): string | null {
+  if (metersPerSecond === null || metersPerSecond === undefined || !Number.isFinite(metersPerSecond)) {
+    return null;
+  }
+  return `${(metersPerSecond * 2.236936).toLocaleString(undefined, { maximumFractionDigits: 1 })} mph`;
+}
+
+function resultSourceLabel(workout: FitnessScheduledWorkout): string | null {
+  const provider = workout.running_result?.external_provider;
+  if (!provider) {
+    return null;
+  }
+  if (provider === "GARMIN") {
+    return "Garmin";
+  }
+  return provider
+    .toLowerCase()
+    .replace(/(^|_)([a-z])/g, (_match, prefix: string, letter: string) => `${prefix ? " " : ""}${letter.toUpperCase()}`);
 }
 
 function messageFromError(error: unknown, fallback: string): string {
@@ -690,6 +736,89 @@ function Dialog({
   );
 }
 
+function CompletedWorkoutDetailDialog({
+  onClose,
+  workout,
+}: {
+  onClose: () => void;
+  workout: FitnessScheduledWorkout;
+}) {
+  const result = workout.running_result;
+  const sourceLabel = resultSourceLabel(workout);
+  const detailMetrics: Array<{ label: string; value: ReactNode | null }> = [
+    { label: "Workout date", value: formatDate(workout.scheduled_date) },
+    { label: "Workout type", value: workout.type === "RUNNING" ? "Running" : "Lifting" },
+    { label: "Status", value: workout.status },
+    { label: "Planned distance", value: workout.type === "RUNNING" ? distanceLabel(workout.planned_distance_miles) : null },
+    { label: "Result source", value: sourceLabel },
+    { label: "Distance", value: result ? distanceLabel(result.completed_distance_miles) : null },
+    { label: "Duration", value: result ? formatDuration(result.duration_seconds) : null },
+    { label: "Moving duration", value: result?.moving_duration_seconds !== null && result?.moving_duration_seconds !== undefined ? formatDuration(result.moving_duration_seconds) : null },
+    { label: "Average pace", value: result ? paceLabel(result.completed_distance_miles, result.duration_seconds) : null },
+    { label: "Average speed", value: speedLabel(result?.average_speed_meters_per_second) },
+    { label: "Average HR", value: numberLabel(result?.average_hr, " bpm", 0) },
+    { label: "Max HR", value: numberLabel(result?.max_hr, " bpm", 0) },
+    { label: "Training load", value: numberLabel(result?.training_load) },
+    { label: "Aerobic effect", value: numberLabel(result?.aerobic_training_effect) },
+    { label: "Anaerobic effect", value: numberLabel(result?.anaerobic_training_effect) },
+    { label: "Training effect", value: result?.training_effect_label ?? null },
+    { label: "HR Zone 1", value: result?.hr_zone_1_seconds !== null && result?.hr_zone_1_seconds !== undefined ? formatDuration(result.hr_zone_1_seconds) : null },
+    { label: "HR Zone 2", value: result?.hr_zone_2_seconds !== null && result?.hr_zone_2_seconds !== undefined ? formatDuration(result.hr_zone_2_seconds) : null },
+    { label: "HR Zone 3", value: result?.hr_zone_3_seconds !== null && result?.hr_zone_3_seconds !== undefined ? formatDuration(result.hr_zone_3_seconds) : null },
+    { label: "HR Zone 4", value: result?.hr_zone_4_seconds !== null && result?.hr_zone_4_seconds !== undefined ? formatDuration(result.hr_zone_4_seconds) : null },
+    { label: "HR Zone 5", value: result?.hr_zone_5_seconds !== null && result?.hr_zone_5_seconds !== undefined ? formatDuration(result.hr_zone_5_seconds) : null },
+    { label: "Average cadence", value: numberLabel(result?.average_cadence_spm, " spm", 0) },
+    { label: "Average power", value: numberLabel(result?.average_power_watts, " W", 0) },
+    { label: "Stride length", value: numberLabel(result?.average_stride_length_meters, " m", 2) },
+    { label: "Elevation gain", value: numberLabel(result?.elevation_gain_meters, " m", 0) },
+    { label: "Elevation loss", value: numberLabel(result?.elevation_loss_meters, " m", 0) },
+    { label: "Calories", value: numberLabel(result?.calories, "", 0) },
+    { label: "Steps", value: numberLabel(result?.steps, "", 0) },
+    { label: "VO2 max", value: numberLabel(result?.vo2_max) },
+  ];
+  const visibleMetrics = detailMetrics.filter((metric) => metric.value !== null);
+
+  return (
+    <Dialog onClose={onClose} title={workout.workout_name || "Completed workout"}>
+      <div className="space-y-4">
+        <div className="flex flex-wrap gap-2">
+          <Pill className={typeStyles[workout.type]}>
+            {workout.type === "RUNNING" ? "Running" : "Lifting"}
+          </Pill>
+          <Pill className={statusStyles[workout.status]}>
+            {workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
+          </Pill>
+          {sourceLabel && (
+            <Pill className="border-slate-200 bg-slate-50 text-slate-600">
+              {sourceLabel}
+            </Pill>
+          )}
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {visibleMetrics.map((metric) => (
+            <Metric key={metric.label} label={metric.label} value={metric.value} />
+          ))}
+        </div>
+        {!result && (
+          <EmptyState>
+            This completed workout does not have external result metrics.
+          </EmptyState>
+        )}
+        {result?.notes && (
+          <p className="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-700">
+            {result.notes}
+          </p>
+        )}
+        <div className="flex justify-end">
+          <button className={secondaryButtonClasses} onClick={onClose} type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 function DialogActions({
   onClose,
   submitDisabled = false,
@@ -1189,6 +1318,7 @@ function CalendarWorkoutCard({
   expanded,
   onComplete,
   onEdit,
+  onOpenCompletedDetail,
   onRemove,
   onReschedule,
   onSelect,
@@ -1202,6 +1332,7 @@ function CalendarWorkoutCard({
   expanded: boolean;
   onComplete: (workout: FitnessScheduledWorkout) => void;
   onEdit: (workout: FitnessScheduledWorkout) => void;
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
   onRemove: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSelect: (workout: FitnessScheduledWorkout) => void;
@@ -1217,6 +1348,13 @@ function CalendarWorkoutCard({
   };
   const compactButtonClasses =
     "rounded border border-slate-300 bg-white px-2 py-1 text-[0.7rem] font-black text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400";
+  const selectWorkout = () => {
+    if (workout.status === "COMPLETED") {
+      onOpenCompletedDetail(workout);
+      return;
+    }
+    onSelect(workout);
+  };
 
   return (
     <article
@@ -1224,11 +1362,11 @@ function CalendarWorkoutCard({
       className={`w-full cursor-pointer rounded-md border p-2 text-left text-xs shadow-sm ${
         expanded ? "border-blue-400 bg-blue-50/40 ring-2 ring-blue-100" : "border-slate-200 bg-white"
       }`}
-      onClick={() => onSelect(workout)}
+      onClick={selectWorkout}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          onSelect(workout);
+          selectWorkout();
         }
       }}
       role="button"
@@ -1305,6 +1443,7 @@ function CalendarWorkoutCard({
 function TrainingCalendarView({
   onComplete,
   onEdit,
+  onOpenCompletedDetail,
   onRemove,
   onReschedule,
   onSkip,
@@ -1314,6 +1453,7 @@ function TrainingCalendarView({
 }: {
   onComplete: (workout: FitnessScheduledWorkout) => void;
   onEdit: (workout: FitnessScheduledWorkout) => void;
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
   onRemove: (workout: FitnessScheduledWorkout) => void;
   onReschedule: (workout: FitnessScheduledWorkout) => void;
   onSkip: (workout: FitnessScheduledWorkout) => void;
@@ -1402,6 +1542,7 @@ function TrainingCalendarView({
                           key={workout.id}
                           onComplete={onComplete}
                           onEdit={onEdit}
+                          onOpenCompletedDetail={onOpenCompletedDetail}
                           onRemove={onRemove}
                           onReschedule={onReschedule}
                           onSelect={(item) => {
@@ -1513,10 +1654,90 @@ function ExercisePicker({
   );
 }
 
-function TemplatesView() {
+function CompletedWorkoutSummaryRow({
+  onOpenCompletedDetail,
+  workout,
+}: {
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
+  workout: FitnessScheduledWorkout;
+}) {
+  const result = workout.running_result;
+
+  return (
+    <button
+      className="w-full rounded-md border border-slate-200 bg-white p-3 text-left hover:border-blue-300 hover:bg-blue-50/40"
+      onClick={() => onOpenCompletedDetail(workout)}
+      type="button"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="font-black text-slate-950">{workout.workout_name}</div>
+          <div className="text-sm font-semibold text-slate-600">{formatDate(workout.scheduled_date)}</div>
+        </div>
+        <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-4">
+        <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
+        <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
+        <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
+        <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+      </div>
+    </button>
+  );
+}
+
+function TemplateHistoricalDialog({
+  error,
+  onClose,
+  onOpenCompletedDetail,
+  state,
+  template,
+  workouts,
+}: {
+  error: string | null;
+  onClose: () => void;
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
+  state: LoadState;
+  template: FitnessWorkoutTemplate;
+  workouts: FitnessScheduledWorkout[];
+}) {
+  return (
+    <Dialog onClose={onClose} title={`${template.name} Historical`}>
+      <div className="space-y-3">
+        <ErrorState message={error} />
+        {state === "loading" && <EmptyState>Loading historical workouts...</EmptyState>}
+        {state !== "loading" && workouts.length === 0 && (
+          <EmptyState>No completed workouts found for this template.</EmptyState>
+        )}
+        {workouts.map((workout) => (
+          <CompletedWorkoutSummaryRow
+            key={workout.id}
+            onOpenCompletedDetail={onOpenCompletedDetail}
+            workout={workout}
+          />
+        ))}
+        <div className="flex justify-end">
+          <button className={secondaryButtonClasses} onClick={onClose} type="button">
+            Close
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function TemplatesView({
+  onOpenCompletedDetail,
+}: {
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
+}) {
   const [templates, setTemplates] = useState<FitnessWorkoutTemplate[]>([]);
   const [exercises, setExercises] = useState<WeightliftingExercise[]>([]);
   const [selected, setSelected] = useState<FitnessWorkoutTemplate | null>(null);
+  const [historicalTemplate, setHistoricalTemplate] = useState<FitnessWorkoutTemplate | null>(null);
+  const [historicalWorkouts, setHistoricalWorkouts] = useState<FitnessScheduledWorkout[]>([]);
+  const [historicalState, setHistoricalState] = useState<LoadState>("idle");
+  const [historicalError, setHistoricalError] = useState<string | null>(null);
   const [includeArchived, setIncludeArchived] = useState(false);
   const [type, setType] = useState<FitnessWorkoutType>("RUNNING");
   const [name, setName] = useState("");
@@ -1639,6 +1860,20 @@ function TemplatesView() {
     }
   };
 
+  const openHistorical = async (template: FitnessWorkoutTemplate) => {
+    setHistoricalTemplate(template);
+    setHistoricalWorkouts([]);
+    setHistoricalState("loading");
+    setHistoricalError(null);
+    try {
+      setHistoricalWorkouts(await listCompletedWorkoutsForTemplate(template.id));
+    } catch (caught) {
+      setHistoricalError(messageFromError(caught, "Unable to load historical workouts."));
+    } finally {
+      setHistoricalState("idle");
+    }
+  };
+
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
       <div className="space-y-4">
@@ -1679,6 +1914,9 @@ function TemplatesView() {
               <div className="mt-4 flex flex-wrap gap-2">
                 <button className={secondaryButtonClasses} onClick={() => void editTemplate(template)} type="button">
                   Edit
+                </button>
+                <button className={secondaryButtonClasses} onClick={() => void openHistorical(template)} type="button">
+                  Historical
                 </button>
                 <button
                   className={secondaryButtonClasses}
@@ -1751,6 +1989,16 @@ function TemplatesView() {
           </button>
         </form>
       </Panel>
+      {historicalTemplate && (
+        <TemplateHistoricalDialog
+          error={historicalError}
+          onClose={() => setHistoricalTemplate(null)}
+          onOpenCompletedDetail={onOpenCompletedDetail}
+          state={historicalState}
+          template={historicalTemplate}
+          workouts={historicalWorkouts}
+        />
+      )}
     </div>
   );
 }
@@ -1837,11 +2085,18 @@ function PlanItemEditor({
   );
 }
 
-function PlansView() {
+function PlansView({
+  onOpenCompletedDetail,
+}: {
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
+}) {
   const [plans, setPlans] = useState<FitnessPlanTemplate[]>([]);
   const [instances, setInstances] = useState<FitnessPlanInstance[]>([]);
   const [templates, setTemplates] = useState<FitnessWorkoutTemplate[]>([]);
   const [selected, setSelected] = useState<FitnessPlanTemplate | null>(null);
+  const [expandedInstanceId, setExpandedInstanceId] = useState<string | null>(null);
+  const [instanceDetails, setInstanceDetails] = useState<Record<string, FitnessPlanInstance>>({});
+  const [loadingInstanceId, setLoadingInstanceId] = useState<string | null>(null);
   const [includeArchived, setIncludeArchived] = useState(false);
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
@@ -1863,6 +2118,8 @@ function PlansView() {
       const instanceList = await listPlanInstances();
       setPlans(planList);
       setInstances(instanceList);
+      setInstanceDetails({});
+      setExpandedInstanceId(null);
       setTemplates(templateList);
     } catch (caught) {
       setError(messageFromError(caught, "Unable to load training plans."));
@@ -2009,6 +2266,30 @@ function PlansView() {
     }
   };
 
+  const toggleInstance = async (instance: FitnessPlanInstance) => {
+    if (expandedInstanceId === instance.id) {
+      setExpandedInstanceId(null);
+      return;
+    }
+    setExpandedInstanceId(instance.id);
+    setError(null);
+    if (instanceDetails[instance.id]) {
+      return;
+    }
+    setLoadingInstanceId(instance.id);
+    try {
+      const detail = await getPlanInstance(instance.id);
+      setInstanceDetails((current) => ({
+        ...current,
+        [instance.id]: detail,
+      }));
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to load plan instance workouts."));
+    } finally {
+      setLoadingInstanceId(null);
+    }
+  };
+
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_26rem]">
       <div className="space-y-4">
@@ -2077,6 +2358,9 @@ function PlansView() {
                   </Pill>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
+                  <button className={secondaryButtonClasses} disabled={mutating || loadingInstanceId === instance.id} onClick={() => void toggleInstance(instance)} type="button">
+                    {expandedInstanceId === instance.id ? "Hide workouts" : "View workouts"}
+                  </button>
                   <button className={secondaryButtonClasses} disabled={mutating} onClick={() => void cleanupInstance(instance, "unstarted")} type="button">
                     Remove unstarted
                   </button>
@@ -2084,6 +2368,51 @@ function PlansView() {
                     Remove remaining
                   </button>
                 </div>
+                {expandedInstanceId === instance.id && (
+                  <div className="mt-3 space-y-2 border-t border-slate-200 pt-3">
+                    {loadingInstanceId === instance.id && (
+                      <EmptyState>Loading attached workouts...</EmptyState>
+                    )}
+                    {loadingInstanceId !== instance.id &&
+                      (instanceDetails[instance.id]?.scheduled_workouts ?? []).length === 0 && (
+                        <EmptyState>No scheduled workouts found for this instance.</EmptyState>
+                      )}
+                    {(instanceDetails[instance.id]?.scheduled_workouts ?? []).map((workout) => {
+                      const result = workout.running_result;
+                      return (
+                        <div
+                          className="rounded-md border border-slate-200 bg-white p-3"
+                          key={workout.id}
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div>
+                              <div className="font-black text-slate-950">{workout.workout_name}</div>
+                              <div className="text-sm font-semibold text-slate-600">{formatDate(workout.scheduled_date)}</div>
+                            </div>
+                            <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
+                          </div>
+                          {workout.status === "COMPLETED" && (
+                            <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                              <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
+                              <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
+                              <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
+                              <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+                            </div>
+                          )}
+                          {workout.status === "COMPLETED" && (
+                            <button
+                              className={`${secondaryButtonClasses} mt-3`}
+                              onClick={() => onOpenCompletedDetail(workout)}
+                              type="button"
+                            >
+                              Open detail
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </article>
             ))}
           </div>
@@ -2179,6 +2508,7 @@ function FitnessScreen() {
   const [completeWorkout, setCompleteWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [rescheduleWorkout, setRescheduleWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [editWorkout, setEditWorkout] = useState<FitnessScheduledWorkout | null>(null);
+  const [detailWorkout, setDetailWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -2328,6 +2658,19 @@ function FitnessScreen() {
     completeWorkoutAction(workout).catch(() => undefined);
   };
 
+  const openCompletedDetail = async (workout: FitnessScheduledWorkout) => {
+    if (workout.status !== "COMPLETED") {
+      return;
+    }
+    setMutationError(null);
+    setDetailWorkout(workout);
+    try {
+      setDetailWorkout(await getScheduledWorkout(workout.id));
+    } catch (caught) {
+      setMutationError(messageFromError(caught, "Unable to open workout detail."));
+    }
+  };
+
   return (
     <main className="mx-auto max-w-7xl px-4 py-6">
       <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
@@ -2390,6 +2733,7 @@ function FitnessScreen() {
           <TrainingCalendarView
             onComplete={requestComplete}
             onEdit={setEditWorkout}
+            onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)}
             onRemove={(workout) => void removeWorkoutAction(workout)}
             onReschedule={setRescheduleWorkout}
             onSkip={(workout) => void skipWorkoutAction(workout)}
@@ -2398,8 +2742,12 @@ function FitnessScreen() {
             refreshToken={refreshKey}
           />
         )}
-        {activeTab === "templates" && <TemplatesView />}
-        {activeTab === "plans" && <PlansView />}
+        {activeTab === "templates" && (
+          <TemplatesView onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)} />
+        )}
+        {activeTab === "plans" && (
+          <PlansView onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)} />
+        )}
         {activeTab === "weightlifting" && <WeightliftingBoundaryView />}
       </div>
 
@@ -2425,6 +2773,12 @@ function FitnessScreen() {
           onSubmit={(workoutTemplateId) => replaceWorkoutTemplateAction(editWorkout, workoutTemplateId, false)}
           submitting={pendingAction === `edit:${editWorkout.id}`}
           workout={editWorkout}
+        />
+      )}
+      {detailWorkout && (
+        <CompletedWorkoutDetailDialog
+          onClose={() => setDetailWorkout(null)}
+          workout={detailWorkout}
         />
       )}
     </main>

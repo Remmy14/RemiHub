@@ -1511,6 +1511,26 @@ def list_workout_history(
         put_db_conn(conn)
 
 
+def list_completed_workouts_for_template(*, user_id: str, template_id: str) -> list[dict]:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _get_workout_template(cur, user_id=user_id, template_id=template_id)
+            cur.execute(
+                _scheduled_select()
+                + """
+                WHERE scheduled.user_id = %s
+                  AND scheduled.workout_template_id = %s
+                  AND scheduled.status = 'COMPLETED'
+                ORDER BY scheduled.scheduled_date DESC, scheduled.updated_at DESC, scheduled.id DESC
+                """,
+                (user_id, template_id),
+            )
+            return _scheduled_rows_to_dicts(cur, cur.fetchall())
+    finally:
+        put_db_conn(conn)
+
+
 class HistoricalEffortAdapter:
     workout_type: str
     metrics: tuple[HistoricalMetricDefinition, ...]

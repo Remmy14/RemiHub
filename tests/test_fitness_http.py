@@ -194,6 +194,36 @@ class FitnessHttpTests(unittest.TestCase):
         self.assertEqual(historical.call_args.kwargs["scheduled_workout_id"], "scheduled")
         self.assertEqual(historical.call_args.kwargs["limit"], "all")
 
+    def test_template_completed_workouts_route_requires_strict_principal_dependency(self):
+        route = next(
+            route
+            for route in fitness.router.routes
+            if getattr(route, "path", "") == "/fitness/workout-templates/{template_id}/completed-workouts"
+            and "GET" in getattr(route, "methods", set())
+        )
+
+        dependency_calls = [
+            dependency.call
+            for dependency in route.dependant.dependencies
+        ]
+
+        self.assertIn(require_current_principal, dependency_calls)
+
+    def test_template_completed_workouts_route_delegates_owner_and_template(self):
+        history = MagicMock(return_value=[])
+        with patch(
+            "backend.routers.fitness.fitness_service.list_completed_workouts_for_template",
+            history,
+        ):
+            response = fitness.list_completed_workouts_for_template(
+                "template",
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(history.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(history.call_args.kwargs["template_id"], "template")
+
     def test_historical_efforts_route_maps_validation_errors(self):
         with patch(
             "backend.routers.fitness.fitness_service.get_historical_efforts",

@@ -1499,6 +1499,72 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertEqual(history[0]["running_result"]["planned_distance_miles"], 5.0)
         self.assertEqual(history[0]["running_result"]["duration_seconds"], 1860)
 
+    def test_template_completed_workouts_query_uses_template_id(self):
+        connection, patches = self.patch_connection(
+            [
+                (TEMPLATE_COLUMNS, [RUNNING_TEMPLATE_ROW]),
+                (SCHEDULED_COLUMNS, [COMPLETED_RUNNING_ROW]),
+            ]
+        )
+
+        with patches:
+            history = fitness_service.list_completed_workouts_for_template(
+                user_id=USER_ID,
+                template_id=TEMPLATE_ID,
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("scheduled.workout_template_id = %s", sql)
+        self.assertIn("scheduled.status = 'COMPLETED'", sql)
+        self.assertNotIn("workout_name", sql.split("WHERE", 1)[1])
+        self.assertEqual(params, (USER_ID, TEMPLATE_ID))
+        self.assertEqual(history[0]["id"], SCHEDULED_ID)
+        self.assertEqual(history[0]["running_result"]["duration_seconds"], 1860)
+
+    def test_template_completed_workouts_excludes_identically_named_other_templates(self):
+        second_completed = list(COMPLETED_RUNNING_ROW)
+        second_completed[0] = SECOND_SCHEDULED_ID
+        second_completed[2] = SECOND_TEMPLATE_ID
+        second_completed[10] = "Long Run"
+        connection, patches = self.patch_connection(
+            [
+                (TEMPLATE_COLUMNS, [RUNNING_TEMPLATE_ROW]),
+                (SCHEDULED_COLUMNS, [COMPLETED_RUNNING_ROW]),
+            ]
+        )
+
+        with patches:
+            history = fitness_service.list_completed_workouts_for_template(
+                user_id=USER_ID,
+                template_id=TEMPLATE_ID,
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("scheduled.workout_template_id = %s", sql)
+        self.assertEqual(params[1], TEMPLATE_ID)
+        self.assertEqual([workout["id"] for workout in history], [SCHEDULED_ID])
+        self.assertNotIn(SECOND_SCHEDULED_ID, [workout["id"] for workout in history])
+
+    def test_template_completed_workouts_handles_completed_without_running_result(self):
+        completed_without_result = list(COMPLETED_RUNNING_ROW)
+        for index in range(15, 21):
+            completed_without_result[index] = None
+        connection, patches = self.patch_connection(
+            [
+                (TEMPLATE_COLUMNS, [RUNNING_TEMPLATE_ROW]),
+                (SCHEDULED_COLUMNS, [tuple(completed_without_result)]),
+            ]
+        )
+
+        with patches:
+            history = fitness_service.list_completed_workouts_for_template(
+                user_id=USER_ID,
+                template_id=TEMPLATE_ID,
+            )
+
+        self.assertEqual(history[0]["status"], "COMPLETED")
+        self.assertIsNone(history[0]["running_result"])
+
     def test_running_result_exposes_persisted_garmin_metrics(self):
         workout = dict(zip(SCHEDULED_COLUMNS, COMPLETED_RUNNING_ROW))
         workout.update(
@@ -2024,6 +2090,36 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertEqual(instance["id"], PLAN_INSTANCE_ID)
         self.assertEqual(len(instance["scheduled_workouts"]), 1)
         self.assertEqual(instance["scheduled_workouts"][0]["planned_distance_miles"], 5.0)
+
+    def test_get_plan_instance_uses_exact_instance_id_for_workouts(self):
+        same_named_other_instance_id = "44444444-4444-4444-8444-444444444444"
+        same_named_other_instance = list(COMPLETED_RUNNING_ROW)
+        same_named_other_instance[3] = same_named_other_instance_id
+        same_named_other_instance[10] = "Long Run"
+        included = list(COMPLETED_RUNNING_ROW)
+        included[3] = PLAN_INSTANCE_ID
+        connection, patches = self.patch_connection(
+            [
+                (PLAN_INSTANCE_COLUMNS, [PLAN_INSTANCE_ROW]),
+                (SCHEDULED_COLUMNS, [tuple(included)]),
+            ]
+        )
+
+        with patches:
+            instance = fitness_service.get_plan_instance(
+                user_id=USER_ID,
+                instance_id=PLAN_INSTANCE_ID,
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("scheduled.plan_instance_id = %s", sql)
+        self.assertNotIn("workout_name", sql.split("WHERE", 1)[1])
+        self.assertEqual(params, (USER_ID, PLAN_INSTANCE_ID))
+        self.assertEqual([workout["id"] for workout in instance["scheduled_workouts"]], [SCHEDULED_ID])
+        self.assertNotIn(
+            same_named_other_instance_id,
+            [workout["plan_instance_id"] for workout in instance["scheduled_workouts"]],
+        )
 
     def test_complete_plan_instance_finishes_active_instance(self):
         connection, patches = self.patch_connection(

@@ -17,6 +17,31 @@ export type FitnessRunningResult = {
   completed_distance_miles: number;
   duration_seconds: number;
   notes: string | null;
+  external_provider: string | null;
+  external_activity_id: string | null;
+  external_activity_uuid: string | null;
+  external_activity_name: string | null;
+  moving_duration_seconds: number | null;
+  average_speed_meters_per_second: number | null;
+  average_hr: number | null;
+  max_hr: number | null;
+  training_load: number | null;
+  aerobic_training_effect: number | null;
+  anaerobic_training_effect: number | null;
+  training_effect_label: string | null;
+  vo2_max: number | null;
+  hr_zone_1_seconds: number | null;
+  hr_zone_2_seconds: number | null;
+  hr_zone_3_seconds: number | null;
+  hr_zone_4_seconds: number | null;
+  hr_zone_5_seconds: number | null;
+  average_cadence_spm: number | null;
+  average_power_watts: number | null;
+  average_stride_length_meters: number | null;
+  elevation_gain_meters: number | null;
+  elevation_loss_meters: number | null;
+  calories: number | null;
+  steps: number | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -375,6 +400,15 @@ export async function getWorkoutTemplate(
   return response.data;
 }
 
+export async function listCompletedWorkoutsForTemplate(
+  templateId: string,
+): Promise<FitnessScheduledWorkout[]> {
+  const response = await apiRequest<FitnessResponse<FitnessScheduledWorkout[]>>(
+    `/fitness/workout-templates/${templateId}/completed-workouts`,
+  );
+  return response.data;
+}
+
 export type WorkoutTemplatePayload = {
   name: string;
   type: FitnessWorkoutType;
@@ -546,6 +580,15 @@ export async function instantiatePlanTemplate(
 export async function listPlanInstances(): Promise<FitnessPlanInstance[]> {
   const response = await apiRequest<FitnessResponse<FitnessPlanInstance[]>>(
     "/fitness/plan-instances",
+  );
+  return response.data;
+}
+
+export async function getPlanInstance(
+  planInstanceId: string,
+): Promise<FitnessPlanInstance> {
+  const response = await apiRequest<FitnessResponse<FitnessPlanInstance>>(
+    `/fitness/plan-instances/${planInstanceId}`,
   );
   return response.data;
 }
