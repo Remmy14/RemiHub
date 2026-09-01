@@ -173,6 +173,48 @@ COMPLETED_RUNNING_ROW[19] = NOW
 COMPLETED_RUNNING_ROW[20] = NOW
 COMPLETED_RUNNING_ROW = tuple(COMPLETED_RUNNING_ROW)
 
+COMPLETED_LIFTING_ROW = list(PLANNED_RUNNING_ROW)
+COMPLETED_LIFTING_ROW[6] = "COMPLETED"
+COMPLETED_LIFTING_ROW[9] = None
+COMPLETED_LIFTING_ROW[10] = "Regular Lifting Day"
+COMPLETED_LIFTING_ROW[11] = "LIFTING"
+COMPLETED_LIFTING_ROW = tuple(COMPLETED_LIFTING_ROW)
+
+LIFTING_RESULT_COLUMNS = [
+    "scheduled_workout_id",
+    "id",
+    "exercise_id",
+    "exercise_name",
+    "weight_unit",
+    "week_start",
+    "workout_day_slot",
+    "workout_date",
+    "weight",
+    "reps",
+    "sets",
+    "notes",
+    "completed",
+    "created_at",
+    "updated_at",
+]
+LIFTING_RESULT_ROW = (
+    SCHEDULED_ID,
+    "44444444-4444-4444-8444-444444444444",
+    EXERCISE_ID,
+    "Bench Press",
+    "lb",
+    date(2026, 8, 31),
+    1,
+    date(2026, 8, 31),
+    Decimal("135.00"),
+    10,
+    3,
+    "solid",
+    True,
+    NOW,
+    NOW,
+)
+
 HISTORICAL_EFFORT_COLUMNS = [
     "scheduled_workout_id",
     "scheduled_date",
@@ -1564,6 +1606,80 @@ class FitnessServiceTests(unittest.TestCase):
 
         self.assertEqual(history[0]["status"], "COMPLETED")
         self.assertIsNone(history[0]["running_result"])
+
+    def test_completed_lifting_workout_exposes_linked_weightlifting_results(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [COMPLETED_LIFTING_ROW]),
+                (LIFTING_RESULT_COLUMNS, [LIFTING_RESULT_ROW]),
+            ]
+        )
+
+        with patches:
+            workout = fitness_service.get_scheduled_workout(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        lifting_sql, lifting_params = connection.cursor_instance.executed[1]
+        self.assertIn("entry.fitness_scheduled_workout_id = ANY", lifting_sql)
+        self.assertIn("entry.completed = true", lifting_sql)
+        self.assertNotIn("workout_name", lifting_sql)
+        self.assertEqual(lifting_params, (USER_ID, [SCHEDULED_ID]))
+        self.assertIsNone(workout["running_result"])
+        self.assertEqual(
+            workout["lifting_result"]["fitness_scheduled_workout_id"],
+            SCHEDULED_ID,
+        )
+        self.assertEqual(workout["lifting_result"]["entries"][0]["exercise_name"], "Bench Press")
+        self.assertEqual(workout["lifting_result"]["entries"][0]["sets"], 3)
+        self.assertEqual(workout["lifting_result"]["entries"][0]["reps"], 10)
+        self.assertEqual(workout["lifting_result"]["entries"][0]["weight"], 135.0)
+
+    def test_completed_lifting_workout_without_linked_entries_is_null_result(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [COMPLETED_LIFTING_ROW]),
+                (LIFTING_RESULT_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            workout = fitness_service.get_scheduled_workout(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        self.assertEqual(workout["status"], "COMPLETED")
+        self.assertIsNone(workout["lifting_result"])
+
+    def test_completed_lifting_result_uses_durable_linkage_not_name_or_date(self):
+        similar_unlinked_row = list(LIFTING_RESULT_ROW)
+        similar_unlinked_row[0] = SECOND_SCHEDULED_ID
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [COMPLETED_LIFTING_ROW]),
+                (LIFTING_RESULT_COLUMNS, [LIFTING_RESULT_ROW]),
+            ]
+        )
+
+        with patches:
+            workout = fitness_service.get_scheduled_workout(
+                user_id=USER_ID,
+                scheduled_workout_id=SCHEDULED_ID,
+            )
+
+        lifting_sql, lifting_params = connection.cursor_instance.executed[1]
+        self.assertIn("entry.fitness_scheduled_workout_id = ANY", lifting_sql)
+        self.assertEqual(lifting_params[1], [SCHEDULED_ID])
+        self.assertEqual(
+            [entry["scheduled_workout_id"] for entry in workout["lifting_result"]["entries"]],
+            [SCHEDULED_ID],
+        )
+        self.assertNotIn(
+            similar_unlinked_row[0],
+            [entry["scheduled_workout_id"] for entry in workout["lifting_result"]["entries"]],
+        )
 
     def test_running_result_exposes_persisted_garmin_metrics(self):
         workout = dict(zip(SCHEDULED_COLUMNS, COMPLETED_RUNNING_ROW))

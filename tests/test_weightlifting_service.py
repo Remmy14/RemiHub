@@ -111,6 +111,40 @@ ENTRY_ROW = (
     NOW,
     NOW,
 )
+LINKED_ENTRY_COLUMNS = [
+    "scheduled_workout_id",
+    "id",
+    "exercise_id",
+    "exercise_name",
+    "weight_unit",
+    "week_start",
+    "workout_day_slot",
+    "workout_date",
+    "weight",
+    "reps",
+    "sets",
+    "notes",
+    "completed",
+    "created_at",
+    "updated_at",
+]
+LINKED_ENTRY_ROW = (
+    "55555555-5555-4555-8555-555555555555",
+    ENTRY_ID,
+    EXERCISE_ID,
+    "Bench Press",
+    "lb",
+    date(2026, 8, 3),
+    1,
+    date(2026, 8, 3),
+    Decimal("135.00"),
+    10,
+    3,
+    "solid",
+    True,
+    NOW,
+    NOW,
+)
 
 
 def configured_slot_responses(slot: int = 1):
@@ -443,6 +477,46 @@ class WeightliftingServiceDatabaseTests(unittest.TestCase):
         self.assertIn("template.workout_type = 'LIFTING'", linkage_sql)
         self.assertTrue(upsert_params[-1])
         self.assertEqual(entry["fitness_scheduled_workout_id"], scheduled_workout_id)
+
+    def test_get_entries_for_fitness_scheduled_workout_uses_durable_linkage(self):
+        scheduled_workout_id = "55555555-5555-4555-8555-555555555555"
+        connection, patches = self.patch_connection(
+            [
+                (LINKED_ENTRY_COLUMNS, [LINKED_ENTRY_ROW]),
+            ]
+        )
+
+        with patches:
+            result = weightlifting_service.get_entries_for_fitness_scheduled_workout(
+                user_id=USER_ID,
+                fitness_scheduled_workout_id=scheduled_workout_id,
+            )
+
+        sql, params = connection.cursor_instance.executed[0]
+        self.assertIn("entry.fitness_scheduled_workout_id = %s", sql)
+        self.assertIn("entry.completed = true", sql)
+        self.assertNotIn("exercise.name = %s", sql)
+        self.assertNotIn("workout_date = %s", sql)
+        self.assertEqual(params, (USER_ID, scheduled_workout_id))
+        self.assertEqual(result["entries"][0]["exercise_name"], "Bench Press")
+        self.assertEqual(result["entries"][0]["sets"], 3)
+        self.assertEqual(result["entries"][0]["reps"], 10)
+        self.assertEqual(result["entries"][0]["weight"], 135.0)
+
+    def test_get_entries_for_fitness_scheduled_workout_returns_none_when_missing(self):
+        connection, patches = self.patch_connection(
+            [
+                (LINKED_ENTRY_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            result = weightlifting_service.get_entries_for_fitness_scheduled_workout(
+                user_id=USER_ID,
+                fitness_scheduled_workout_id="55555555-5555-4555-8555-555555555555",
+            )
+
+        self.assertIsNone(result)
 
     def test_upsert_rejects_slot_that_is_not_currently_configured(self):
         connection, patches = self.patch_connection(

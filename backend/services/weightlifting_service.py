@@ -561,6 +561,57 @@ def _entry_select() -> str:
     """
 
 
+def get_entries_for_fitness_scheduled_workout(
+    *,
+    user_id: str,
+    fitness_scheduled_workout_id: str,
+) -> dict | None:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entry.fitness_scheduled_workout_id AS scheduled_workout_id,
+                       entry.id,
+                       entry.exercise_id,
+                       exercise.name AS exercise_name,
+                       exercise.weight_unit,
+                       entry.week_start,
+                       entry.workout_day_slot,
+                       entry.workout_date,
+                       entry.weight,
+                       entry.reps,
+                       entry.sets,
+                       entry.notes,
+                       entry.completed,
+                       entry.created_at,
+                       entry.updated_at
+                FROM public.weightlifting_entries AS entry
+                JOIN public.weightlifting_exercises AS exercise
+                  ON exercise.id = entry.exercise_id
+                 AND exercise.user_id = entry.user_id
+                WHERE entry.user_id = %s
+                  AND entry.fitness_scheduled_workout_id = %s
+                  AND entry.completed = true
+                ORDER BY exercise.display_order,
+                         exercise.name,
+                         entry.workout_day_slot,
+                         entry.updated_at,
+                         entry.id
+                """,
+                (user_id, fitness_scheduled_workout_id),
+            )
+            entries = _rows_to_dicts(cur, cur.fetchall())
+        if not entries:
+            return None
+        return {
+            "fitness_scheduled_workout_id": fitness_scheduled_workout_id,
+            "entries": entries,
+        }
+    finally:
+        put_db_conn(conn)
+
+
 def _validate_fitness_lifting_workout(
     cur,
     *,

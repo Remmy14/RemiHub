@@ -295,6 +295,12 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertIn("workout.status === \"COMPLETED\"", screen_source)
         self.assertIn("getScheduledWorkout(workout.id)", screen_source)
         self.assertIn("resultSourceLabel(workout)", screen_source)
+        self.assertIn("liftingEntryLabel", screen_source)
+        self.assertIn("No recorded workout details are available.", screen_source)
+        self.assertNotIn(
+            "This completed workout does not have external result metrics.",
+            screen_source,
+        )
         self.assertIn("listCompletedWorkoutsForTemplate", api_source)
         self.assertIn("/completed-workouts", api_source)
 
@@ -328,6 +334,37 @@ class FrontendWebPortalTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertIn(field, source)
+
+    def test_fitness_frontend_models_lifting_results_as_aggregate_entries(self):
+        api_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "fitnessApi.ts"
+        ).read_text(encoding="utf-8")
+        screen_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for field in (
+            "export type FitnessLiftingEntry",
+            "exercise_name: string",
+            "weight: number",
+            "reps: number",
+            "sets: number | null",
+            "notes: string | null",
+            "lifting_result: FitnessLiftingResult | null",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, api_source)
+
+        self.assertIn("function liftingEntryLabel", screen_source)
+        self.assertIn("sets\"} x ${reps} @ ${weight}", screen_source)
+        self.assertNotIn("Set 1", screen_source)
 
     def test_fitness_frontend_exposes_template_and_plan_history_by_id(self):
         source = (

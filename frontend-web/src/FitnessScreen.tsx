@@ -222,6 +222,15 @@ function resultSourceLabel(workout: FitnessScheduledWorkout): string | null {
     .replace(/(^|_)([a-z])/g, (_match, prefix: string, letter: string) => `${prefix ? " " : ""}${letter.toUpperCase()}`);
 }
 
+function liftingEntryLabel(entry: NonNullable<FitnessScheduledWorkout["lifting_result"]>["entries"][number]): string {
+  const weight = `${entry.weight.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${entry.weight_unit}`;
+  const reps = `${entry.reps.toLocaleString()} ${entry.reps === 1 ? "rep" : "reps"}`;
+  if (entry.sets === null || entry.sets === undefined) {
+    return `${reps} @ ${weight}`;
+  }
+  return `${entry.sets.toLocaleString()} ${entry.sets === 1 ? "set" : "sets"} x ${reps} @ ${weight}`;
+}
+
 function messageFromError(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
@@ -744,6 +753,7 @@ function CompletedWorkoutDetailDialog({
   workout: FitnessScheduledWorkout;
 }) {
   const result = workout.running_result;
+  const liftingResult = workout.lifting_result;
   const sourceLabel = resultSourceLabel(workout);
   const detailMetrics: Array<{ label: string; value: ReactNode | null }> = [
     { label: "Workout date", value: formatDate(workout.scheduled_date) },
@@ -777,6 +787,7 @@ function CompletedWorkoutDetailDialog({
     { label: "VO2 max", value: numberLabel(result?.vo2_max) },
   ];
   const visibleMetrics = detailMetrics.filter((metric) => metric.value !== null);
+  const hasLiftingDetails = Boolean(liftingResult?.entries.length);
 
   return (
     <Dialog onClose={onClose} title={workout.workout_name || "Completed workout"}>
@@ -799,9 +810,26 @@ function CompletedWorkoutDetailDialog({
             <Metric key={metric.label} label={metric.label} value={metric.value} />
           ))}
         </div>
-        {!result && (
+        {hasLiftingDetails && liftingResult && (
+          <div className="space-y-3">
+            {liftingResult.entries.map((entry) => (
+              <div className="rounded-md border border-slate-200 bg-white p-3" key={entry.id}>
+                <div className="font-black text-slate-950">{entry.exercise_name}</div>
+                <div className="mt-1 text-sm font-semibold text-slate-700">
+                  {liftingEntryLabel(entry)}
+                </div>
+                {entry.notes && (
+                  <p className="mt-2 rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-700">
+                    {entry.notes}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {!result && !hasLiftingDetails && (
           <EmptyState>
-            This completed workout does not have external result metrics.
+            No recorded workout details are available.
           </EmptyState>
         )}
         {result?.notes && (
@@ -1662,6 +1690,8 @@ function CompletedWorkoutSummaryRow({
   workout: FitnessScheduledWorkout;
 }) {
   const result = workout.running_result;
+  const liftingResult = workout.lifting_result;
+  const firstLift = liftingResult?.entries[0];
 
   return (
     <button
@@ -1677,10 +1707,21 @@ function CompletedWorkoutSummaryRow({
         <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
       </div>
       <div className="mt-3 grid gap-2 sm:grid-cols-4">
-        <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
-        <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
-        <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
-        <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+        {workout.type === "LIFTING" ? (
+          <>
+            <MiniStat label="Exercises" value={liftingResult?.entries.length ?? "N/A"} />
+            <MiniStat label="First lift" value={firstLift?.exercise_name ?? "N/A"} />
+            <MiniStat label="Result" value={firstLift ? liftingEntryLabel(firstLift) : "N/A"} />
+            <MiniStat label="Date" value={firstLift?.workout_date ? formatDate(firstLift.workout_date) : formatDate(workout.scheduled_date)} />
+          </>
+        ) : (
+          <>
+            <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
+            <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
+            <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
+            <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+          </>
+        )}
       </div>
     </button>
   );
@@ -2379,6 +2420,8 @@ function PlansView({
                       )}
                     {(instanceDetails[instance.id]?.scheduled_workouts ?? []).map((workout) => {
                       const result = workout.running_result;
+                      const liftingResult = workout.lifting_result;
+                      const firstLift = liftingResult?.entries[0];
                       return (
                         <div
                           className="rounded-md border border-slate-200 bg-white p-3"
@@ -2393,10 +2436,21 @@ function PlansView({
                           </div>
                           {workout.status === "COMPLETED" && (
                             <div className="mt-3 grid gap-2 sm:grid-cols-4">
-                              <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
-                              <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
-                              <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
-                              <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+                              {workout.type === "LIFTING" ? (
+                                <>
+                                  <MiniStat label="Exercises" value={liftingResult?.entries.length ?? "N/A"} />
+                                  <MiniStat label="First lift" value={firstLift?.exercise_name ?? "N/A"} />
+                                  <MiniStat label="Result" value={firstLift ? liftingEntryLabel(firstLift) : "N/A"} />
+                                  <MiniStat label="Date" value={firstLift?.workout_date ? formatDate(firstLift.workout_date) : formatDate(workout.scheduled_date)} />
+                                </>
+                              ) : (
+                                <>
+                                  <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
+                                  <MiniStat label="Duration" value={result ? formatDuration(result.duration_seconds) : "N/A"} />
+                                  <MiniStat label="Pace" value={result ? paceLabel(result.completed_distance_miles, result.duration_seconds) ?? "N/A" : "N/A"} />
+                                  <MiniStat label="Avg HR" value={numberLabel(result?.average_hr, " bpm", 0) ?? "N/A"} />
+                                </>
+                              )}
                             </div>
                           )}
                           {workout.status === "COMPLETED" && (

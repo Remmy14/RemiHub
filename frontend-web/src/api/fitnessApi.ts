@@ -46,6 +46,29 @@ export type FitnessRunningResult = {
   updated_at: string | null;
 };
 
+export type FitnessLiftingEntry = {
+  scheduled_workout_id: string;
+  id: string;
+  exercise_id: string;
+  exercise_name: string;
+  weight_unit: "lb" | "kg" | string;
+  week_start: string;
+  workout_day_slot: number;
+  workout_date: string | null;
+  weight: number;
+  reps: number;
+  sets: number | null;
+  notes: string | null;
+  completed: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type FitnessLiftingResult = {
+  fitness_scheduled_workout_id: string;
+  entries: FitnessLiftingEntry[];
+};
+
 export type FitnessScheduledWorkout = {
   id: string;
   user_id: string;
@@ -61,6 +84,7 @@ export type FitnessScheduledWorkout = {
   type: FitnessWorkoutType;
   source?: FitnessWorkoutSource;
   running_result: FitnessRunningResult | null;
+  lifting_result: FitnessLiftingResult | null;
   created_at: string | null;
   updated_at: string | null;
 };

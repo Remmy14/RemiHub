@@ -344,11 +344,76 @@ def _with_running_result(workout: dict) -> dict:
         "recurring_series_weekdays": cleaned.get("recurring_series_weekdays"),
     }
     cleaned["running_result"] = result
+    cleaned["lifting_result"] = None
     return cleaned
 
 
 def _scheduled_rows_to_dicts(cur, rows) -> list[dict]:
-    return [_with_running_result(row) for row in _rows_to_dicts(cur, rows)]
+    workouts = [_with_running_result(row) for row in _rows_to_dicts(cur, rows)]
+    _attach_lifting_results(cur, workouts)
+    return workouts
+
+
+def _scheduled_row_to_dict(cur, row) -> dict | None:
+    if not row:
+        return None
+    workouts = _scheduled_rows_to_dicts(cur, [row])
+    return workouts[0] if workouts else None
+
+
+def _attach_lifting_results(cur, workouts: list[dict]) -> None:
+    lifting_ids = [
+        workout["id"]
+        for workout in workouts
+        if workout.get("type") == "LIFTING" and workout.get("status") == "COMPLETED"
+    ]
+    if not lifting_ids:
+        return
+
+    cur.execute(
+        """
+        SELECT entry.fitness_scheduled_workout_id AS scheduled_workout_id,
+               entry.id,
+               entry.exercise_id,
+               exercise.name AS exercise_name,
+               exercise.weight_unit,
+               entry.week_start,
+               entry.workout_day_slot,
+               entry.workout_date,
+               entry.weight,
+               entry.reps,
+               entry.sets,
+               entry.notes,
+               entry.completed,
+               entry.created_at,
+               entry.updated_at
+        FROM public.weightlifting_entries AS entry
+        JOIN public.weightlifting_exercises AS exercise
+          ON exercise.id = entry.exercise_id
+         AND exercise.user_id = entry.user_id
+        WHERE entry.user_id = %s
+          AND entry.fitness_scheduled_workout_id = ANY(%s::uuid[])
+          AND entry.completed = true
+        ORDER BY entry.fitness_scheduled_workout_id,
+                 exercise.display_order,
+                 exercise.name,
+                 entry.workout_day_slot,
+                 entry.updated_at,
+                 entry.id
+        """,
+        (workouts[0]["user_id"], lifting_ids),
+    )
+    entries_by_workout: dict[str, list[dict]] = {}
+    for entry in _rows_to_dicts(cur, cur.fetchall()):
+        entries_by_workout.setdefault(entry["scheduled_workout_id"], []).append(entry)
+
+    for workout in workouts:
+        entries = entries_by_workout.get(workout["id"])
+        if entries:
+            workout["lifting_result"] = {
+                "fitness_scheduled_workout_id": workout["id"],
+                "entries": entries,
+            }
 
 
 def _get_workout_template(cur, *, user_id: str, template_id: str) -> dict:
@@ -1441,10 +1506,10 @@ def _get_scheduled_workout(
         + lock_clause,
         (scheduled_workout_id, user_id),
     )
-    workout = _row_to_dict(cur, cur.fetchone())
+    workout = _scheduled_row_to_dict(cur, cur.fetchone())
     if not workout:
         raise FitnessNotFoundError(f"Scheduled workout not found: {scheduled_workout_id}")
-    return _with_running_result(workout)
+    return workout
 
 
 def get_scheduled_workout(*, user_id: str, scheduled_workout_id: str) -> dict:
