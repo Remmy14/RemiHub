@@ -5,6 +5,8 @@ import {
   archivePlanTemplate,
   archiveWorkoutTemplate,
   completeScheduledWorkout,
+  completeScheduledWorkoutWithGarmin,
+  completeScheduledWorkoutWithGarminSelection,
   createPlanTemplate,
   createRecurringSeries,
   createScheduledWorkout,
@@ -81,6 +83,19 @@ const statusStyles = {
 const typeStyles = {
   RUNNING: "border-cyan-200 bg-cyan-50 text-cyan-800",
   LIFTING: "border-violet-200 bg-violet-50 text-violet-800",
+  CYCLING: "border-emerald-200 bg-emerald-50 text-emerald-800",
+};
+
+const typeLabels = {
+  RUNNING: "Running",
+  LIFTING: "Lifting",
+  CYCLING: "Cycling",
+};
+
+const compactTypeLabels = {
+  RUNNING: "Run",
+  LIFTING: "Lift",
+  CYCLING: "Ride",
 };
 
 const isoWeekdays = [
@@ -177,6 +192,16 @@ function formatDuration(seconds: number | null | undefined): string {
   return `${remaining}s`;
 }
 
+function templatePrescriptionLabel(template: FitnessWorkoutTemplate): string {
+  if (template.type === "RUNNING") {
+    return distanceLabel(template.planned_distance_miles);
+  }
+  if (template.type === "CYCLING") {
+    return formatDuration(template.planned_duration_seconds);
+  }
+  return "Lifting";
+}
+
 function distanceLabel(value: number | null | undefined): string {
   if (value === null || value === undefined) {
     return "No distance";
@@ -216,7 +241,7 @@ function speedLabel(metersPerSecond: number | null | undefined): string | null {
 }
 
 function resultSourceLabel(workout: FitnessScheduledWorkout): string | null {
-  const provider = workout.running_result?.external_provider;
+  const provider = workout.running_result?.external_provider ?? workout.cycling_result?.external_provider;
   if (!provider) {
     return null;
   }
@@ -359,7 +384,7 @@ function WorkoutSummary({
           </h3>
           <div className="mt-2 flex flex-wrap gap-2">
             <Pill className={typeStyles[workout.type]}>
-              {workout.type === "RUNNING" ? "Running" : "Lifting"}
+              {typeLabels[workout.type]}
             </Pill>
             <Pill className={statusStyles[workout.status]}>
               {workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
@@ -384,6 +409,9 @@ function WorkoutSummary({
         {workout.type === "RUNNING" && (
           <Metric label="Planned" value={distanceLabel(workout.planned_distance_miles)} />
         )}
+        {workout.type === "CYCLING" && (
+          <Metric label="Planned" value={formatDuration(workout.planned_duration_seconds)} />
+        )}
         {workout.running_result && (
           <>
             <Metric
@@ -393,6 +421,18 @@ function WorkoutSummary({
             <Metric
               label="Duration"
               value={formatDuration(workout.running_result.duration_seconds)}
+            />
+          </>
+        )}
+        {workout.cycling_result && (
+          <>
+            <Metric
+              label="Completed"
+              value={formatDuration(workout.cycling_result.duration_seconds)}
+            />
+            <Metric
+              label="Distance"
+              value={distanceLabel(workout.cycling_result.completed_distance_miles)}
             />
           </>
         )}
@@ -428,7 +468,7 @@ function WorkoutSummary({
               onClick={() => onComplete(workout)}
               type="button"
             >
-              {workout.type === "RUNNING" ? "Complete" : "Mark complete"}
+              {workout.type === "RUNNING" || workout.type === "CYCLING" ? "Complete" : "Mark complete"}
             </button>
             <button
               className={secondaryButtonClasses}
@@ -685,6 +725,9 @@ function WorkoutTemplateReplaceDialog({
           {workout.type === "RUNNING" && (
             <Metric label="Current planned" value={distanceLabel(workout.planned_distance_miles)} />
           )}
+          {workout.type === "CYCLING" && (
+            <Metric label="Current planned" value={formatDuration(workout.planned_duration_seconds)} />
+          )}
           {workout.source?.label && <Metric label="From" value={workout.source.label} />}
         </div>
         <Field label="Replacement template">
@@ -698,14 +741,13 @@ function WorkoutTemplateReplaceDialog({
             <option value="">Choose replacement template...</option>
             {templates.map((template) => (
               <option key={template.id} value={template.id}>
-                {template.name}
-                {template.type === "RUNNING" ? ` (${distanceLabel(template.planned_distance_miles)})` : " (Lifting)"}
+                {template.name} ({templatePrescriptionLabel(template)})
               </option>
             ))}
           </select>
         </Field>
-        {selectedTemplate && selectedTemplate.type === "RUNNING" && (
-          <Metric label="New planned" value={distanceLabel(selectedTemplate.planned_distance_miles)} />
+        {selectedTemplate && selectedTemplate.type !== "LIFTING" && (
+          <Metric label="New planned" value={templatePrescriptionLabel(selectedTemplate)} />
         )}
         {templates.length === 0 && state !== "loading" && (
           <EmptyState>No compatible active templates are available.</EmptyState>
@@ -759,36 +801,49 @@ function CompletedWorkoutDetailDialog({
   workout: FitnessScheduledWorkout;
 }) {
   const result = workout.running_result;
+  const cyclingResult = workout.cycling_result;
   const liftingResult = workout.lifting_result;
   const sourceLabel = resultSourceLabel(workout);
   const detailMetrics: Array<{ label: string; value: ReactNode | null }> = [
     { label: "Workout date", value: formatDate(workout.scheduled_date) },
-    { label: "Workout type", value: workout.type === "RUNNING" ? "Running" : "Lifting" },
+    { label: "Workout type", value: typeLabels[workout.type] },
     { label: "Status", value: workout.status },
     { label: "Planned distance", value: workout.type === "RUNNING" ? distanceLabel(workout.planned_distance_miles) : null },
+    { label: "Planned duration", value: workout.type === "CYCLING" ? formatDuration(workout.planned_duration_seconds) : null },
     { label: "Result source", value: sourceLabel },
     { label: "Distance", value: result ? distanceLabel(result.completed_distance_miles) : null },
+    { label: "Ride distance", value: cyclingResult ? distanceLabel(cyclingResult.completed_distance_miles) : null },
     { label: "Duration", value: result ? formatDuration(result.duration_seconds) : null },
+    { label: "Ride duration", value: cyclingResult ? formatDuration(cyclingResult.duration_seconds) : null },
     { label: "Moving duration", value: result?.moving_duration_seconds !== null && result?.moving_duration_seconds !== undefined ? formatDuration(result.moving_duration_seconds) : null },
+    { label: "Ride moving duration", value: cyclingResult?.moving_duration_seconds !== null && cyclingResult?.moving_duration_seconds !== undefined ? formatDuration(cyclingResult.moving_duration_seconds) : null },
     { label: "Average pace", value: result ? paceLabel(result.completed_distance_miles, result.duration_seconds) : null },
     { label: "Average speed", value: speedLabel(result?.average_speed_meters_per_second) },
-    { label: "Average HR", value: numberLabel(result?.average_hr, " bpm", 0) },
-    { label: "Max HR", value: numberLabel(result?.max_hr, " bpm", 0) },
-    { label: "Training load", value: numberLabel(result?.training_load) },
-    { label: "Aerobic effect", value: numberLabel(result?.aerobic_training_effect) },
-    { label: "Anaerobic effect", value: numberLabel(result?.anaerobic_training_effect) },
-    { label: "Training effect", value: result?.training_effect_label ?? null },
-    { label: "HR Zone 1", value: result?.hr_zone_1_seconds !== null && result?.hr_zone_1_seconds !== undefined ? formatDuration(result.hr_zone_1_seconds) : null },
-    { label: "HR Zone 2", value: result?.hr_zone_2_seconds !== null && result?.hr_zone_2_seconds !== undefined ? formatDuration(result.hr_zone_2_seconds) : null },
-    { label: "HR Zone 3", value: result?.hr_zone_3_seconds !== null && result?.hr_zone_3_seconds !== undefined ? formatDuration(result.hr_zone_3_seconds) : null },
-    { label: "HR Zone 4", value: result?.hr_zone_4_seconds !== null && result?.hr_zone_4_seconds !== undefined ? formatDuration(result.hr_zone_4_seconds) : null },
-    { label: "HR Zone 5", value: result?.hr_zone_5_seconds !== null && result?.hr_zone_5_seconds !== undefined ? formatDuration(result.hr_zone_5_seconds) : null },
+    { label: "Activity type", value: cyclingResult?.external_activity_type_key ?? null },
+    { label: "Manufacturer", value: cyclingResult?.external_manufacturer ?? null },
+    { label: "Average HR", value: numberLabel(result?.average_hr ?? cyclingResult?.average_hr, " bpm", 0) },
+    { label: "Max HR", value: numberLabel(result?.max_hr ?? cyclingResult?.max_hr, " bpm", 0) },
+    { label: "Training load", value: numberLabel(result?.training_load ?? cyclingResult?.training_load) },
+    { label: "Aerobic effect", value: numberLabel(result?.aerobic_training_effect ?? cyclingResult?.aerobic_training_effect) },
+    { label: "Anaerobic effect", value: numberLabel(result?.anaerobic_training_effect ?? cyclingResult?.anaerobic_training_effect) },
+    { label: "Training effect", value: result?.training_effect_label ?? cyclingResult?.training_effect_label ?? null },
+    { label: "HR Zone 1", value: result?.hr_zone_1_seconds !== null && result?.hr_zone_1_seconds !== undefined ? formatDuration(result.hr_zone_1_seconds) : cyclingResult?.hr_zone_1_seconds !== null && cyclingResult?.hr_zone_1_seconds !== undefined ? formatDuration(cyclingResult.hr_zone_1_seconds) : null },
+    { label: "HR Zone 2", value: result?.hr_zone_2_seconds !== null && result?.hr_zone_2_seconds !== undefined ? formatDuration(result.hr_zone_2_seconds) : cyclingResult?.hr_zone_2_seconds !== null && cyclingResult?.hr_zone_2_seconds !== undefined ? formatDuration(cyclingResult.hr_zone_2_seconds) : null },
+    { label: "HR Zone 3", value: result?.hr_zone_3_seconds !== null && result?.hr_zone_3_seconds !== undefined ? formatDuration(result.hr_zone_3_seconds) : cyclingResult?.hr_zone_3_seconds !== null && cyclingResult?.hr_zone_3_seconds !== undefined ? formatDuration(cyclingResult.hr_zone_3_seconds) : null },
+    { label: "HR Zone 4", value: result?.hr_zone_4_seconds !== null && result?.hr_zone_4_seconds !== undefined ? formatDuration(result.hr_zone_4_seconds) : cyclingResult?.hr_zone_4_seconds !== null && cyclingResult?.hr_zone_4_seconds !== undefined ? formatDuration(cyclingResult.hr_zone_4_seconds) : null },
+    { label: "HR Zone 5", value: result?.hr_zone_5_seconds !== null && result?.hr_zone_5_seconds !== undefined ? formatDuration(result.hr_zone_5_seconds) : cyclingResult?.hr_zone_5_seconds !== null && cyclingResult?.hr_zone_5_seconds !== undefined ? formatDuration(cyclingResult.hr_zone_5_seconds) : null },
     { label: "Average cadence", value: numberLabel(result?.average_cadence_spm, " spm", 0) },
+    { label: "Average ride cadence", value: numberLabel(cyclingResult?.average_cadence_rpm, " rpm", 0) },
+    { label: "Max ride cadence", value: numberLabel(cyclingResult?.max_cadence_rpm, " rpm", 0) },
     { label: "Average power", value: numberLabel(result?.average_power_watts, " W", 0) },
+    { label: "Average ride power", value: numberLabel(cyclingResult?.average_power_watts, " W", 0) },
+    { label: "Max ride power", value: numberLabel(cyclingResult?.max_power_watts, " W", 0) },
+    { label: "Normalized power", value: numberLabel(cyclingResult?.normalized_power_watts, " W", 0) },
+    { label: "Resistance", value: cyclingResult?.resistance_avg !== null && cyclingResult?.resistance_avg !== undefined ? `${numberLabel(cyclingResult.resistance_avg) ?? "N/A"} avg${cyclingResult.resistance_min !== null && cyclingResult.resistance_min !== undefined && cyclingResult.resistance_max !== null && cyclingResult.resistance_max !== undefined ? ` · ${numberLabel(cyclingResult.resistance_min, "", 0)}-${numberLabel(cyclingResult.resistance_max, "", 0)}` : ""}` : null },
     { label: "Stride length", value: numberLabel(result?.average_stride_length_meters, " m", 2) },
     { label: "Elevation gain", value: numberLabel(result?.elevation_gain_meters, " m", 0) },
     { label: "Elevation loss", value: numberLabel(result?.elevation_loss_meters, " m", 0) },
-    { label: "Calories", value: numberLabel(result?.calories, "", 0) },
+    { label: "Calories", value: numberLabel(result?.calories ?? cyclingResult?.calories, "", 0) },
     { label: "Steps", value: numberLabel(result?.steps, "", 0) },
     { label: "VO2 max", value: numberLabel(result?.vo2_max) },
   ];
@@ -800,7 +855,7 @@ function CompletedWorkoutDetailDialog({
       <div className="space-y-4">
         <div className="flex flex-wrap gap-2">
           <Pill className={typeStyles[workout.type]}>
-            {workout.type === "RUNNING" ? "Running" : "Lifting"}
+            {typeLabels[workout.type]}
           </Pill>
           <Pill className={statusStyles[workout.status]}>
             {workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
@@ -905,6 +960,20 @@ function completedWorkoutSummary(workout: FitnessScheduledWorkout): string {
     }
     return "Lifting completed";
   }
+  if (workout.type === "CYCLING") {
+    const result = workout.cycling_result;
+    if (!result) {
+      return formatDuration(workout.planned_duration_seconds);
+    }
+    return [
+      formatDuration(result.duration_seconds),
+      distanceLabel(result.completed_distance_miles),
+      numberLabel(result.average_power_watts, " W avg", 0),
+      numberLabel(result.average_hr, " avg HR", 0),
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
   const result = workout.running_result;
   if (!result) {
     return distanceLabel(workout.planned_distance_miles);
@@ -931,7 +1000,7 @@ function DashboardWorkoutLink({
   const content = (
     <>
       <div className="flex flex-wrap items-center gap-1.5">
-        <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+        <Pill className={typeStyles[workout.type]}>{compactTypeLabels[workout.type]}</Pill>
         <Pill className={statusStyles[workout.status]}>
           {workout.status === "COMPLETED" ? "Done" : workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
         </Pill>
@@ -947,6 +1016,13 @@ function DashboardWorkoutLink({
           {workout.running_result
             ? completedWorkoutSummary(workout)
             : distanceLabel(workout.planned_distance_miles)}
+        </div>
+      )}
+      {workout.type === "CYCLING" && (
+        <div className="mt-1 text-sm font-semibold text-slate-700">
+          {workout.cycling_result
+            ? completedWorkoutSummary(workout)
+            : formatDuration(workout.planned_duration_seconds)}
         </div>
       )}
     </>
@@ -1041,12 +1117,26 @@ function DashboardView({
   const weeklyCompletedRuns = weeklyRuns.filter((workout) => workout.status === "COMPLETED");
   const weeklyLifts = scheduledWeekWorkouts.filter((workout) => workout.type === "LIFTING");
   const weeklyCompletedLifts = weeklyLifts.filter((workout) => workout.status === "COMPLETED");
+  const weeklyRides = scheduledWeekWorkouts.filter((workout) => workout.type === "CYCLING");
+  const weeklyCompletedRides = weeklyRides.filter((workout) => workout.status === "COMPLETED");
   const completedRunningDistance = weeklyCompletedRuns.reduce(
     (total, workout) => total + (workout.running_result?.completed_distance_miles ?? 0),
     0,
   );
   const plannedRunningDistance = weeklyRuns.reduce(
     (total, workout) => total + (workout.planned_distance_miles ?? 0),
+    0,
+  );
+  const completedCyclingDistance = weeklyCompletedRides.reduce(
+    (total, workout) => total + (workout.cycling_result?.completed_distance_miles ?? 0),
+    0,
+  );
+  const plannedCyclingDuration = weeklyRides.reduce(
+    (total, workout) => total + (workout.planned_duration_seconds ?? 0),
+    0,
+  );
+  const completedCyclingDuration = weeklyCompletedRides.reduce(
+    (total, workout) => total + (workout.cycling_result?.duration_seconds ?? 0),
     0,
   );
   const completedScheduledWorkouts = scheduledWeekWorkouts.filter((workout) => workout.status === "COMPLETED");
@@ -1112,6 +1202,18 @@ function DashboardView({
             value={`${weeklyCompletedLifts.length.toLocaleString()} / ${weeklyLifts.length.toLocaleString()} lifts`}
           />
           <Metric
+            label="Cycling"
+            value={`${weeklyCompletedRides.length.toLocaleString()} / ${weeklyRides.length.toLocaleString()} rides`}
+          />
+          <Metric
+            label="Ride time"
+            value={`${formatDuration(completedCyclingDuration)} / ${formatDuration(plannedCyclingDuration)}`}
+          />
+          <Metric
+            label="Ride distance"
+            value={distanceLabel(completedCyclingDistance)}
+          />
+          <Metric
             label="Overall"
             value={`${completedScheduledWorkouts.length.toLocaleString()} / ${scheduledWeekWorkouts.length.toLocaleString()} workouts completed`}
           />
@@ -1153,7 +1255,7 @@ function DashboardView({
                 <div className="mt-1 text-sm font-semibold text-slate-600">{formatDate(upNext.scheduled_date)}</div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Pill className={typeStyles[upNext.type]}>{upNext.type === "RUNNING" ? "Running" : "Lifting"}</Pill>
+                <Pill className={typeStyles[upNext.type]}>{typeLabels[upNext.type]}</Pill>
                 <Pill className={statusStyles[upNext.status]}>Planned</Pill>
                 {upNext.source?.label && (
                   <Pill className="border-slate-200 bg-slate-50 text-slate-600">{upNext.source.label}</Pill>
@@ -1256,7 +1358,7 @@ function DashboardView({
                     {formatDate(workout.scheduled_date)} · {completedWorkoutSummary(workout)}
                   </div>
                 </div>
-                <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+                <Pill className={typeStyles[workout.type]}>{compactTypeLabels[workout.type]}</Pill>
               </div>
             </button>
           ))}
@@ -1494,7 +1596,7 @@ function ScheduleView({
               >
                 {templates.map((template) => (
                   <option key={template.id} value={template.id}>
-                    {template.name} ({template.type === "RUNNING" ? "Running" : "Lifting"})
+                    {template.name} ({typeLabels[template.type]})
                   </option>
                 ))}
               </select>
@@ -1644,6 +1746,10 @@ function WeeklyMiniSummary({ summary }: { summary: FitnessTrainingCalendar["week
         label="Long %"
         value={summary.planned_long_run_percentage === null ? "N/A" : `${summary.planned_long_run_percentage.toFixed(0)}%`}
       />
+      <MiniStat label="Ride plan" value={formatDuration(summary.planned_cycling_seconds)} />
+      <MiniStat label="Ride actual" value={formatDuration(summary.actual_cycling_seconds)} />
+      <MiniStat label="Ride mi" value={distanceLabel(summary.actual_cycling_miles)} />
+      <MiniStat label="Rides" value={summary.completed_cycling_sessions} />
       <MiniStat label="Lifts" value={summary.completed_lifting_sessions} />
     </div>
   );
@@ -1709,11 +1815,14 @@ function CalendarWorkoutCard({
     >
       <div className="font-black text-slate-950">{workout.workout_name}</div>
       <div className="mt-1 flex flex-wrap gap-1">
-        <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+        <Pill className={typeStyles[workout.type]}>{compactTypeLabels[workout.type]}</Pill>
         <Pill className={statusStyles[workout.status]}>{workout.status}</Pill>
       </div>
       {workout.type === "RUNNING" && (
         <div className="mt-1 font-semibold text-slate-600">{distanceLabel(workout.planned_distance_miles)}</div>
+      )}
+      {workout.type === "CYCLING" && (
+        <div className="mt-1 font-semibold text-slate-600">{formatDuration(workout.planned_duration_seconds)}</div>
       )}
       {workout.source?.label && (
         <div className="mt-1 text-slate-500">{workout.source.label}</div>
@@ -2021,6 +2130,13 @@ function CompletedWorkoutSummaryRow({
             <MiniStat label="Result" value={firstLift ? liftingEntryLabel(firstLift) : "N/A"} />
             <MiniStat label="Date" value={firstLift?.workout_date ? formatDate(firstLift.workout_date) : formatDate(workout.scheduled_date)} />
           </>
+        ) : workout.type === "CYCLING" ? (
+          <>
+            <MiniStat label="Planned" value={formatDuration(workout.planned_duration_seconds)} />
+            <MiniStat label="Duration" value={workout.cycling_result ? formatDuration(workout.cycling_result.duration_seconds) : "N/A"} />
+            <MiniStat label="Distance" value={workout.cycling_result ? distanceLabel(workout.cycling_result.completed_distance_miles) : "N/A"} />
+            <MiniStat label="Avg power" value={numberLabel(workout.cycling_result?.average_power_watts, " W", 0) ?? "N/A"} />
+          </>
         ) : (
           <>
             <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
@@ -2091,6 +2207,7 @@ function TemplatesView({
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
   const [plannedDistance, setPlannedDistance] = useState("");
+  const [plannedDurationMinutes, setPlannedDurationMinutes] = useState("");
   const [selectedExercises, setSelectedExercises] = useState<string[]>([]);
   const [state, setState] = useState<LoadState>("idle");
   const [mutating, setMutating] = useState(false);
@@ -2126,6 +2243,11 @@ function TemplatesView({
       setName(detail.name);
       setNotes(detail.notes ?? "");
       setPlannedDistance(detail.planned_distance_miles?.toString() ?? "");
+      setPlannedDurationMinutes(
+        detail.planned_duration_seconds
+          ? (detail.planned_duration_seconds / 60).toString()
+          : "",
+      );
       setSelectedExercises(
         [...(detail.exercises ?? [])]
           .sort((left, right) => left.display_order - right.display_order)
@@ -2142,6 +2264,7 @@ function TemplatesView({
     setName("");
     setNotes("");
     setPlannedDistance("");
+    setPlannedDurationMinutes("");
     setSelectedExercises([]);
   };
 
@@ -2152,6 +2275,9 @@ function TemplatesView({
     try {
       if (type === "RUNNING" && plannedDistance.trim() === "") {
         throw new Error("Running templates require planned distance.");
+      }
+      if (type === "CYCLING" && plannedDurationMinutes.trim() === "") {
+        throw new Error("Cycling templates require planned duration.");
       }
       if (type === "LIFTING" && selectedExercises.length === 0) {
         throw new Error("Lifting templates require at least one exercise.");
@@ -2166,6 +2292,8 @@ function TemplatesView({
           notes: notes.trim() || null,
           ...(type === "RUNNING"
             ? { planned_distance_miles: Number(plannedDistance) }
+            : type === "CYCLING"
+              ? { planned_duration_seconds: Math.round(Number(plannedDurationMinutes) * 60) }
             : {}),
         });
         const detailed =
@@ -2180,6 +2308,8 @@ function TemplatesView({
           notes: notes.trim() || null,
           ...(type === "RUNNING"
             ? { planned_distance_miles: Number(plannedDistance) }
+            : type === "CYCLING"
+              ? { planned_duration_seconds: Math.round(Number(plannedDurationMinutes) * 60) }
             : { exercises: exercisePayload }),
         });
         resetForm();
@@ -2249,13 +2379,16 @@ function TemplatesView({
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <h3 className="break-words text-lg font-black text-slate-950">{template.name}</h3>
                 <Pill className={typeStyles[template.type]}>
-                  {template.type === "RUNNING" ? "Running" : "Lifting"}
+                  {typeLabels[template.type]}
                 </Pill>
               </div>
               <div className="mt-3 flex flex-wrap gap-2 text-sm text-slate-600">
                 <span>{template.active ? "Active" : "Archived"}</span>
                 {template.type === "RUNNING" && (
                   <span>{distanceLabel(template.planned_distance_miles)}</span>
+                )}
+                {template.type === "CYCLING" && (
+                  <span>{formatDuration(template.planned_duration_seconds)}</span>
                 )}
               </div>
               {template.notes && <p className="mt-3 text-sm leading-6 text-slate-600">{template.notes}</p>}
@@ -2303,6 +2436,7 @@ function TemplatesView({
             >
               <option value="RUNNING">Running</option>
               <option value="LIFTING">Lifting</option>
+              <option value="CYCLING">Cycling</option>
             </select>
           </Field>
           <Field label="Name">
@@ -2321,6 +2455,18 @@ function TemplatesView({
                 step="0.01"
                 type="number"
                 value={plannedDistance}
+              />
+            </Field>
+          ) : type === "CYCLING" ? (
+            <Field label="Planned duration minutes">
+              <input
+                className={inputClasses}
+                min="0.1"
+                onChange={(event) => setPlannedDurationMinutes(event.target.value)}
+                required
+                step="0.1"
+                type="number"
+                value={plannedDurationMinutes}
               />
             </Field>
           ) : (
@@ -2918,6 +3064,13 @@ function PlansView({
                                   <MiniStat label="Result" value={firstLift ? liftingEntryLabel(firstLift) : "N/A"} />
                                   <MiniStat label="Date" value={firstLift?.workout_date ? formatDate(firstLift.workout_date) : formatDate(workout.scheduled_date)} />
                                 </>
+                              ) : workout.type === "CYCLING" ? (
+                                <>
+                                  <MiniStat label="Planned" value={formatDuration(workout.planned_duration_seconds)} />
+                                  <MiniStat label="Duration" value={workout.cycling_result ? formatDuration(workout.cycling_result.duration_seconds) : "N/A"} />
+                                  <MiniStat label="Distance" value={workout.cycling_result ? distanceLabel(workout.cycling_result.completed_distance_miles) : "N/A"} />
+                                  <MiniStat label="Avg power" value={numberLabel(workout.cycling_result?.average_power_watts, " W", 0) ?? "N/A"} />
+                                </>
                               ) : (
                                 <>
                                   <MiniStat label="Distance" value={result ? distanceLabel(result.completed_distance_miles) : distanceLabel(workout.planned_distance_miles)} />
@@ -3070,7 +3223,24 @@ function FitnessScreen() {
     setPendingAction(`complete:${workout.id}`);
     setMutationError(null);
     try {
-      await completeScheduledWorkout(workout.id, running);
+      if (workout.type === "CYCLING") {
+        const result = await completeScheduledWorkoutWithGarmin(workout.id);
+        if (result.status === "AMBIGUOUS_MATCH") {
+          const selected = window.prompt(
+            `Choose Garmin ride activity ID: ${result.candidates
+              .map((candidate) => `${candidate.activityId} ${candidate.activityName ?? ""}`.trim())
+              .join(", ")}`,
+          );
+          if (!selected) {
+            throw new Error("Choose a Garmin activity to complete this ride.");
+          }
+          await completeScheduledWorkoutWithGarminSelection(workout.id, selected);
+        } else if (result.status === "NO_MATCH") {
+          throw new Error("No matching Garmin cycling activity was found.");
+        }
+      } else {
+        await completeScheduledWorkout(workout.id, running);
+      }
       setCompleteWorkout(null);
       refresh();
     } catch (caught) {

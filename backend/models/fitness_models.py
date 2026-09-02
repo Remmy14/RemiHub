@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FITNESS_RECURRENCE_MAX_WEEKS = 260
+FITNESS_DURATION_SECONDS_MAX = 864000
 
 
 class FitnessRequestModel(BaseModel):
@@ -18,6 +19,7 @@ class FitnessRequestModel(BaseModel):
 class WorkoutType(str, Enum):
     RUNNING = "RUNNING"
     LIFTING = "LIFTING"
+    CYCLING = "CYCLING"
 
 
 class ScheduledWorkoutStatus(str, Enum):
@@ -42,6 +44,7 @@ class WorkoutTemplateCreate(FitnessRequestModel):
     type: WorkoutType
     notes: str | None = Field(default=None, max_length=4000)
     planned_distance_miles: Decimal | None = Field(default=None, ge=0, le=10000)
+    planned_duration_seconds: int | None = Field(default=None, gt=0, le=FITNESS_DURATION_SECONDS_MAX)
     exercises: list[LiftingTemplateExercise] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -50,6 +53,8 @@ class WorkoutTemplateCreate(FitnessRequestModel):
             raise ValueError("planned_distance_miles is required for RUNNING templates")
         if self.type is WorkoutType.LIFTING and not self.exercises:
             raise ValueError("exercises are required for LIFTING templates")
+        if self.type is WorkoutType.CYCLING and self.planned_duration_seconds is None:
+            raise ValueError("planned_duration_seconds is required for CYCLING templates")
         return self
 
 
@@ -57,6 +62,7 @@ class WorkoutTemplateUpdate(FitnessRequestModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     notes: str | None = Field(default=None, max_length=4000)
     planned_distance_miles: Decimal | None = Field(default=None, ge=0, le=10000)
+    planned_duration_seconds: int | None = Field(default=None, gt=0, le=FITNESS_DURATION_SECONDS_MAX)
 
 
 class LiftingTemplateExercisesReplace(FitnessRequestModel):
@@ -104,7 +110,7 @@ class ScheduledWorkoutTemplateReplace(FitnessRequestModel):
 
 class RunningCompletion(FitnessRequestModel):
     completed_distance_miles: Decimal = Field(ge=0, le=10000)
-    duration_seconds: int = Field(ge=0, le=864000)
+    duration_seconds: int = Field(ge=0, le=FITNESS_DURATION_SECONDS_MAX)
     notes: str | None = Field(default=None, max_length=4000)
 
 

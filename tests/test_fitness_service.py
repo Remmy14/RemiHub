@@ -42,6 +42,7 @@ TEMPLATE_COLUMNS = [
     "notes",
     "active",
     "planned_distance_miles",
+    "planned_duration_seconds",
     "created_at",
     "updated_at",
 ]
@@ -52,6 +53,7 @@ LIFTING_TEMPLATE_ROW = (
     "LIFTING",
     None,
     True,
+    None,
     None,
     NOW,
     NOW,
@@ -64,6 +66,7 @@ RUNNING_TEMPLATE_ROW = (
     None,
     True,
     Decimal("5.00"),
+    None,
     NOW,
     NOW,
 )
@@ -75,6 +78,19 @@ SECOND_RUNNING_TEMPLATE_ROW = (
     None,
     True,
     Decimal("3.00"),
+    None,
+    NOW,
+    NOW,
+)
+CYCLING_TEMPLATE_ROW = (
+    "99999999-9999-4999-8999-999999999990",
+    USER_ID,
+    "Easy Ride",
+    "CYCLING",
+    None,
+    True,
+    None,
+    1800,
     NOW,
     NOW,
 )
@@ -137,6 +153,40 @@ SCHEDULED_COLUMNS = [
     "updated_at",
     "plan_template_item_id",
     "is_reschedule_replacement",
+    "planned_duration_seconds",
+    "cycling_result_planned_duration_seconds",
+    "cycling_external_provider",
+    "cycling_external_activity_id",
+    "cycling_external_activity_uuid",
+    "cycling_external_activity_name",
+    "cycling_external_activity_type_key",
+    "cycling_external_manufacturer",
+    "cycling_start_time_local",
+    "cycling_duration_seconds",
+    "cycling_moving_duration_seconds",
+    "cycling_completed_distance_miles",
+    "cycling_calories",
+    "cycling_average_power_watts",
+    "cycling_max_power_watts",
+    "cycling_normalized_power_watts",
+    "cycling_average_cadence_rpm",
+    "cycling_max_cadence_rpm",
+    "cycling_average_hr",
+    "cycling_max_hr",
+    "cycling_hr_zone_1_seconds",
+    "cycling_hr_zone_2_seconds",
+    "cycling_hr_zone_3_seconds",
+    "cycling_hr_zone_4_seconds",
+    "cycling_hr_zone_5_seconds",
+    "cycling_aerobic_training_effect",
+    "cycling_anaerobic_training_effect",
+    "cycling_training_load",
+    "cycling_training_effect_label",
+    "cycling_resistance_min",
+    "cycling_resistance_avg",
+    "cycling_resistance_max",
+    "cycling_result_created_at",
+    "cycling_result_updated_at",
 ]
 
 PLANNED_RUNNING_ROW = (
@@ -165,6 +215,8 @@ PLANNED_RUNNING_ROW = (
     NOW,
     None,
     False,
+    None,
+    *([None] * 33),
 )
 
 COMPLETED_RUNNING_ROW = list(PLANNED_RUNNING_ROW)
@@ -183,6 +235,42 @@ COMPLETED_LIFTING_ROW[9] = None
 COMPLETED_LIFTING_ROW[10] = "Regular Lifting Day"
 COMPLETED_LIFTING_ROW[11] = "LIFTING"
 COMPLETED_LIFTING_ROW = tuple(COMPLETED_LIFTING_ROW)
+
+PLANNED_CYCLING_ROW = list(PLANNED_RUNNING_ROW)
+PLANNED_CYCLING_ROW[0] = "12121212-1212-4212-8212-121212121212"
+PLANNED_CYCLING_ROW[2] = CYCLING_TEMPLATE_ROW[0]
+PLANNED_CYCLING_ROW[9] = None
+PLANNED_CYCLING_ROW[10] = "Easy Ride"
+PLANNED_CYCLING_ROW[11] = "CYCLING"
+PLANNED_CYCLING_ROW[25] = 1800
+PLANNED_CYCLING_ROW = tuple(PLANNED_CYCLING_ROW)
+
+COMPLETED_CYCLING_ROW = list(PLANNED_CYCLING_ROW)
+COMPLETED_CYCLING_ROW[6] = "COMPLETED"
+COMPLETED_CYCLING_ROW[26] = 1800
+COMPLETED_CYCLING_ROW[27] = "GARMIN"
+COMPLETED_CYCLING_ROW[28] = "ride-1"
+COMPLETED_CYCLING_ROW[29] = "ride-uuid"
+COMPLETED_CYCLING_ROW[30] = "Peloton Indoor Ride"
+COMPLETED_CYCLING_ROW[31] = "indoor_cycling"
+COMPLETED_CYCLING_ROW[32] = "PELOTON"
+COMPLETED_CYCLING_ROW[34] = 1812
+COMPLETED_CYCLING_ROW[35] = 1801
+COMPLETED_CYCLING_ROW[36] = Decimal("8.60")
+COMPLETED_CYCLING_ROW[37] = Decimal("260")
+COMPLETED_CYCLING_ROW[38] = Decimal("125")
+COMPLETED_CYCLING_ROW[39] = Decimal("220")
+COMPLETED_CYCLING_ROW[40] = Decimal("132")
+COMPLETED_CYCLING_ROW[41] = Decimal("82")
+COMPLETED_CYCLING_ROW[42] = Decimal("105")
+COMPLETED_CYCLING_ROW[43] = Decimal("148")
+COMPLETED_CYCLING_ROW[44] = Decimal("165")
+COMPLETED_CYCLING_ROW[54] = Decimal("25")
+COMPLETED_CYCLING_ROW[55] = Decimal("41")
+COMPLETED_CYCLING_ROW[56] = Decimal("58")
+COMPLETED_CYCLING_ROW[57] = NOW
+COMPLETED_CYCLING_ROW[58] = NOW
+COMPLETED_CYCLING_ROW = tuple(COMPLETED_CYCLING_ROW)
 
 LIFTING_RESULT_COLUMNS = [
     "scheduled_workout_id",
@@ -241,6 +329,28 @@ HISTORICAL_EFFORT_COLUMNS = [
     "average_power_watts",
     "average_stride_length_meters",
     "elevation_gain_meters",
+    "total_efforts",
+]
+CYCLING_HISTORICAL_EFFORT_COLUMNS = [
+    "scheduled_workout_id",
+    "scheduled_date",
+    "status",
+    "duration_seconds",
+    "moving_duration_seconds",
+    "completed_distance_miles",
+    "average_power_watts",
+    "max_power_watts",
+    "normalized_power_watts",
+    "average_cadence_rpm",
+    "max_cadence_rpm",
+    "average_hr",
+    "max_hr",
+    "training_load",
+    "aerobic_training_effect",
+    "anaerobic_training_effect",
+    "resistance_avg",
+    "resistance_min",
+    "resistance_max",
     "total_efforts",
 ]
 
@@ -879,6 +989,136 @@ class FitnessServiceTests(unittest.TestCase):
             steps=6400,
         )
 
+    def garmin_cycling_activity(self, activity_id="ride-1"):
+        return garmin_activity_provider.GarminCyclingActivity(
+            external_provider="GARMIN",
+            external_activity_id=activity_id,
+            external_activity_uuid="ride-uuid",
+            external_activity_name="Peloton Indoor Ride",
+            external_activity_type_key="indoor_cycling",
+            external_manufacturer="PELOTON",
+            start_time_local="2026-08-21 06:30:00",
+            duration_seconds=1812,
+            moving_duration_seconds=1801,
+            completed_distance_miles=Decimal("8.60"),
+            calories=Decimal("260"),
+            average_power_watts=Decimal("125"),
+            max_power_watts=Decimal("220"),
+            normalized_power_watts=Decimal("132"),
+            average_cadence_rpm=Decimal("82"),
+            max_cadence_rpm=Decimal("105"),
+            average_hr=Decimal("148"),
+            max_hr=Decimal("165"),
+            hr_zone_1_seconds=None,
+            hr_zone_2_seconds=None,
+            hr_zone_3_seconds=None,
+            hr_zone_4_seconds=None,
+            hr_zone_5_seconds=None,
+            aerobic_training_effect=Decimal("2.4"),
+            anaerobic_training_effect=Decimal("0.1"),
+            training_load=Decimal("21"),
+            training_effect_label=None,
+            resistance_min=Decimal("25"),
+            resistance_avg=Decimal("41"),
+            resistance_max=Decimal("58"),
+        )
+
+    def test_cycling_template_creation_persists_positive_planned_duration(self):
+        connection, patches = self.patch_connection(
+            [
+                (["id"], [(CYCLING_TEMPLATE_ROW[0],)]),
+                ([], []),
+                (TEMPLATE_COLUMNS, [CYCLING_TEMPLATE_ROW]),
+            ]
+        )
+
+        with patches:
+            template = fitness_service.create_workout_template(
+                user_id=USER_ID,
+                name="Easy Ride",
+                workout_type="CYCLING",
+                planned_duration_seconds=1800,
+            )
+
+        self.assertEqual(connection.cursor_instance.executed[1][1][1], 1800)
+        self.assertEqual(template["planned_duration_seconds"], 1800)
+
+    def test_cycling_scheduling_snapshots_planned_duration_not_distance(self):
+        connection, patches = self.patch_connection(
+            [
+                (TEMPLATE_COLUMNS, [CYCLING_TEMPLATE_ROW]),
+                (["id"], [(PLANNED_CYCLING_ROW[0],)]),
+                (SCHEDULED_COLUMNS, [PLANNED_CYCLING_ROW]),
+            ]
+        )
+
+        with patches:
+            workout = fitness_service.create_scheduled_workout(
+                user_id=USER_ID,
+                workout_template_id=CYCLING_TEMPLATE_ROW[0],
+                scheduled_date=date(2026, 8, 21),
+            )
+
+        insert_params = connection.cursor_instance.executed[1][1]
+        self.assertIsNone(insert_params[7])
+        self.assertEqual(insert_params[8], 1800)
+        self.assertEqual(workout["type"], "CYCLING")
+        self.assertIsNone(workout["planned_distance_miles"])
+        self.assertEqual(workout["planned_duration_seconds"], 1800)
+
+    def test_cycling_garmin_completion_persists_summary_metrics_and_duration_snapshot(self):
+        activity = self.garmin_cycling_activity()
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_CYCLING_ROW]),
+                (SCHEDULED_COLUMNS, [PLANNED_CYCLING_ROW]),
+                ([], []),
+                ([], []),
+                (SCHEDULED_COLUMNS, [COMPLETED_CYCLING_ROW]),
+            ]
+        )
+        resolution = garmin_activity_provider.GarminActivityResolution(
+            activities=[activity],
+            candidates=[],
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_cycling_activities",
+            return_value=resolution,
+        ):
+            result = fitness_service.attempt_garmin_scheduled_workout_completion(
+                user_id=USER_ID,
+                scheduled_workout_id=PLANNED_CYCLING_ROW[0],
+            )
+
+        insert_sql, insert_params = connection.cursor_instance.executed[2]
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertIn("INSERT INTO public.fitness_cycling_workout_results", insert_sql)
+        self.assertEqual(insert_params[1], 1800)
+        self.assertEqual(insert_params[2], "GARMIN")
+        self.assertEqual(insert_params[6], "indoor_cycling")
+        self.assertEqual(insert_params[7], "PELOTON")
+        self.assertEqual(result["workout"]["cycling_result"]["duration_seconds"], 1812)
+        self.assertEqual(result["workout"]["cycling_result"]["completed_distance_miles"], 8.6)
+        self.assertEqual(result["workout"]["planned_duration_seconds"], 1800)
+
+    def test_manual_cycling_completion_is_rejected(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_CYCLING_ROW]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessValidationError, "Garmin"):
+                fitness_service.complete_scheduled_workout(
+                    user_id=USER_ID,
+                    scheduled_workout_id=PLANNED_CYCLING_ROW[0],
+                )
+
+        executed_sql = "\n".join(sql for sql, _ in connection.cursor_instance.executed)
+        self.assertNotIn("UPDATE public.fitness_scheduled_workouts", executed_sql)
+
     def test_garmin_completion_zero_results_returns_no_match_without_mutation(self):
         connection, patches = self.patch_connection(
             [
@@ -1130,7 +1370,7 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertIn("WHERE id = %s", update_sql)
         self.assertIn("AND user_id = %s", update_sql)
         self.assertIn("AND status = 'PLANNED'", update_sql)
-        self.assertEqual(update_params, (SECOND_TEMPLATE_ID, Decimal("3.00"), SCHEDULED_ID, USER_ID))
+        self.assertEqual(update_params, (SECOND_TEMPLATE_ID, Decimal("3.00"), None, SCHEDULED_ID, USER_ID))
         self.assertIn("FOR UPDATE", connection.cursor_instance.executed[0][0])
         self.assertEqual(result["workout_template_id"], SECOND_TEMPLATE_ID)
         self.assertEqual(result["planned_distance_miles"], 3.0)
@@ -1603,6 +1843,7 @@ class FitnessServiceTests(unittest.TestCase):
 
         completed = scheduled(COMPLETED_RUNNING_ROW)
         planned = scheduled(PLANNED_RUNNING_ROW)
+        completed_ride = scheduled(COMPLETED_CYCLING_ROW)
         rescheduled_source = dict(planned)
         rescheduled_source["id"] = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         rescheduled_source["status"] = "RESCHEDULED"
@@ -1613,7 +1854,7 @@ class FitnessServiceTests(unittest.TestCase):
 
         with patch(
             "backend.services.fitness_service.list_scheduled_workouts",
-            return_value=[completed, planned, rescheduled_source, lifting],
+            return_value=[completed, planned, completed_ride, rescheduled_source, lifting],
         ), patch(
             "backend.services.fitness_service.current_fitness_date",
             return_value=date(2026, 8, 21),
@@ -1628,6 +1869,10 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertEqual(summary["planned_running_miles"], 10.0)
         self.assertEqual(summary["actual_running_miles"], 5.1)
         self.assertEqual(summary["longest_planned_run_miles"], 5.0)
+        self.assertEqual(summary["planned_cycling_seconds"], 1800)
+        self.assertEqual(summary["actual_cycling_seconds"], 1812)
+        self.assertEqual(summary["actual_cycling_miles"], 8.6)
+        self.assertEqual(summary["completed_cycling_sessions"], 1)
         self.assertEqual(summary["completed_lifting_sessions"], 1)
 
     def test_remove_unstarted_plan_instance_uses_locked_scheduled_state(self):
@@ -2153,6 +2398,66 @@ class FitnessServiceTests(unittest.TestCase):
         self.assertEqual(result["workout"]["workout_template_id"], TEMPLATE_ID)
         self.assertEqual(result["workout"]["workout_type"], "RUNNING")
         self.assertEqual(result["workout"]["planned_distance_miles"], 5.0)
+
+    def test_historical_efforts_cycling_cohort_query_uses_duration_snapshot(self):
+        connection, patches = self.patch_connection(
+            [
+                (SCHEDULED_COLUMNS, [PLANNED_CYCLING_ROW]),
+                (
+                    CYCLING_HISTORICAL_EFFORT_COLUMNS,
+                    [
+                        (
+                            PLANNED_CYCLING_ROW[0],
+                            date(2026, 8, 29),
+                            "COMPLETED",
+                            1812,
+                            1801,
+                            Decimal("8.60"),
+                            Decimal("125"),
+                            Decimal("220"),
+                            Decimal("132"),
+                            Decimal("82"),
+                            Decimal("105"),
+                            None,
+                            Decimal("165"),
+                            Decimal("21"),
+                            Decimal("2.4"),
+                            Decimal("0.1"),
+                            Decimal("41"),
+                            Decimal("25"),
+                            Decimal("58"),
+                            2,
+                        )
+                    ],
+                ),
+            ]
+        )
+
+        with patches, patch(
+            "backend.services.fitness_service.garmin_activity_provider.resolve_cycling_activities"
+        ) as resolve_cycling, patch(
+            "backend.services.fitness_service.garmin_activity_provider.find_cycling_activity"
+        ) as find_cycling:
+            result = fitness_service.get_historical_efforts(
+                user_id=USER_ID,
+                scheduled_workout_id=PLANNED_CYCLING_ROW[0],
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("JOIN public.fitness_cycling_workout_results AS result", sql)
+        self.assertIn("template.workout_type = 'CYCLING'", sql)
+        self.assertIn("scheduled.planned_duration_seconds = %s", sql)
+        self.assertEqual(params, (USER_ID, CYCLING_TEMPLATE_ROW[0], 1800, 5))
+        resolve_cycling.assert_not_called()
+        find_cycling.assert_not_called()
+        self.assertEqual(result["total_efforts"], 2)
+        self.assertEqual(result["workout"]["workout_type"], "CYCLING")
+        self.assertEqual(result["workout"]["planned_duration_seconds"], 1800)
+        values = result["efforts"][0]["values"]
+        self.assertEqual(values["duration_seconds"], 1812)
+        self.assertEqual(values["completed_distance_miles"], 8.6)
+        self.assertIsNone(values["average_hr"])
+        self.assertEqual(values["resistance_avg"], 41.0)
 
     def test_historical_efforts_returns_total_count_before_limit_and_metrics(self):
         connection, patches = self.patch_connection(

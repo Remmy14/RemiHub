@@ -335,6 +335,45 @@ class FrontendWebPortalTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(field, source)
 
+    def test_fitness_frontend_supports_cycling_duration_and_garmin_results(self):
+        api_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "api"
+            / "fitnessApi.ts"
+        ).read_text(encoding="utf-8")
+        screen_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for field in (
+            '"RUNNING" | "LIFTING" | "CYCLING"',
+            "planned_duration_seconds: number | null",
+            "cycling_result: FitnessCyclingResult | null",
+            "external_activity_type_key: string | null",
+            "external_manufacturer: string | null",
+            "resistance_avg: number | null",
+            "completeScheduledWorkoutWithGarmin",
+            "completeScheduledWorkoutWithGarminSelection",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, api_source)
+
+        for marker in (
+            "CYCLING: \"Cycling\"",
+            "Planned duration minutes",
+            "Cycling templates require planned duration.",
+            "formatDuration(workout.planned_duration_seconds)",
+            "weeklyRides",
+            "Ride distance",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, screen_source)
+
     def test_fitness_frontend_models_lifting_results_as_aggregate_entries(self):
         api_source = (
             Path(__file__).resolve().parents[1]

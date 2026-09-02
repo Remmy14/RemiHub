@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from psycopg2 import errors
 
 from backend.database.database import get_db_conn, put_db_conn
-from backend.models.fitness_models import FITNESS_RECURRENCE_MAX_WEEKS
+from backend.models.fitness_models import FITNESS_DURATION_SECONDS_MAX, FITNESS_RECURRENCE_MAX_WEEKS
 from backend.services import garmin_activity_provider
 
 RUNNING_RESULT_COLUMNS = (
@@ -48,6 +48,41 @@ GARMIN_RUNNING_RESULT_COLUMNS = (
     "elevation_loss_meters",
     "calories",
     "steps",
+)
+CYCLING_RESULT_COLUMNS = (
+    "planned_duration_seconds",
+    "external_provider",
+    "external_activity_id",
+    "external_activity_uuid",
+    "external_activity_name",
+    "external_activity_type_key",
+    "external_manufacturer",
+    "start_time_local",
+    "duration_seconds",
+    "moving_duration_seconds",
+    "completed_distance_miles",
+    "calories",
+    "average_power_watts",
+    "max_power_watts",
+    "normalized_power_watts",
+    "average_cadence_rpm",
+    "max_cadence_rpm",
+    "average_hr",
+    "max_hr",
+    "hr_zone_1_seconds",
+    "hr_zone_2_seconds",
+    "hr_zone_3_seconds",
+    "hr_zone_4_seconds",
+    "hr_zone_5_seconds",
+    "aerobic_training_effect",
+    "anaerobic_training_effect",
+    "training_load",
+    "training_effect_label",
+    "resistance_min",
+    "resistance_avg",
+    "resistance_max",
+    "created_at",
+    "updated_at",
 )
 FITNESS_TIMEZONE_ENV = "REMIHUB_FITNESS_TIMEZONE"
 DEFAULT_FITNESS_TIMEZONE = "America/New_York"
@@ -113,6 +148,20 @@ def _decimal(value) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise FitnessValidationError("Invalid decimal value") from exc
+
+
+def _duration_seconds(value) -> int:
+    try:
+        duration = int(value)
+    except (TypeError, ValueError) as exc:
+        raise FitnessValidationError("Invalid duration value") from exc
+    if duration <= 0:
+        raise FitnessValidationError("Cycling planned duration must be greater than zero")
+    if duration > FITNESS_DURATION_SECONDS_MAX:
+        raise FitnessValidationError(
+            f"Cycling planned duration cannot exceed {FITNESS_DURATION_SECONDS_MAX} seconds"
+        )
+    return duration
 
 
 def _date_value(value) -> date:
@@ -219,11 +268,14 @@ def _workout_template_select() -> str:
                template.notes,
                template.active,
                running.planned_distance_miles,
+               cycling.planned_duration_seconds,
                template.created_at,
                template.updated_at
         FROM public.fitness_workout_templates AS template
         LEFT JOIN public.fitness_running_workout_templates AS running
           ON running.template_id = template.id
+        LEFT JOIN public.fitness_cycling_workout_templates AS cycling
+          ON cycling.template_id = template.id
     """
 
 
@@ -240,6 +292,7 @@ def _scheduled_select() -> str:
                scheduled.replacement_scheduled_workout_id,
                scheduled.recurring_series_id,
                scheduled.planned_distance_miles,
+               scheduled.planned_duration_seconds,
                template.name AS workout_name,
                template.workout_type AS type,
                series.weekdays AS recurring_series_weekdays,
@@ -276,6 +329,39 @@ def _scheduled_select() -> str:
                result.elevation_loss_meters,
                result.calories,
                result.steps,
+               cycling_result.planned_duration_seconds AS cycling_result_planned_duration_seconds,
+               cycling_result.external_provider AS cycling_external_provider,
+               cycling_result.external_activity_id AS cycling_external_activity_id,
+               cycling_result.external_activity_uuid AS cycling_external_activity_uuid,
+               cycling_result.external_activity_name AS cycling_external_activity_name,
+               cycling_result.external_activity_type_key AS cycling_external_activity_type_key,
+               cycling_result.external_manufacturer AS cycling_external_manufacturer,
+               cycling_result.start_time_local AS cycling_start_time_local,
+               cycling_result.duration_seconds AS cycling_duration_seconds,
+               cycling_result.moving_duration_seconds AS cycling_moving_duration_seconds,
+               cycling_result.completed_distance_miles AS cycling_completed_distance_miles,
+               cycling_result.calories AS cycling_calories,
+               cycling_result.average_power_watts AS cycling_average_power_watts,
+               cycling_result.max_power_watts AS cycling_max_power_watts,
+               cycling_result.normalized_power_watts AS cycling_normalized_power_watts,
+               cycling_result.average_cadence_rpm AS cycling_average_cadence_rpm,
+               cycling_result.max_cadence_rpm AS cycling_max_cadence_rpm,
+               cycling_result.average_hr AS cycling_average_hr,
+               cycling_result.max_hr AS cycling_max_hr,
+               cycling_result.hr_zone_1_seconds AS cycling_hr_zone_1_seconds,
+               cycling_result.hr_zone_2_seconds AS cycling_hr_zone_2_seconds,
+               cycling_result.hr_zone_3_seconds AS cycling_hr_zone_3_seconds,
+               cycling_result.hr_zone_4_seconds AS cycling_hr_zone_4_seconds,
+               cycling_result.hr_zone_5_seconds AS cycling_hr_zone_5_seconds,
+               cycling_result.aerobic_training_effect AS cycling_aerobic_training_effect,
+               cycling_result.anaerobic_training_effect AS cycling_anaerobic_training_effect,
+               cycling_result.training_load AS cycling_training_load,
+               cycling_result.training_effect_label AS cycling_training_effect_label,
+               cycling_result.resistance_min AS cycling_resistance_min,
+               cycling_result.resistance_avg AS cycling_resistance_avg,
+               cycling_result.resistance_max AS cycling_resistance_max,
+               cycling_result.created_at AS cycling_result_created_at,
+               cycling_result.updated_at AS cycling_result_updated_at,
                EXISTS (
                    SELECT 1
                    FROM public.fitness_scheduled_workouts AS reschedule_source
@@ -296,11 +382,13 @@ def _scheduled_select() -> str:
           ON plan_template.id = plan_instance.plan_template_id
         LEFT JOIN public.fitness_running_workout_results AS result
           ON result.scheduled_workout_id = scheduled.id
+        LEFT JOIN public.fitness_cycling_workout_results AS cycling_result
+          ON cycling_result.scheduled_workout_id = scheduled.id
     """
 
 
-def _with_running_result(workout: dict) -> dict:
-    result = None
+def _with_results(workout: dict) -> dict:
+    running_result = None
     if any(
         workout.get(key) is not None
         for key in (
@@ -313,7 +401,7 @@ def _with_running_result(workout: dict) -> dict:
             *GARMIN_RUNNING_RESULT_COLUMNS,
         )
     ):
-        result = {
+        running_result = {
             "planned_distance_miles": workout.get("result_planned_distance_miles"),
             "completed_distance_miles": workout.get("completed_distance_miles"),
             "duration_seconds": workout.get("duration_seconds"),
@@ -321,12 +409,19 @@ def _with_running_result(workout: dict) -> dict:
             "created_at": workout.get("result_created_at"),
             "updated_at": workout.get("result_updated_at"),
         }
-        result.update(
+        running_result.update(
             {
                 column: workout.get(column)
                 for column in GARMIN_RUNNING_RESULT_COLUMNS
             }
         )
+    cycling_result = None
+    cycling_keys = tuple(f"cycling_{column}" for column in CYCLING_RESULT_COLUMNS)
+    if any(workout.get(key) is not None for key in cycling_keys):
+        cycling_result = {
+            column: workout.get(f"cycling_{column}")
+            for column in CYCLING_RESULT_COLUMNS
+        }
     is_reschedule_replacement = workout.get("is_reschedule_replacement")
     cleaned = {
         key: value
@@ -341,6 +436,7 @@ def _with_running_result(workout: dict) -> dict:
             "result_created_at",
             "result_updated_at",
             *GARMIN_RUNNING_RESULT_COLUMNS,
+            *cycling_keys,
         }
     }
     source_type = "INDIVIDUAL"
@@ -362,13 +458,18 @@ def _with_running_result(workout: dict) -> dict:
         "plan_template_name": cleaned.get("plan_template_name"),
         "recurring_series_weekdays": cleaned.get("recurring_series_weekdays"),
     }
-    cleaned["running_result"] = result
+    cleaned["running_result"] = running_result
+    cleaned["cycling_result"] = cycling_result
     cleaned["lifting_result"] = None
     return cleaned
 
 
+def _with_running_result(workout: dict) -> dict:
+    return _with_results(workout)
+
+
 def _scheduled_rows_to_dicts(cur, rows) -> list[dict]:
-    workouts = [_with_running_result(row) for row in _rows_to_dicts(cur, rows)]
+    workouts = [_with_results(row) for row in _rows_to_dicts(cur, rows)]
     _attach_lifting_results(cur, workouts)
     return workouts
 
@@ -549,6 +650,7 @@ def create_workout_template(
     workout_type: str,
     notes: str | None = None,
     planned_distance_miles=None,
+    planned_duration_seconds=None,
     exercises: list[dict] | None = None,
 ) -> dict:
     conn = get_db_conn()
@@ -578,6 +680,17 @@ def create_workout_template(
                     VALUES (%s, %s)
                     """,
                     (template_id, _decimal(planned_distance_miles)),
+                )
+            elif workout_type == "CYCLING":
+                cur.execute(
+                    """
+                    INSERT INTO public.fitness_cycling_workout_templates (
+                        template_id,
+                        planned_duration_seconds
+                    )
+                    VALUES (%s, %s)
+                    """,
+                    (template_id, _duration_seconds(planned_duration_seconds)),
                 )
             elif workout_type == "LIFTING":
                 _replace_lifting_exercises(
@@ -652,6 +765,23 @@ def update_workout_template(user_id: str, template_id: str, **fields) -> dict:
                     WHERE template_id = %s
                     """,
                     (_decimal(fields["planned_distance_miles"]), template_id),
+                )
+            if "planned_duration_seconds" in fields:
+                template = _get_workout_template(
+                    cur,
+                    user_id=user_id,
+                    template_id=template_id,
+                )
+                if template["type"] != "CYCLING":
+                    raise FitnessValidationError("Only CYCLING templates have planned duration")
+                cur.execute(
+                    """
+                    UPDATE public.fitness_cycling_workout_templates
+                    SET planned_duration_seconds = %s,
+                        updated_at = now()
+                    WHERE template_id = %s
+                    """,
+                    (_duration_seconds(fields["planned_duration_seconds"]), template_id),
                 )
             template = _template_details(
                 cur,
@@ -971,6 +1101,10 @@ def _planned_distance_snapshot(template: dict):
     return _decimal(template["planned_distance_miles"]) if template["type"] == "RUNNING" else None
 
 
+def _planned_duration_snapshot(template: dict):
+    return _duration_seconds(template["planned_duration_seconds"]) if template["type"] == "CYCLING" else None
+
+
 def _insert_scheduled_workout(
     cur,
     *,
@@ -982,6 +1116,7 @@ def _insert_scheduled_workout(
     recurring_series_id: str | None = None,
     original_scheduled_date: date | None = None,
     planned_distance_miles=None,
+    planned_duration_seconds=None,
 ) -> str:
     cur.execute(
         """
@@ -993,9 +1128,10 @@ def _insert_scheduled_workout(
             recurring_series_id,
             scheduled_date,
             original_scheduled_date,
-            planned_distance_miles
+            planned_distance_miles,
+            planned_duration_seconds
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -1007,6 +1143,7 @@ def _insert_scheduled_workout(
             scheduled_date,
             original_scheduled_date or scheduled_date,
             planned_distance_miles,
+            planned_duration_seconds,
         ),
     )
     return str(cur.fetchone()[0])
@@ -1032,6 +1169,7 @@ def create_scheduled_workout(
                 workout_template_id=workout_template_id,
                 scheduled_date=scheduled_date,
                 planned_distance_miles=_planned_distance_snapshot(template),
+                planned_duration_seconds=_planned_duration_snapshot(template),
             )
             workout = _get_scheduled_workout(
                 cur,
@@ -1254,6 +1392,7 @@ def create_recurring_series(
                             recurring_series_id=series_id,
                             scheduled_date=scheduled_date,
                             planned_distance_miles=_planned_distance_snapshot(template),
+                            planned_duration_seconds=_planned_duration_snapshot(template),
                         )
                     )
             series = _get_recurring_series(cur, user_id=user_id, series_id=series_id)
@@ -1349,6 +1488,7 @@ def instantiate_plan_template(
                         plan_template_item_id=item["id"],
                         scheduled_date=start_date + timedelta(days=item["day_offset"]),
                         planned_distance_miles=_planned_distance_snapshot(template),
+                        planned_duration_seconds=_planned_duration_snapshot(template),
                     )
                 )
             instance = _get_plan_instance(cur, user_id=user_id, instance_id=instance_id)
@@ -1701,7 +1841,8 @@ def repeat_plan_instance_week(
                        workout_template_id,
                        plan_template_item_id,
                        scheduled_date,
-                       planned_distance_miles
+                       planned_distance_miles,
+                       planned_duration_seconds
                 FROM public.fitness_scheduled_workouts
                 WHERE user_id = %s
                   AND plan_instance_id = %s
@@ -1724,7 +1865,8 @@ def repeat_plan_instance_week(
                        workout_template_id,
                        plan_template_item_id,
                        scheduled_date,
-                       planned_distance_miles
+                       planned_distance_miles,
+                       planned_duration_seconds
                 FROM public.fitness_scheduled_workouts
                 WHERE user_id = %s
                   AND plan_instance_id = %s
@@ -1791,6 +1933,7 @@ def repeat_plan_instance_week(
                     plan_template_item_id=workout["plan_template_item_id"],
                     scheduled_date=repeated_date,
                     planned_distance_miles=workout["planned_distance_miles"],
+                    planned_duration_seconds=workout.get("planned_duration_seconds"),
                 )
                 repeated_ids.append(repeated_id)
                 cur.execute(
@@ -2054,8 +2197,94 @@ class RunningHistoricalEffortAdapter(HistoricalEffortAdapter):
         }
 
 
+class CyclingHistoricalEffortAdapter(HistoricalEffortAdapter):
+    workout_type = "CYCLING"
+    metrics = (
+        HistoricalMetricDefinition("duration_seconds", "Duration", "SECONDS", True),
+        HistoricalMetricDefinition("moving_duration_seconds", "Moving Duration", "SECONDS", True),
+        HistoricalMetricDefinition("completed_distance_miles", "Completed Distance", "MILES"),
+        HistoricalMetricDefinition("average_power_watts", "Avg Power", "WATTS"),
+        HistoricalMetricDefinition("max_power_watts", "Max Power", "WATTS"),
+        HistoricalMetricDefinition("normalized_power_watts", "Normalized Power", "WATTS"),
+        HistoricalMetricDefinition("average_cadence_rpm", "Avg Cadence", "RPM"),
+        HistoricalMetricDefinition("max_cadence_rpm", "Max Cadence", "RPM"),
+        HistoricalMetricDefinition("average_hr", "Avg HR", "BPM"),
+        HistoricalMetricDefinition("max_hr", "Max HR", "BPM"),
+        HistoricalMetricDefinition("training_load", "Training Load", "DECIMAL"),
+        HistoricalMetricDefinition("aerobic_training_effect", "Aerobic Training Effect", "DECIMAL"),
+        HistoricalMetricDefinition("anaerobic_training_effect", "Anaerobic Training Effect", "DECIMAL"),
+        HistoricalMetricDefinition("resistance_avg", "Avg Resistance", "DECIMAL"),
+        HistoricalMetricDefinition("resistance_min", "Min Resistance", "DECIMAL"),
+        HistoricalMetricDefinition("resistance_max", "Max Resistance", "DECIMAL"),
+    )
+    value_keys = tuple(metric.key for metric in metrics)
+
+    def workout_summary(self, reference: dict) -> dict:
+        summary = super().workout_summary(reference)
+        summary["planned_duration_seconds"] = reference.get("planned_duration_seconds")
+        return summary
+
+    def list_efforts(self, cur, *, user_id: str, reference: dict, limit: int | None) -> tuple[int, list[dict]]:
+        limit_clause = "" if limit is None else "\n                LIMIT %s"
+        params = [
+            user_id,
+            reference["workout_template_id"],
+            reference["planned_duration_seconds"],
+        ]
+        if limit is not None:
+            params.append(limit)
+        cur.execute(
+            f"""
+                SELECT scheduled.id AS scheduled_workout_id,
+                       scheduled.scheduled_date,
+                       scheduled.status,
+                       result.duration_seconds,
+                       result.moving_duration_seconds,
+                       result.completed_distance_miles,
+                       result.average_power_watts,
+                       result.max_power_watts,
+                       result.normalized_power_watts,
+                       result.average_cadence_rpm,
+                       result.max_cadence_rpm,
+                       result.average_hr,
+                       result.max_hr,
+                       result.training_load,
+                       result.aerobic_training_effect,
+                       result.anaerobic_training_effect,
+                       result.resistance_avg,
+                       result.resistance_min,
+                       result.resistance_max,
+                       COUNT(*) OVER() AS total_efforts
+                FROM public.fitness_scheduled_workouts AS scheduled
+                JOIN public.fitness_workout_templates AS template
+                  ON template.id = scheduled.workout_template_id
+                JOIN public.fitness_cycling_workout_results AS result
+                  ON result.scheduled_workout_id = scheduled.id
+                WHERE scheduled.user_id = %s
+                  AND scheduled.status = 'COMPLETED'
+                  AND template.workout_type = 'CYCLING'
+                  AND scheduled.workout_template_id = %s
+                  AND scheduled.planned_duration_seconds = %s
+                ORDER BY scheduled.scheduled_date DESC, scheduled.updated_at DESC, scheduled.id DESC{limit_clause}
+                """,
+            tuple(params),
+        )
+        rows = _rows_to_dicts(cur, cur.fetchall())
+        total_efforts = int(rows[0]["total_efforts"]) if rows else 0
+        return total_efforts, [self._effort_to_api(row) for row in rows]
+
+    def _effort_to_api(self, row: dict) -> dict:
+        return {
+            "scheduled_workout_id": row["scheduled_workout_id"],
+            "scheduled_date": row["scheduled_date"],
+            "status": row["status"],
+            "values": {key: row.get(key) for key in self.value_keys},
+        }
+
+
 HISTORICAL_EFFORT_ADAPTERS = {
     RunningHistoricalEffortAdapter.workout_type: RunningHistoricalEffortAdapter(),
+    CyclingHistoricalEffortAdapter.workout_type: CyclingHistoricalEffortAdapter(),
 }
 
 
@@ -2122,8 +2351,8 @@ def today_workouts(*, user_id: str, target_date: date) -> list[dict]:
 def _validate_garmin_completion_target(workout: dict) -> None:
     if workout["status"] != "PLANNED":
         raise FitnessConflictError("Only planned workouts can be completed")
-    if workout["type"] != "RUNNING":
-        raise FitnessValidationError("Garmin completion is only available for running workouts")
+    if workout["type"] not in {"RUNNING", "CYCLING"}:
+        raise FitnessValidationError("Garmin completion is only available for running and cycling workouts")
 
 
 def _translate_garmin_error(exc: garmin_activity_provider.GarminProviderError) -> FitnessValidationError:
@@ -2178,6 +2407,49 @@ def _insert_garmin_running_result(
     )
 
 
+def _cycling_result_insert_sql(extra_columns: tuple[str, ...]) -> str:
+    columns = ("scheduled_workout_id", "planned_duration_seconds", *extra_columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    set_clause = ",\n                        ".join(
+        f"{column} = EXCLUDED.{column}"
+        for column in columns
+        if column != "scheduled_workout_id"
+    )
+    return f"""
+                    INSERT INTO public.fitness_cycling_workout_results (
+                        {", ".join(columns)}
+                    )
+                    VALUES ({placeholders})
+                    ON CONFLICT (scheduled_workout_id)
+                    DO UPDATE SET
+                        {set_clause},
+                        updated_at = now()
+                    """
+
+
+def _insert_garmin_cycling_result(
+    cur,
+    *,
+    scheduled_workout_id: str,
+    planned_duration_seconds,
+    activity: garmin_activity_provider.GarminCyclingActivity,
+) -> None:
+    activity_values = activity.to_insert_params()
+    result_columns = tuple(
+        column
+        for column in CYCLING_RESULT_COLUMNS
+        if column not in {"planned_duration_seconds", "created_at", "updated_at"}
+    )
+    cur.execute(
+        _cycling_result_insert_sql(result_columns),
+        (
+            scheduled_workout_id,
+            _duration_seconds(planned_duration_seconds),
+            *(activity_values[column] for column in result_columns),
+        ),
+    )
+
+
 def _complete_scheduled_running_workout_with_garmin_activity(
     *,
     user_id: str,
@@ -2194,6 +2466,8 @@ def _complete_scheduled_running_workout_with_garmin_activity(
                 lock=True,
             )
             _validate_garmin_completion_target(workout)
+            if workout["type"] != "RUNNING":
+                raise FitnessValidationError("Garmin running activities can only complete running workouts")
             _insert_garmin_running_result(
                 cur,
                 scheduled_workout_id=scheduled_workout_id,
@@ -2230,6 +2504,60 @@ def _complete_scheduled_running_workout_with_garmin_activity(
         put_db_conn(conn)
 
 
+def _complete_scheduled_cycling_workout_with_garmin_activity(
+    *,
+    user_id: str,
+    scheduled_workout_id: str,
+    activity: garmin_activity_provider.GarminCyclingActivity,
+) -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            workout = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+                lock=True,
+            )
+            _validate_garmin_completion_target(workout)
+            if workout["type"] != "CYCLING":
+                raise FitnessValidationError("Garmin cycling activities can only complete cycling workouts")
+            _insert_garmin_cycling_result(
+                cur,
+                scheduled_workout_id=scheduled_workout_id,
+                planned_duration_seconds=workout["planned_duration_seconds"],
+                activity=activity,
+            )
+            cur.execute(
+                """
+                UPDATE public.fitness_scheduled_workouts
+                SET status = 'COMPLETED',
+                    updated_at = now()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND status = 'PLANNED'
+                """,
+                (scheduled_workout_id, user_id),
+            )
+            if cur.rowcount != 1:
+                raise FitnessConflictError("Only planned workouts can be completed")
+            result = _get_scheduled_workout(
+                cur,
+                user_id=user_id,
+                scheduled_workout_id=scheduled_workout_id,
+            )
+        conn.commit()
+        return result
+    except errors.UniqueViolation as exc:
+        conn.rollback()
+        raise FitnessConflictError("Garmin activity is already linked to a completed ride") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def attempt_garmin_scheduled_workout_completion(
     *,
     user_id: str,
@@ -2242,7 +2570,10 @@ def attempt_garmin_scheduled_workout_completion(
     _validate_garmin_completion_target(workout)
     scheduled_date = date.fromisoformat(workout["scheduled_date"])
     try:
-        resolution = garmin_activity_provider.resolve_running_activities(scheduled_date)
+        if workout["type"] == "CYCLING":
+            resolution = garmin_activity_provider.resolve_cycling_activities(scheduled_date)
+        else:
+            resolution = garmin_activity_provider.resolve_running_activities(scheduled_date)
     except garmin_activity_provider.GarminProviderError as exc:
         raise _translate_garmin_error(exc) from exc
 
@@ -2254,11 +2585,18 @@ def attempt_garmin_scheduled_workout_completion(
                 "candidates": [candidate.to_api_dict() for candidate in resolution.candidates],
             }
         return {"status": "NO_MATCH"}
-    completed = _complete_scheduled_running_workout_with_garmin_activity(
-        user_id=user_id,
-        scheduled_workout_id=scheduled_workout_id,
-        activity=activities[0],
-    )
+    if workout["type"] == "CYCLING":
+        completed = _complete_scheduled_cycling_workout_with_garmin_activity(
+            user_id=user_id,
+            scheduled_workout_id=scheduled_workout_id,
+            activity=activities[0],
+        )
+    else:
+        completed = _complete_scheduled_running_workout_with_garmin_activity(
+            user_id=user_id,
+            scheduled_workout_id=scheduled_workout_id,
+            activity=activities[0],
+        )
     return {"status": "COMPLETED", "workout": completed}
 
 
@@ -2275,20 +2613,33 @@ def complete_scheduled_workout_with_garmin_activity(
     _validate_garmin_completion_target(workout)
     scheduled_date = date.fromisoformat(workout["scheduled_date"])
     try:
-        activity = garmin_activity_provider.find_running_activity(
-            scheduled_date,
-            activity_id=activity_id,
-        )
+        if workout["type"] == "CYCLING":
+            activity = garmin_activity_provider.find_cycling_activity(
+                scheduled_date,
+                activity_id=activity_id,
+            )
+        else:
+            activity = garmin_activity_provider.find_running_activity(
+                scheduled_date,
+                activity_id=activity_id,
+            )
     except garmin_activity_provider.GarminProviderError as exc:
         raise _translate_garmin_error(exc) from exc
 
     if activity is None:
         raise FitnessValidationError("Selected Garmin activity is not available for this scheduled date")
-    completed = _complete_scheduled_running_workout_with_garmin_activity(
-        user_id=user_id,
-        scheduled_workout_id=scheduled_workout_id,
-        activity=activity,
-    )
+    if workout["type"] == "CYCLING":
+        completed = _complete_scheduled_cycling_workout_with_garmin_activity(
+            user_id=user_id,
+            scheduled_workout_id=scheduled_workout_id,
+            activity=activity,
+        )
+    else:
+        completed = _complete_scheduled_running_workout_with_garmin_activity(
+            user_id=user_id,
+            scheduled_workout_id=scheduled_workout_id,
+            activity=activity,
+        )
     return {"status": "COMPLETED", "workout": completed}
 
 
@@ -2328,6 +2679,8 @@ def _assert_safe_planned_removal(cur, *, user_id: str, workout: dict) -> None:
         raise FitnessConflictError("Only planned workouts can be removed")
     if workout.get("running_result"):
         raise FitnessConflictError("Workout has Running result data")
+    if workout.get("cycling_result"):
+        raise FitnessConflictError("Workout has Cycling result data")
     _assert_no_weightlifting_entries(
         cur,
         user_id=user_id,
@@ -2390,6 +2743,8 @@ def replace_scheduled_workout_template(
                 raise FitnessConflictError("Only planned workouts can change templates")
             if workout.get("running_result"):
                 raise FitnessConflictError("Workout has Running result data")
+            if workout.get("cycling_result"):
+                raise FitnessConflictError("Workout has Cycling result data")
             _assert_no_weightlifting_entries(
                 cur,
                 user_id=user_id,
@@ -2408,6 +2763,7 @@ def replace_scheduled_workout_template(
                 SET workout_template_id = %s,
                     plan_template_item_id = NULL,
                     planned_distance_miles = %s,
+                    planned_duration_seconds = %s,
                     updated_at = now()
                 WHERE id = %s
                   AND user_id = %s
@@ -2416,6 +2772,7 @@ def replace_scheduled_workout_template(
                 (
                     workout_template_id,
                     _planned_distance_snapshot(template),
+                    _planned_duration_snapshot(template),
                     scheduled_workout_id,
                     user_id,
                 ),
@@ -2459,6 +2816,8 @@ def undo_reschedule(*, user_id: str, scheduled_workout_id: str) -> dict:
                 raise FitnessConflictError("Only planned replacement workouts can be removed")
             if replacement.get("running_result"):
                 raise FitnessConflictError("Replacement has Running result data")
+            if replacement.get("cycling_result"):
+                raise FitnessConflictError("Replacement has Cycling result data")
             _assert_no_weightlifting_entries(
                 cur,
                 user_id=user_id,
@@ -2529,6 +2888,11 @@ def remove_remaining_recurring_workouts(
                   AND NOT EXISTS (
                       SELECT 1
                       FROM public.fitness_running_workout_results AS result
+                      WHERE result.scheduled_workout_id = scheduled.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM public.fitness_cycling_workout_results AS result
                       WHERE result.scheduled_workout_id = scheduled.id
                   )
                   AND NOT EXISTS (
@@ -2614,6 +2978,7 @@ def _plan_instance_cleanup(
                 SELECT scheduled.id,
                        scheduled.status,
                        result.scheduled_workout_id IS NOT NULL AS has_running_result,
+                       cycling_result.scheduled_workout_id IS NOT NULL AS has_cycling_result,
                        EXISTS (
                            SELECT 1
                            FROM public.weightlifting_entries AS lifting
@@ -2630,6 +2995,8 @@ def _plan_instance_cleanup(
                 FROM public.fitness_scheduled_workouts AS scheduled
                 LEFT JOIN public.fitness_running_workout_results AS result
                   ON result.scheduled_workout_id = scheduled.id
+                LEFT JOIN public.fitness_cycling_workout_results AS cycling_result
+                  ON cycling_result.scheduled_workout_id = scheduled.id
                 WHERE scheduled.user_id = %s
                   AND scheduled.plan_instance_id = %s
                   AND (%s OR scheduled.scheduled_date >= %s)
@@ -2638,13 +3005,17 @@ def _plan_instance_cleanup(
                 """,
                 (user_id, instance_id, unstarted_only, cutoff),
             )
-            locked_rows = cur.fetchall()
+            locked_rows = _rows_to_dicts(cur, cur.fetchall())
             if unstarted_only and instance_status == "COMPLETED":
                 raise FitnessConflictError("Completed plan instances cannot be removed as unstarted")
             removable_ids = [
-                str(row[0])
+                str(row["id"])
                 for row in locked_rows
-                if row[1] == "PLANNED" and not row[2] and not row[3] and not row[4]
+                if row["status"] == "PLANNED"
+                and not row["has_running_result"]
+                and not row.get("has_cycling_result")
+                and not row["has_weightlifting_entries"]
+                and not row["is_reschedule_replacement"]
             ]
             if unstarted_only:
                 if len(removable_ids) != len(locked_rows):
@@ -2779,10 +3150,34 @@ def training_calendar(
             and workout.get("running_result")
             and workout["running_result"].get("completed_distance_miles") is not None
         ]
+        planned_rides = [
+            workout
+            for workout in week_workouts
+            if workout["type"] == "CYCLING"
+            and workout["status"] != "RESCHEDULED"
+            and workout.get("planned_duration_seconds") is not None
+        ]
+        completed_rides = [
+            workout
+            for workout in week_workouts
+            if workout["type"] == "CYCLING"
+            and workout["status"] == "COMPLETED"
+            and workout.get("cycling_result")
+        ]
         planned_mileage = sum(Decimal(str(workout["planned_distance_miles"])) for workout in planned_runs)
         actual_mileage = sum(
             Decimal(str(workout["running_result"]["completed_distance_miles"]))
             for workout in completed_runs
+        )
+        planned_cycling_duration = sum(int(workout["planned_duration_seconds"]) for workout in planned_rides)
+        actual_cycling_duration = sum(
+            int(workout["cycling_result"].get("duration_seconds") or 0)
+            for workout in completed_rides
+        )
+        actual_cycling_distance = sum(
+            Decimal(str(workout["cycling_result"]["completed_distance_miles"]))
+            for workout in completed_rides
+            if workout["cycling_result"].get("completed_distance_miles") is not None
         )
         longest_planned = max(
             (Decimal(str(workout["planned_distance_miles"])) for workout in planned_runs),
@@ -2821,6 +3216,10 @@ def training_calendar(
                 if not planned_mileage or longest_planned is None
                 else _serialize_value((longest_planned / planned_mileage) * Decimal("100"))
             ),
+            "planned_cycling_seconds": planned_cycling_duration,
+            "actual_cycling_seconds": actual_cycling_duration,
+            "actual_cycling_miles": _serialize_value(actual_cycling_distance),
+            "completed_cycling_sessions": len(completed_rides),
             "completed_lifting_sessions": len(
                 [
                     workout
@@ -2891,6 +3290,8 @@ def complete_scheduled_workout(
                         running.get("notes"),
                     ),
                 )
+            elif workout["type"] == "CYCLING":
+                raise FitnessValidationError("Cycling completion requires Garmin activity reconciliation")
             cur.execute(
                 """
                 UPDATE public.fitness_scheduled_workouts
@@ -2984,6 +3385,7 @@ def reschedule_scheduled_workout(
                 scheduled_date=scheduled_date,
                 original_scheduled_date=workout["original_scheduled_date"],
                 planned_distance_miles=workout["planned_distance_miles"],
+                planned_duration_seconds=workout["planned_duration_seconds"],
             )
             cur.execute(
                 """

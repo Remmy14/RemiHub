@@ -105,6 +105,7 @@ def get_planned_workouts(conn, *, user_id: str, target_date) -> list[dict]:
             SELECT scheduled.id,
                    scheduled.scheduled_date,
                    scheduled.planned_distance_miles,
+                   scheduled.planned_duration_seconds,
                    template.name,
                    template.workout_type,
                    (
@@ -129,6 +130,10 @@ def workout_summary(workout: dict) -> str:
     if workout["workout_type"] == "RUNNING":
         distance = workout.get("planned_distance_miles")
         return f"{workout['name']} - {float(distance):g} mi"
+    if workout["workout_type"] == "CYCLING":
+        duration = workout.get("planned_duration_seconds")
+        minutes = int(duration or 0) // 60
+        return f"{workout['name']} - {minutes:g} min"
     return f"{workout['name']} - {workout.get('exercise_count') or 0} exercises"
 
 

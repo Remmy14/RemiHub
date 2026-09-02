@@ -11,6 +11,7 @@ from typing import Callable, Any
 GARMIN_TOKENSTORE_ENV = "GARMIN_TOKENSTORE"
 GARMIN_PROVIDER = "GARMIN"
 METERS_PER_MILE = Decimal("1609.344")
+CYCLING_ACTIVITY_TYPE_KEYS = ("indoor_cycling",)
 
 
 class GarminProviderError(RuntimeError):
@@ -90,8 +91,45 @@ class GarminRunningActivity:
 
 
 @dataclass(frozen=True)
+class GarminCyclingActivity:
+    external_provider: str
+    external_activity_id: str
+    external_activity_uuid: str | None
+    external_activity_name: str | None
+    external_activity_type_key: str
+    external_manufacturer: str | None
+    start_time_local: str | None
+    duration_seconds: int
+    moving_duration_seconds: int | None
+    completed_distance_miles: Decimal
+    calories: Decimal | None
+    average_power_watts: Decimal | None
+    max_power_watts: Decimal | None
+    normalized_power_watts: Decimal | None
+    average_cadence_rpm: Decimal | None
+    max_cadence_rpm: Decimal | None
+    average_hr: Decimal | None
+    max_hr: Decimal | None
+    hr_zone_1_seconds: int | None
+    hr_zone_2_seconds: int | None
+    hr_zone_3_seconds: int | None
+    hr_zone_4_seconds: int | None
+    hr_zone_5_seconds: int | None
+    aerobic_training_effect: Decimal | None
+    anaerobic_training_effect: Decimal | None
+    training_load: Decimal | None
+    training_effect_label: str | None
+    resistance_min: Decimal | None
+    resistance_avg: Decimal | None
+    resistance_max: Decimal | None
+
+    def to_insert_params(self) -> dict:
+        return self.__dict__.copy()
+
+
+@dataclass(frozen=True)
 class GarminActivityResolution:
-    activities: list[GarminRunningActivity]
+    activities: list[GarminRunningActivity | GarminCyclingActivity]
     candidates: list[GarminActivityCandidate]
 
 
@@ -139,6 +177,11 @@ def _activity_type_key(summary: dict) -> str | None:
         value = activity_type.get("typeKey")
         return str(value) if value is not None else None
     return None
+
+
+def _activity_manufacturer(summary: dict) -> str | None:
+    value = summary.get("manufacturer")
+    return str(value) if value is not None else None
 
 
 def normalize_activity_summary(summary: dict) -> GarminRunningActivity:
@@ -193,6 +236,88 @@ def normalize_activity_summary(summary: dict) -> GarminRunningActivity:
         elevation_loss_meters=_decimal(summary.get("elevationLoss")),
         calories=_decimal(summary.get("calories")),
         steps=_int_count(summary.get("steps")),
+    )
+
+
+def _decimal_from_keys(summary: dict, *keys: str) -> Decimal | None:
+    for key in keys:
+        if summary.get(key) is not None:
+            return _decimal(summary.get(key))
+    return None
+
+
+def normalize_cycling_activity_summary(
+    summary: dict,
+    *,
+    resistance: tuple[Decimal | None, Decimal | None, Decimal | None] | None = None,
+) -> GarminCyclingActivity:
+    if not isinstance(summary, dict):
+        raise GarminMalformedResponseError("Garmin activity summary is not an object")
+    activity_type_key = _activity_type_key(summary)
+    if activity_type_key not in CYCLING_ACTIVITY_TYPE_KEYS:
+        raise GarminMalformedResponseError("Garmin activity summary is not a cycling activity")
+
+    activity_id = summary.get("activityId")
+    if activity_id is None or str(activity_id).strip() == "":
+        raise GarminMalformedResponseError("Garmin activity summary is missing activityId")
+
+    distance_meters = _decimal(summary.get("distance"), required=True)
+    duration_seconds = _seconds(summary.get("duration"), required=True)
+    resistance_min, resistance_avg, resistance_max = resistance or (None, None, None)
+    return GarminCyclingActivity(
+        external_provider=GARMIN_PROVIDER,
+        external_activity_id=str(activity_id),
+        external_activity_uuid=(
+            str(summary["activityUUID"]) if summary.get("activityUUID") is not None else None
+        ),
+        external_activity_name=(
+            str(summary["activityName"]) if summary.get("activityName") is not None else None
+        ),
+        external_activity_type_key=activity_type_key,
+        external_manufacturer=_activity_manufacturer(summary),
+        start_time_local=(
+            str(summary["startTimeLocal"]) if summary.get("startTimeLocal") is not None else None
+        ),
+        duration_seconds=duration_seconds,
+        moving_duration_seconds=_seconds(summary.get("movingDuration")),
+        completed_distance_miles=distance_meters / METERS_PER_MILE,
+        calories=_decimal(summary.get("calories")),
+        average_power_watts=_decimal(summary.get("avgPower")),
+        max_power_watts=_decimal(summary.get("maxPower")),
+        normalized_power_watts=_decimal_from_keys(
+            summary,
+            "normPower",
+            "normalizedPower",
+            "normalizedPowerWatts",
+        ),
+        average_cadence_rpm=_decimal_from_keys(
+            summary,
+            "averageBikeCadenceInRevPerMinute",
+            "averageCadence",
+        ),
+        max_cadence_rpm=_decimal_from_keys(
+            summary,
+            "maxBikeCadenceInRevPerMinute",
+            "maxCadence",
+        ),
+        average_hr=_decimal(summary.get("averageHR")),
+        max_hr=_decimal(summary.get("maxHR")),
+        hr_zone_1_seconds=_seconds(summary.get("hrTimeInZone_1")),
+        hr_zone_2_seconds=_seconds(summary.get("hrTimeInZone_2")),
+        hr_zone_3_seconds=_seconds(summary.get("hrTimeInZone_3")),
+        hr_zone_4_seconds=_seconds(summary.get("hrTimeInZone_4")),
+        hr_zone_5_seconds=_seconds(summary.get("hrTimeInZone_5")),
+        aerobic_training_effect=_decimal(summary.get("aerobicTrainingEffect")),
+        anaerobic_training_effect=_decimal(summary.get("anaerobicTrainingEffect")),
+        training_load=_decimal(summary.get("activityTrainingLoad")),
+        training_effect_label=(
+            str(summary["trainingEffectLabel"])
+            if summary.get("trainingEffectLabel") is not None
+            else None
+        ),
+        resistance_min=resistance_min,
+        resistance_avg=resistance_avg,
+        resistance_max=resistance_max,
     )
 
 
@@ -264,6 +389,83 @@ def fetch_running_activity_summaries(
     return activities
 
 
+def fetch_cycling_activity_summaries(
+    scheduled_date: date,
+    *,
+    tokenstore: str | None = None,
+) -> list[dict]:
+    summaries: list[dict] = []
+    for activity_type in CYCLING_ACTIVITY_TYPE_KEYS:
+        api = _runtime_api(tokenstore)
+        garmin_date = scheduled_date.isoformat()
+        activities = _garmin_call(
+            lambda: api.get_activities_by_date(
+                garmin_date,
+                garmin_date,
+                activitytype=activity_type,
+                sortorder="asc",
+            )
+        )
+        if not isinstance(activities, list):
+            raise GarminMalformedResponseError("Garmin activities response is not a list")
+        summaries.extend(activities)
+    return summaries
+
+
+def _activity_detail_metrics(detail: Any) -> list[dict]:
+    if not isinstance(detail, dict):
+        return []
+    for key in ("activityDetailMetrics", "metrics", "samples"):
+        value = detail.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _resistance_aggregates(detail: Any) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    values = [
+        value
+        for value in (
+            _decimal(sample.get("directResistance"))
+            for sample in _activity_detail_metrics(detail)
+            if sample.get("directResistance") is not None
+        )
+        if value is not None
+    ]
+    if not values:
+        return None, None, None
+    return min(values), sum(values) / Decimal(len(values)), max(values)
+
+
+def _is_peloton(summary: dict) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    manufacturer = _activity_manufacturer(summary)
+    return manufacturer is not None and manufacturer.upper() == "PELOTON"
+
+
+def _fetch_activity_detail(api, activity_id: str) -> Any:
+    return _garmin_call(lambda: api.get_activity_details(activity_id))
+
+
+def _normalize_cycling_summaries(
+    summaries: list[dict],
+    *,
+    tokenstore: str | None = None,
+) -> list[GarminCyclingActivity]:
+    activities = []
+    api = None
+    for summary in summaries:
+        resistance = None
+        activity_id = summary.get("activityId") if isinstance(summary, dict) else None
+        if _is_peloton(summary) and activity_id is not None:
+            if api is None:
+                api = _runtime_api(tokenstore)
+            resistance = _resistance_aggregates(_fetch_activity_detail(api, str(activity_id)))
+        activities.append(normalize_cycling_activity_summary(summary, resistance=resistance))
+    return activities
+
+
 def list_running_activity_candidates(
     scheduled_date: date,
     *,
@@ -314,6 +516,40 @@ def find_running_activity(
         if str(activity.get("activityId")) == selected:
             return normalize_activity_summary(activity)
     return None
+
+
+def resolve_cycling_activities(
+    scheduled_date: date,
+    *,
+    tokenstore: str | None = None,
+) -> GarminActivityResolution:
+    summaries = fetch_cycling_activity_summaries(scheduled_date, tokenstore=tokenstore)
+    if len(summaries) > 1:
+        return GarminActivityResolution(
+            activities=[],
+            candidates=[summarize_candidate(activity) for activity in summaries],
+        )
+    return GarminActivityResolution(
+        activities=_normalize_cycling_summaries(summaries, tokenstore=tokenstore),
+        candidates=[],
+    )
+
+
+def find_cycling_activity(
+    scheduled_date: date,
+    *,
+    activity_id: str,
+    tokenstore: str | None = None,
+) -> GarminCyclingActivity | None:
+    selected = str(activity_id)
+    summaries = [
+        activity
+        for activity in fetch_cycling_activity_summaries(scheduled_date, tokenstore=tokenstore)
+        if str(activity.get("activityId")) == selected
+    ]
+    if not summaries:
+        return None
+    return _normalize_cycling_summaries(summaries[:1], tokenstore=tokenstore)[0]
 
 
 def bootstrap_garmin_tokenstore(

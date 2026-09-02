@@ -64,6 +64,7 @@ def create_workout_template(
                 workout_type=request.type.value,
                 notes=request.notes,
                 planned_distance_miles=request.planned_distance_miles,
+                planned_duration_seconds=request.planned_duration_seconds,
                 exercises=[item.model_dump(mode="json") for item in request.exercises],
             ),
         }

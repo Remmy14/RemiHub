@@ -1,6 +1,6 @@
 import { apiRequest } from "./authenticatedApi";
 
-export type FitnessWorkoutType = "RUNNING" | "LIFTING";
+export type FitnessWorkoutType = "RUNNING" | "LIFTING" | "CYCLING";
 export type FitnessWorkoutStatus =
   | "PLANNED"
   | "COMPLETED"
@@ -69,6 +69,42 @@ export type FitnessLiftingResult = {
   entries: FitnessLiftingEntry[];
 };
 
+export type FitnessCyclingResult = {
+  planned_duration_seconds: number;
+  external_provider: string | null;
+  external_activity_id: string | null;
+  external_activity_uuid: string | null;
+  external_activity_name: string | null;
+  external_activity_type_key: string | null;
+  external_manufacturer: string | null;
+  start_time_local: string | null;
+  duration_seconds: number;
+  moving_duration_seconds: number | null;
+  completed_distance_miles: number;
+  calories: number | null;
+  average_power_watts: number | null;
+  max_power_watts: number | null;
+  normalized_power_watts: number | null;
+  average_cadence_rpm: number | null;
+  max_cadence_rpm: number | null;
+  average_hr: number | null;
+  max_hr: number | null;
+  hr_zone_1_seconds: number | null;
+  hr_zone_2_seconds: number | null;
+  hr_zone_3_seconds: number | null;
+  hr_zone_4_seconds: number | null;
+  hr_zone_5_seconds: number | null;
+  aerobic_training_effect: number | null;
+  anaerobic_training_effect: number | null;
+  training_load: number | null;
+  training_effect_label: string | null;
+  resistance_min: number | null;
+  resistance_avg: number | null;
+  resistance_max: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
 export type FitnessScheduledWorkout = {
   id: string;
   user_id: string;
@@ -81,11 +117,13 @@ export type FitnessScheduledWorkout = {
   status: FitnessWorkoutStatus;
   replacement_scheduled_workout_id: string | null;
   planned_distance_miles: number | null;
+  planned_duration_seconds: number | null;
   workout_name: string;
   type: FitnessWorkoutType;
   source?: FitnessWorkoutSource;
   running_result: FitnessRunningResult | null;
   lifting_result: FitnessLiftingResult | null;
+  cycling_result: FitnessCyclingResult | null;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -134,6 +172,10 @@ export type FitnessWeeklySummary = {
   actual_mileage_change: number | null;
   planned_long_run_percentage: number | null;
   completed_lifting_sessions: number;
+  planned_cycling_seconds: number;
+  actual_cycling_seconds: number;
+  actual_cycling_miles: number;
+  completed_cycling_sessions: number;
 };
 
 export type FitnessCalendarDay = {
@@ -169,6 +211,7 @@ export type FitnessWorkoutTemplate = {
   notes: string | null;
   active: boolean;
   planned_distance_miles: number | null;
+  planned_duration_seconds: number | null;
   exercises?: FitnessLiftingTemplateExercise[];
   created_at: string | null;
   updated_at: string | null;
@@ -226,6 +269,19 @@ export type RunningCompletionRequest = {
   duration_seconds: number;
   notes?: string | null;
 };
+
+export type GarminActivityCandidate = {
+  activityId: string;
+  activityName: string | null;
+  startTimeLocal: string | null;
+  distance: number | null;
+  duration: number | null;
+};
+
+export type GarminCompletionResult =
+  | { status: "NO_MATCH" }
+  | { status: "AMBIGUOUS_MATCH"; candidates: GarminActivityCandidate[] }
+  | { status: "COMPLETED"; workout: FitnessScheduledWorkout };
 
 export type FitnessRescheduleResult = {
   original: FitnessScheduledWorkout;
@@ -364,6 +420,30 @@ export async function completeScheduledWorkout(
   return response.data;
 }
 
+export async function completeScheduledWorkoutWithGarmin(
+  workoutId: string,
+): Promise<GarminCompletionResult> {
+  const response = await apiRequest<FitnessResponse<GarminCompletionResult>>(
+    `/fitness/scheduled-workouts/${workoutId}/garmin/complete`,
+    { method: "POST" },
+  );
+  return response.data;
+}
+
+export async function completeScheduledWorkoutWithGarminSelection(
+  workoutId: string,
+  activityId: string,
+): Promise<GarminCompletionResult> {
+  const response = await apiRequest<FitnessResponse<GarminCompletionResult>>(
+    `/fitness/scheduled-workouts/${workoutId}/garmin/complete-selection`,
+    {
+      method: "POST",
+      body: JSON.stringify({ activity_id: activityId }),
+    },
+  );
+  return response.data;
+}
+
 export async function skipScheduledWorkout(
   workoutId: string,
 ): Promise<FitnessScheduledWorkout> {
@@ -464,6 +544,7 @@ export type WorkoutTemplatePayload = {
   type: FitnessWorkoutType;
   notes: string | null;
   planned_distance_miles?: number | null;
+  planned_duration_seconds?: number | null;
   exercises?: Array<{ exercise_id: string; display_order: number }>;
 };
 
@@ -486,6 +567,7 @@ export async function updateWorkoutTemplate(
     name?: string;
     notes?: string | null;
     planned_distance_miles?: number | null;
+    planned_duration_seconds?: number | null;
   },
 ): Promise<FitnessWorkoutTemplate> {
   const response = await apiRequest<FitnessResponse<FitnessWorkoutTemplate>>(

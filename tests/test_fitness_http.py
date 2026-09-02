@@ -23,6 +23,7 @@ pool.ThreadedConnectionPool = OfflineThreadedConnectionPool
 
 from backend.core.auth import AuthenticatedPrincipal, require_current_principal
 from backend.routers import fitness
+from backend.models.fitness_models import WorkoutTemplateCreate
 
 
 USER = AuthenticatedPrincipal(
@@ -35,6 +36,19 @@ USER = AuthenticatedPrincipal(
 
 
 class FitnessHttpTests(unittest.TestCase):
+    def test_cycling_template_model_requires_positive_planned_duration(self):
+        template = WorkoutTemplateCreate(
+            name="Easy Ride",
+            type="CYCLING",
+            planned_duration_seconds=1800,
+        )
+
+        self.assertEqual(template.planned_duration_seconds, 1800)
+        with self.assertRaises(ValueError):
+            WorkoutTemplateCreate(name="Easy Ride", type="CYCLING")
+        with self.assertRaises(ValueError):
+            WorkoutTemplateCreate(name="Easy Ride", type="CYCLING", planned_duration_seconds=0)
+
     def test_fitness_router_requires_strict_principal_dependency(self):
         route = next(
             route

@@ -16,6 +16,7 @@ class FakeGarminApi:
     date_calls = []
     prohibited_calls = []
     activities = []
+    activity_details = {}
     login_error = None
     activities_error = None
 
@@ -29,6 +30,7 @@ class FakeGarminApi:
         cls.date_calls = []
         cls.prohibited_calls = []
         cls.activities = []
+        cls.activity_details = {}
         cls.login_error = None
         cls.activities_error = None
 
@@ -52,6 +54,9 @@ class FakeGarminApi:
         raise AssertionError("get_activity_splits must not be called")
 
     def get_activity_details(self, *_args, **_kwargs):
+        activity_id = str(_args[0])
+        if activity_id in self.__class__.activity_details:
+            return self.__class__.activity_details[activity_id]
         self.__class__.prohibited_calls.append("get_activity_details")
         raise AssertionError("get_activity_details must not be called")
 
@@ -219,6 +224,106 @@ class GarminActivityProviderTests(unittest.TestCase):
     def test_malformed_response_is_structured(self):
         with self.assertRaises(provider.GarminMalformedResponseError):
             provider.normalize_activity_summary({"activityId": 1, "activityType": {"typeKey": "cycling"}})
+
+    def test_cycling_query_uses_verified_indoor_cycling_activity_type(self):
+        FakeGarminApi.activities = [{"activityId": 123, "activityName": "Ride"}]
+
+        with self.patch_garmin():
+            provider.fetch_cycling_activity_summaries(
+                date(2026, 8, 29),
+                tokenstore="/secure/garmin",
+            )
+
+        self.assertEqual(
+            FakeGarminApi.date_calls,
+            [("2026-08-29", "2026-08-29", "indoor_cycling", "asc")],
+        )
+        self.assertEqual(FakeGarminApi.prohibited_calls, [])
+
+    def test_cycling_summary_metrics_and_manufacturer_are_canonical(self):
+        activity = provider.normalize_cycling_activity_summary(
+            {
+                "activityId": 456,
+                "activityUUID": "uuid-456",
+                "activityName": "18 min Just Ride",
+                "activityType": {"typeKey": "indoor_cycling"},
+                "manufacturer": "PELOTON",
+                "startTimeLocal": "2026-08-29 06:30:00",
+                "distance": "8107",
+                "duration": "1083",
+                "movingDuration": "1081",
+                "calories": "260",
+                "avgPower": "103",
+                "maxPower": "218",
+                "normPower": "132",
+                "averageBikeCadenceInRevPerMinute": "78",
+                "maxBikeCadenceInRevPerMinute": "110",
+                "averageHR": "151",
+                "maxHR": "163",
+                "activityTrainingLoad": "21",
+                "aerobicTrainingEffect": "2.4",
+                "anaerobicTrainingEffect": "0.1",
+            },
+            resistance=(Decimal("24"), Decimal("39.49"), Decimal("57")),
+        )
+
+        self.assertEqual(activity.external_activity_type_key, "indoor_cycling")
+        self.assertEqual(activity.external_manufacturer, "PELOTON")
+        self.assertEqual(activity.completed_distance_miles, Decimal("8107") / provider.METERS_PER_MILE)
+        self.assertEqual(activity.average_power_watts, Decimal("103"))
+        self.assertEqual(activity.max_power_watts, Decimal("218"))
+        self.assertEqual(activity.normalized_power_watts, Decimal("132"))
+        self.assertEqual(activity.average_cadence_rpm, Decimal("78"))
+        self.assertEqual(activity.max_cadence_rpm, Decimal("110"))
+        self.assertEqual(activity.resistance_avg, Decimal("39.49"))
+
+    def test_peloton_resistance_aggregates_are_transient_detail_derived(self):
+        FakeGarminApi.activities = [
+            {
+                "activityId": 456,
+                "activityType": {"typeKey": "indoor_cycling"},
+                "manufacturer": "PELOTON",
+                "distance": "1609.344",
+                "duration": "600",
+            }
+        ]
+        FakeGarminApi.activity_details = {
+            "456": {
+                "activityDetailMetrics": [
+                    {"directResistance": "24"},
+                    {"directResistance": "57"},
+                    {"directResistance": None},
+                    {"directResistance": "37.5"},
+                ]
+            }
+        }
+
+        with self.patch_garmin():
+            resolution = provider.resolve_cycling_activities(
+                date(2026, 8, 29),
+                tokenstore="/secure/garmin",
+            )
+
+        self.assertEqual(len(resolution.activities), 1)
+        activity = resolution.activities[0]
+        self.assertEqual(activity.resistance_min, Decimal("24"))
+        self.assertEqual(activity.resistance_max, Decimal("57"))
+        self.assertEqual(activity.resistance_avg, Decimal("39.5"))
+        self.assertNotIn("get_activity", FakeGarminApi.prohibited_calls)
+
+    def test_cycling_partial_or_missing_hr_remains_nullable(self):
+        activity = provider.normalize_cycling_activity_summary(
+            {
+                "activityId": 456,
+                "activityType": {"typeKey": "indoor_cycling"},
+                "distance": "1609.344",
+                "duration": "600",
+                "maxHR": "163",
+            }
+        )
+
+        self.assertIsNone(activity.average_hr)
+        self.assertEqual(activity.max_hr, Decimal("163"))
 
     def test_bootstrap_script_does_not_import_garminconnect(self):
         script = Path("backend/scripts/garmin_auth_bootstrap.py").read_text(encoding="utf-8")
