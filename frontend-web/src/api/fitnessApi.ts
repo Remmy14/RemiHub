@@ -74,6 +74,7 @@ export type FitnessScheduledWorkout = {
   user_id: string;
   workout_template_id: string;
   plan_instance_id: string | null;
+  plan_template_item_id: string | null;
   recurring_series_id: string | null;
   scheduled_date: string;
   original_scheduled_date: string;
@@ -206,6 +207,18 @@ export type FitnessPlanInstance = {
   scheduled_workouts?: FitnessScheduledWorkout[];
   created_at: string | null;
   updated_at: string | null;
+};
+
+export type FitnessPlanInstanceRepeatWeekResult = FitnessPlanInstance & {
+  repeat_operation_id: string;
+  selected_week_start: string;
+  selected_week_end: string;
+  repeated_week_start: string;
+  repeated_week_end: string;
+  repeated_scheduled_workout_ids: string[];
+  repeated_count: number;
+  shifted_scheduled_workout_ids: string[];
+  shifted_count: number;
 };
 
 export type RunningCompletionRequest = {
@@ -658,6 +671,20 @@ export async function removeRemainingPlanWorkouts(
     {
       method: "POST",
       body: JSON.stringify(fromDate ? { from_date: fromDate } : {}),
+    },
+  );
+  return response.data;
+}
+
+export async function repeatPlanInstanceWeek(
+  planInstanceId: string,
+  payload: { week_start: string; idempotency_key?: string | null },
+): Promise<FitnessPlanInstanceRepeatWeekResult> {
+  const response = await apiRequest<FitnessResponse<FitnessPlanInstanceRepeatWeekResult>>(
+    `/fitness/plan-instances/${planInstanceId}/repeat-week`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
     },
   );
   return response.data;

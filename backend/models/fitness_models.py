@@ -88,6 +88,11 @@ class PlanInstantiateRequest(FitnessRequestModel):
     start_date: date
 
 
+class PlanInstanceRepeatWeekRequest(FitnessRequestModel):
+    week_start: date
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=160)
+
+
 class ScheduledWorkoutCreate(FitnessRequestModel):
     workout_template_id: UUID
     scheduled_date: date

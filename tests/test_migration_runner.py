@@ -33,6 +33,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0009", "fitness_foundation"),
                 ("0010", "fitness_planning_v2"),
                 ("0011", "fitness_garmin_running_results"),
+                ("0012", "fitness_repeat_training_week"),
             ],
         )
 
@@ -53,6 +54,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0009", "fitness_foundation"),
                 ("0010", "fitness_planning_v2"),
                 ("0011", "fitness_garmin_running_results"),
+                ("0012", "fitness_repeat_training_week"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))

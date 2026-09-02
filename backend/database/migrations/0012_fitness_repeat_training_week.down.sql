@@ -1,0 +1,19 @@
+DROP INDEX fitness_plan_week_repeat_workouts_repeat_role_idx;
+
+DROP TABLE public.fitness_training_plan_week_repeat_workouts;
+
+DROP INDEX fitness_plan_week_repeats_instance_created_idx;
+
+DROP INDEX fitness_plan_week_repeats_user_idempotency_uidx;
+
+DROP TABLE public.fitness_training_plan_week_repeats;
+
+DROP INDEX fitness_scheduled_workouts_plan_prescription_date_idx;
+
+DROP INDEX fitness_scheduled_workouts_plan_template_item_idx;
+
+ALTER TABLE public.fitness_scheduled_workouts
+    DROP CONSTRAINT fitness_scheduled_workouts_plan_template_item_id_fkey;
+
+ALTER TABLE public.fitness_scheduled_workouts
+    DROP COLUMN plan_template_item_id;

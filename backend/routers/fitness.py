@@ -9,6 +9,7 @@ from backend.models.fitness_models import (
     GarminActivitySelectionRequest,
     LiftingTemplateExercisesReplace,
     PlanInstanceCleanupRequest,
+    PlanInstanceRepeatWeekRequest,
     PlanInstantiateRequest,
     PlanTemplateCreate,
     PlanTemplateItemsReplace,
@@ -405,6 +406,26 @@ def remove_remaining_plan_workouts(
                 user_id=principal.id,
                 instance_id=plan_instance_id,
                 from_date=request.from_date if request else None,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.post("/plan-instances/{plan_instance_id}/repeat-week")
+def repeat_plan_instance_week(
+    plan_instance_id: str,
+    request: PlanInstanceRepeatWeekRequest,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.repeat_plan_instance_week(
+                user_id=principal.id,
+                instance_id=plan_instance_id,
+                week_start=request.week_start,
+                idempotency_key=request.idempotency_key,
             ),
         }
     except ValueError as exc:

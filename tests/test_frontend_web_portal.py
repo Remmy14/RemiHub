@@ -491,6 +491,33 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertNotIn("function GarminDashboard", source)
         self.assertNotIn("function WeightliftingDashboardResultDialog", source)
 
+    def test_fitness_training_plans_repeat_week_controls_are_present(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        screen_source = (frontend_root / "src" / "FitnessScreen.tsx").read_text(
+            encoding="utf-8"
+        )
+        api_source = (frontend_root / "src" / "api" / "fitnessApi.ts").read_text(
+            encoding="utf-8"
+        )
+
+        for fragment in (
+            "Repeat week",
+            "Repeat training week",
+            "Choose the week to repeat.",
+            "eligiblePlanWeeks",
+            "startOfIsoWeek(localDateInputValue())",
+            "later workouts will move back 7 days",
+            "repeatPlanInstanceWeek",
+            "idempotency_key: repeatDialog.idempotencyKey",
+            'workout.status !== "RESCHEDULED"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, screen_source)
+
+        self.assertIn("plan_template_item_id: string | null", api_source)
+        self.assertIn("/repeat-week", api_source)
+        self.assertIn("FitnessPlanInstanceRepeatWeekResult", api_source)
+
     def test_health_screen_does_not_duplicate_systemd_health_semantics(self):
         source = (
             Path(__file__).resolve().parents[1]

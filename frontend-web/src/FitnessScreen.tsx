@@ -30,6 +30,7 @@ import {
   removeRemainingRecurringWorkouts,
   removeScheduledWorkout,
   removeUnstartedPlanInstance,
+  repeatPlanInstanceWeek,
   rescheduleScheduledWorkout,
   restorePlanTemplate,
   restoreWorkoutTemplate,
@@ -109,6 +110,10 @@ function startOfIsoWeek(dateValue: string): string {
   const isoDay = date.getUTCDay() === 0 ? 7 : date.getUTCDay();
   date.setUTCDate(date.getUTCDate() - (isoDay - 1));
   return date.toISOString().slice(0, 10);
+}
+
+function endOfIsoWeek(dateValue: string): string {
+  return addDays(dateValue, 6);
 }
 
 function newIdempotencyKey(): string {
@@ -2428,6 +2433,102 @@ function PlanItemEditor({
   );
 }
 
+type RepeatWeekDialogState = {
+  idempotencyKey: string;
+  instance: FitnessPlanInstance;
+};
+
+function canonicalPlanWorkouts(instance: FitnessPlanInstance): FitnessScheduledWorkout[] {
+  return (instance.scheduled_workouts ?? []).filter((workout) => workout.status !== "RESCHEDULED");
+}
+
+function eligiblePlanWeeks(instance: FitnessPlanInstance): string[] {
+  return Array.from(
+    new Set(
+      canonicalPlanWorkouts(instance).map((workout) => startOfIsoWeek(workout.scheduled_date)),
+    ),
+  ).sort();
+}
+
+function RepeatPlanWeekDialog({
+  instance,
+  onClose,
+  onConfirm,
+  selectedWeekStart,
+  setSelectedWeekStart,
+  submitting,
+}: {
+  instance: FitnessPlanInstance;
+  onClose: () => void;
+  onConfirm: () => void;
+  selectedWeekStart: string;
+  setSelectedWeekStart: (weekStart: string) => void;
+  submitting: boolean;
+}) {
+  const weekOptions = eligiblePlanWeeks(instance);
+  const selectedWeekEnd = endOfIsoWeek(selectedWeekStart);
+  const repeatedWeekStart = addDays(selectedWeekStart, 7);
+  const repeatedWeekEnd = addDays(selectedWeekEnd, 7);
+  const workouts = canonicalPlanWorkouts(instance);
+  const repeatedCount = workouts.filter(
+    (workout) =>
+      workout.scheduled_date >= selectedWeekStart &&
+      workout.scheduled_date <= selectedWeekEnd,
+  ).length;
+  const shiftedCount = workouts.filter((workout) => workout.scheduled_date > selectedWeekEnd).length;
+
+  return (
+    <Dialog onClose={onClose} title="Repeat training week">
+      <form className="space-y-4" onSubmit={(event) => {
+        event.preventDefault();
+        onConfirm();
+      }}>
+        <p className="text-sm leading-6 text-slate-600">
+          Choose the week to repeat. Later workouts in this plan will move back
+          one week, and the selected week's workouts will be scheduled again the
+          following week.
+        </p>
+        <Field label="Week">
+          <select
+            className={inputClasses}
+            disabled={submitting || weekOptions.length === 0}
+            onChange={(event) => setSelectedWeekStart(event.target.value)}
+            value={selectedWeekStart}
+          >
+            {weekOptions.map((weekStart) => (
+              <option key={weekStart} value={weekStart}>
+                {formatDate(weekStart)} - {formatDate(endOfIsoWeek(weekStart))}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {weekOptions.length === 0 ? (
+          <EmptyState>No eligible training weeks were found for this instance.</EmptyState>
+        ) : (
+          <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm font-semibold text-slate-700">
+            <div className="font-black text-slate-950">
+              Repeat {formatDate(selectedWeekStart)} - {formatDate(selectedWeekEnd)}
+            </div>
+            <div className="mt-2">
+              {repeatedCount.toLocaleString()} workouts will be scheduled again{" "}
+              {formatDate(repeatedWeekStart)} - {formatDate(repeatedWeekEnd)}.
+            </div>
+            <div>
+              {shiftedCount.toLocaleString()} later workouts will move back 7 days.
+            </div>
+          </div>
+        )}
+        <DialogActions
+          onClose={onClose}
+          submitDisabled={weekOptions.length === 0 || repeatedCount === 0}
+          submitLabel="Repeat week"
+          submitting={submitting}
+        />
+      </form>
+    </Dialog>
+  );
+}
+
 function PlansView({
   onOpenCompletedDetail,
 }: {
@@ -2440,6 +2541,8 @@ function PlansView({
   const [expandedInstanceId, setExpandedInstanceId] = useState<string | null>(null);
   const [instanceDetails, setInstanceDetails] = useState<Record<string, FitnessPlanInstance>>({});
   const [loadingInstanceId, setLoadingInstanceId] = useState<string | null>(null);
+  const [repeatDialog, setRepeatDialog] = useState<RepeatWeekDialogState | null>(null);
+  const [repeatWeekStart, setRepeatWeekStart] = useState("");
   const [includeArchived, setIncludeArchived] = useState(false);
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
@@ -2633,6 +2736,71 @@ function PlansView({
     }
   };
 
+  const loadInstanceDetail = async (instance: FitnessPlanInstance): Promise<FitnessPlanInstance> => {
+    const cached = instanceDetails[instance.id];
+    if (cached) {
+      return cached;
+    }
+    setLoadingInstanceId(instance.id);
+    try {
+      const detail = await getPlanInstance(instance.id);
+      setInstanceDetails((current) => ({
+        ...current,
+        [instance.id]: detail,
+      }));
+      return detail;
+    } finally {
+      setLoadingInstanceId(null);
+    }
+  };
+
+  const openRepeatWeek = async (instance: FitnessPlanInstance) => {
+    setError(null);
+    setSuccess(null);
+    try {
+      const detail = await loadInstanceDetail(instance);
+      const weeks = eligiblePlanWeeks(detail);
+      const currentWeek = startOfIsoWeek(localDateInputValue());
+      setRepeatWeekStart(weeks.includes(currentWeek) ? currentWeek : weeks[0] ?? currentWeek);
+      setRepeatDialog({
+        idempotencyKey: newIdempotencyKey(),
+        instance: detail,
+      });
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to load plan instance workouts."));
+    }
+  };
+
+  const confirmRepeatWeek = async () => {
+    if (!repeatDialog || !repeatWeekStart) {
+      return;
+    }
+    setMutating(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await repeatPlanInstanceWeek(repeatDialog.instance.id, {
+        week_start: repeatWeekStart,
+        idempotency_key: repeatDialog.idempotencyKey,
+      });
+      await load();
+      const refreshed = await getPlanInstance(result.id);
+      setInstanceDetails((current) => ({
+        ...current,
+        [result.id]: refreshed,
+      }));
+      setExpandedInstanceId(result.id);
+      setRepeatDialog(null);
+      setSuccess(
+        `Repeated ${result.repeated_count} workouts and moved ${result.shifted_count} later workouts.`,
+      );
+    } catch (caught) {
+      setError(messageFromError(caught, "Unable to repeat training week."));
+    } finally {
+      setMutating(false);
+    }
+  };
+
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_26rem]">
       <div className="space-y-4">
@@ -2704,6 +2872,11 @@ function PlansView({
                   <button className={secondaryButtonClasses} disabled={mutating || loadingInstanceId === instance.id} onClick={() => void toggleInstance(instance)} type="button">
                     {expandedInstanceId === instance.id ? "Hide workouts" : "View workouts"}
                   </button>
+                  {instance.status === "ACTIVE" && instance.planning_status !== "STOPPED" && (
+                    <button className={secondaryButtonClasses} disabled={mutating || loadingInstanceId === instance.id} onClick={() => void openRepeatWeek(instance)} type="button">
+                      Repeat week
+                    </button>
+                  )}
                   <button className={secondaryButtonClasses} disabled={mutating} onClick={() => void cleanupInstance(instance, "unstarted")} type="button">
                     Remove unstarted
                   </button>
@@ -2834,6 +3007,16 @@ function PlansView({
           </button>
         </div>
       </Panel>
+      {repeatDialog && (
+        <RepeatPlanWeekDialog
+          instance={repeatDialog.instance}
+          onClose={() => setRepeatDialog(null)}
+          onConfirm={() => void confirmRepeatWeek()}
+          selectedWeekStart={repeatWeekStart}
+          setSelectedWeekStart={setRepeatWeekStart}
+          submitting={mutating}
+        />
+      )}
     </div>
   );
 }

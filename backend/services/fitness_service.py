@@ -115,6 +115,15 @@ def _decimal(value) -> Decimal:
         raise FitnessValidationError("Invalid decimal value") from exc
 
 
+def _date_value(value) -> date:
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise FitnessValidationError("Invalid date value") from exc
+
+
 def fitness_timezone() -> ZoneInfo:
     name = os.environ.get(FITNESS_TIMEZONE_ENV, DEFAULT_FITNESS_TIMEZONE).strip()
     try:
@@ -224,6 +233,7 @@ def _scheduled_select() -> str:
                scheduled.user_id,
                scheduled.workout_template_id,
                scheduled.plan_instance_id,
+               scheduled.plan_template_item_id,
                scheduled.scheduled_date,
                scheduled.original_scheduled_date,
                scheduled.status,
@@ -266,6 +276,13 @@ def _scheduled_select() -> str:
                result.elevation_loss_meters,
                result.calories,
                result.steps,
+               EXISTS (
+                   SELECT 1
+                   FROM public.fitness_scheduled_workouts AS reschedule_source
+                   WHERE reschedule_source.user_id = scheduled.user_id
+                     AND reschedule_source.status = 'RESCHEDULED'
+                     AND reschedule_source.replacement_scheduled_workout_id = scheduled.id
+               ) AS is_reschedule_replacement,
                scheduled.created_at,
                scheduled.updated_at
         FROM public.fitness_scheduled_workouts AS scheduled
@@ -310,11 +327,13 @@ def _with_running_result(workout: dict) -> dict:
                 for column in GARMIN_RUNNING_RESULT_COLUMNS
             }
         )
+    is_reschedule_replacement = workout.get("is_reschedule_replacement")
     cleaned = {
         key: value
         for key, value in workout.items()
         if key
         not in {
+            "is_reschedule_replacement",
             "result_planned_distance_miles",
             "completed_distance_miles",
             "duration_seconds",
@@ -332,7 +351,7 @@ def _with_running_result(workout: dict) -> dict:
     elif cleaned.get("plan_instance_id"):
         source_type = "TRAINING_PLAN"
         source_label = cleaned.get("plan_template_name") or "Training plan"
-    if cleaned.get("scheduled_date") != cleaned.get("original_scheduled_date"):
+    if is_reschedule_replacement:
         source_type = "RESCHEDULE_REPLACEMENT"
         source_label = f"Rescheduled from {cleaned.get('original_scheduled_date')}"
     cleaned["source"] = {
@@ -959,6 +978,7 @@ def _insert_scheduled_workout(
     workout_template_id: str,
     scheduled_date: date,
     plan_instance_id: str | None = None,
+    plan_template_item_id: str | None = None,
     recurring_series_id: str | None = None,
     original_scheduled_date: date | None = None,
     planned_distance_miles=None,
@@ -969,18 +989,20 @@ def _insert_scheduled_workout(
             user_id,
             workout_template_id,
             plan_instance_id,
+            plan_template_item_id,
             recurring_series_id,
             scheduled_date,
             original_scheduled_date,
             planned_distance_miles
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             user_id,
             workout_template_id,
             plan_instance_id,
+            plan_template_item_id,
             recurring_series_id,
             scheduled_date,
             original_scheduled_date or scheduled_date,
@@ -1324,6 +1346,7 @@ def instantiate_plan_template(
                         user_id=user_id,
                         workout_template_id=item["workout_template_id"],
                         plan_instance_id=instance_id,
+                        plan_template_item_id=item["id"],
                         scheduled_date=start_date + timedelta(days=item["day_offset"]),
                         planned_distance_miles=_planned_distance_snapshot(template),
                     )
@@ -1485,6 +1508,331 @@ def get_current_plan_instance(*, user_id: str) -> dict | None:
             if instance:
                 instance["planning_status"] = "ACTIVE"
             return instance
+    finally:
+        put_db_conn(conn)
+
+
+def _repeat_week_fingerprint(*, plan_instance_id: str, week_start: date) -> str:
+    return json.dumps(
+        {
+            "plan_instance_id": str(plan_instance_id),
+            "selected_week_start": week_start.isoformat(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _repeat_operation_workout_ids(cur, *, repeat_id: str) -> tuple[list[str], list[str]]:
+    cur.execute(
+        """
+        SELECT role, scheduled_workout_id
+        FROM public.fitness_training_plan_week_repeat_workouts
+        WHERE repeat_id = %s
+        ORDER BY mutation_order, id
+        """,
+        (repeat_id,),
+    )
+    repeated_ids = []
+    shifted_ids = []
+    for row in _rows_to_dicts(cur, cur.fetchall()):
+        if row["role"] == "REPEATED":
+            repeated_ids.append(str(row["scheduled_workout_id"]))
+        elif row["role"] == "SHIFTED":
+            shifted_ids.append(str(row["scheduled_workout_id"]))
+    return repeated_ids, shifted_ids
+
+
+def _repeat_plan_instance_week_response(
+    cur,
+    *,
+    user_id: str,
+    instance_id: str,
+    repeat_id: str,
+    week_start: date,
+    week_end: date,
+    repeated_ids: list[str],
+    shifted_ids: list[str],
+) -> dict:
+    instance = _get_plan_instance(
+        cur,
+        user_id=user_id,
+        instance_id=instance_id,
+        include_workouts=True,
+    )
+    repeated_week_start = week_start + timedelta(days=7)
+    repeated_week_end = week_end + timedelta(days=7)
+    return {
+        **instance,
+        "repeat_operation_id": repeat_id,
+        "selected_week_start": week_start,
+        "selected_week_end": week_end,
+        "repeated_week_start": repeated_week_start,
+        "repeated_week_end": repeated_week_end,
+        "repeated_scheduled_workout_ids": repeated_ids,
+        "repeated_count": len(repeated_ids),
+        "shifted_scheduled_workout_ids": shifted_ids,
+        "shifted_count": len(shifted_ids),
+    }
+
+
+def repeat_plan_instance_week(
+    *,
+    user_id: str,
+    instance_id: str,
+    week_start: date,
+    idempotency_key: str | None = None,
+) -> dict:
+    if week_start != _week_start(week_start):
+        raise FitnessValidationError("week_start must be a Monday")
+    week_end = week_start + timedelta(days=6)
+    repeated_week_start = week_start + timedelta(days=7)
+    repeated_week_end = week_end + timedelta(days=7)
+    fingerprint = _repeat_week_fingerprint(
+        plan_instance_id=instance_id,
+        week_start=week_start,
+    )
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, status, stopped_at
+                FROM public.fitness_training_plan_instances
+                WHERE id = %s
+                  AND user_id = %s
+                FOR UPDATE
+                """,
+                (instance_id, user_id),
+            )
+            instance_row = cur.fetchone()
+            if not instance_row:
+                raise FitnessNotFoundError(f"Training plan instance not found: {instance_id}")
+            if instance_row[1] != "ACTIVE" or instance_row[2] is not None:
+                raise FitnessConflictError("Only active plan instances can repeat a week")
+
+            inserted_repeat = True
+            if idempotency_key:
+                cur.execute(
+                    """
+                    INSERT INTO public.fitness_training_plan_week_repeats (
+                        user_id,
+                        plan_instance_id,
+                        selected_week_start,
+                        selected_week_end,
+                        repeated_week_start,
+                        repeated_week_end,
+                        idempotency_key,
+                        request_fingerprint
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    DO UPDATE SET created_at = public.fitness_training_plan_week_repeats.created_at
+                    RETURNING id, request_fingerprint, (xmax = 0) AS inserted
+                    """,
+                    (
+                        user_id,
+                        instance_id,
+                        week_start,
+                        week_end,
+                        repeated_week_start,
+                        repeated_week_end,
+                        idempotency_key,
+                        fingerprint,
+                    ),
+                )
+                repeat_row = cur.fetchone()
+                repeat_id = str(repeat_row[0])
+                inserted_repeat = bool(repeat_row[2])
+                if repeat_row[1] != fingerprint:
+                    raise FitnessConflictError(
+                        "Idempotency key was already used for different repeat-week inputs"
+                    )
+                if not inserted_repeat:
+                    repeated_ids, shifted_ids = _repeat_operation_workout_ids(
+                        cur,
+                        repeat_id=repeat_id,
+                    )
+                    result = _repeat_plan_instance_week_response(
+                        cur,
+                        user_id=user_id,
+                        instance_id=instance_id,
+                        repeat_id=repeat_id,
+                        week_start=week_start,
+                        week_end=week_end,
+                        repeated_ids=repeated_ids,
+                        shifted_ids=shifted_ids,
+                    )
+                    conn.commit()
+                    return result
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO public.fitness_training_plan_week_repeats (
+                        user_id,
+                        plan_instance_id,
+                        selected_week_start,
+                        selected_week_end,
+                        repeated_week_start,
+                        repeated_week_end,
+                        idempotency_key,
+                        request_fingerprint
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        user_id,
+                        instance_id,
+                        week_start,
+                        week_end,
+                        repeated_week_start,
+                        repeated_week_end,
+                        idempotency_key,
+                        fingerprint,
+                    ),
+                )
+                repeat_id = str(cur.fetchone()[0])
+
+            cur.execute(
+                """
+                SELECT id,
+                       workout_template_id,
+                       plan_template_item_id,
+                       scheduled_date,
+                       planned_distance_miles
+                FROM public.fitness_scheduled_workouts
+                WHERE user_id = %s
+                  AND plan_instance_id = %s
+                  AND scheduled_date BETWEEN %s AND %s
+                  AND status <> 'RESCHEDULED'
+                ORDER BY scheduled_date, created_at, id
+                FOR UPDATE
+                """,
+                (user_id, instance_id, week_start, week_end),
+            )
+            selected_workouts = _rows_to_dicts(cur, cur.fetchall())
+            if not selected_workouts:
+                raise FitnessValidationError(
+                    "Selected week contains no workouts for this training plan instance"
+                )
+
+            cur.execute(
+                """
+                SELECT id,
+                       workout_template_id,
+                       plan_template_item_id,
+                       scheduled_date,
+                       planned_distance_miles
+                FROM public.fitness_scheduled_workouts
+                WHERE user_id = %s
+                  AND plan_instance_id = %s
+                  AND scheduled_date > %s
+                  AND status <> 'RESCHEDULED'
+                ORDER BY scheduled_date, created_at, id
+                FOR UPDATE
+                """,
+                (user_id, instance_id, week_end),
+            )
+            later_workouts = _rows_to_dicts(cur, cur.fetchall())
+            shifted_ids = [str(workout["id"]) for workout in later_workouts]
+            if shifted_ids:
+                cur.execute(
+                    """
+                    UPDATE public.fitness_scheduled_workouts
+                    SET scheduled_date = scheduled_date + 7,
+                        updated_at = now()
+                    WHERE user_id = %s
+                      AND id = ANY(%s::uuid[])
+                      AND status <> 'RESCHEDULED'
+                    """,
+                    (user_id, shifted_ids),
+                )
+                if cur.rowcount != len(shifted_ids):
+                    raise FitnessConflictError("Future workouts could not be shifted safely")
+
+            for index, workout in enumerate(later_workouts):
+                scheduled_date = _date_value(workout["scheduled_date"])
+                cur.execute(
+                    """
+                    INSERT INTO public.fitness_training_plan_week_repeat_workouts (
+                        repeat_id,
+                        role,
+                        mutation_order,
+                        scheduled_workout_id,
+                        scheduled_date_before,
+                        scheduled_date_after,
+                        plan_template_item_id,
+                        workout_template_id
+                    )
+                    VALUES (%s, 'SHIFTED', %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        repeat_id,
+                        index,
+                        workout["id"],
+                        scheduled_date,
+                        scheduled_date + timedelta(days=7),
+                        workout["plan_template_item_id"],
+                        workout["workout_template_id"],
+                    ),
+                )
+
+            repeated_ids = []
+            for index, workout in enumerate(selected_workouts):
+                source_date = _date_value(workout["scheduled_date"])
+                repeated_date = source_date + timedelta(days=7)
+                repeated_id = _insert_scheduled_workout(
+                    cur,
+                    user_id=user_id,
+                    workout_template_id=workout["workout_template_id"],
+                    plan_instance_id=instance_id,
+                    plan_template_item_id=workout["plan_template_item_id"],
+                    scheduled_date=repeated_date,
+                    planned_distance_miles=workout["planned_distance_miles"],
+                )
+                repeated_ids.append(repeated_id)
+                cur.execute(
+                    """
+                    INSERT INTO public.fitness_training_plan_week_repeat_workouts (
+                        repeat_id,
+                        role,
+                        mutation_order,
+                        scheduled_workout_id,
+                        scheduled_date_before,
+                        scheduled_date_after,
+                        plan_template_item_id,
+                        workout_template_id
+                    )
+                    VALUES (%s, 'REPEATED', %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        repeat_id,
+                        index,
+                        repeated_id,
+                        source_date,
+                        repeated_date,
+                        workout["plan_template_item_id"],
+                        workout["workout_template_id"],
+                    ),
+                )
+
+            result = _repeat_plan_instance_week_response(
+                cur,
+                user_id=user_id,
+                instance_id=instance_id,
+                repeat_id=repeat_id,
+                week_start=week_start,
+                week_end=week_end,
+                repeated_ids=repeated_ids,
+                shifted_ids=shifted_ids,
+            )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         put_db_conn(conn)
 
@@ -2058,6 +2406,7 @@ def replace_scheduled_workout_template(
                 """
                 UPDATE public.fitness_scheduled_workouts
                 SET workout_template_id = %s,
+                    plan_template_item_id = NULL,
                     planned_distance_miles = %s,
                     updated_at = now()
                 WHERE id = %s
@@ -2630,6 +2979,7 @@ def reschedule_scheduled_workout(
                 user_id=user_id,
                 workout_template_id=workout["workout_template_id"],
                 plan_instance_id=workout["plan_instance_id"],
+                plan_template_item_id=workout["plan_template_item_id"],
                 recurring_series_id=workout["recurring_series_id"],
                 scheduled_date=scheduled_date,
                 original_scheduled_date=workout["original_scheduled_date"],

@@ -135,6 +135,8 @@ SCHEDULED_COLUMNS = [
     "result_updated_at",
     "created_at",
     "updated_at",
+    "plan_template_item_id",
+    "is_reschedule_replacement",
 ]
 
 PLANNED_RUNNING_ROW = (
@@ -161,6 +163,8 @@ PLANNED_RUNNING_ROW = (
     None,
     NOW,
     NOW,
+    None,
+    False,
 )
 
 COMPLETED_RUNNING_ROW = list(PLANNED_RUNNING_ROW)
@@ -252,6 +256,9 @@ PLAN_INSTANCE_COLUMNS = [
     "updated_at",
 ]
 PLAN_INSTANCE_ID = "55555555-5555-4555-8555-555555555555"
+PLAN_ITEM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+SECOND_PLAN_ITEM_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+THIRD_PLAN_ITEM_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PLAN_INSTANCE_ROW = (
     PLAN_INSTANCE_ID,
     USER_ID,
@@ -372,6 +379,316 @@ class FitnessServiceTests(unittest.TestCase):
             put_db_conn=lambda _connection: None,
         )
 
+    def test_repeat_plan_instance_week_repeats_selected_and_shifts_later_workouts(self):
+        selected_columns = [
+            "id",
+            "workout_template_id",
+            "plan_template_item_id",
+            "scheduled_date",
+            "planned_distance_miles",
+        ]
+        later_columns = selected_columns
+        selected_rows = [
+            (SCHEDULED_ID, TEMPLATE_ID, PLAN_ITEM_ID, date(2026, 9, 1), Decimal("1.50")),
+            (SECOND_SCHEDULED_ID, TEMPLATE_ID, PLAN_ITEM_ID, date(2026, 9, 3), Decimal("1.50")),
+            ("77777777-7777-4777-8777-777777777777", SECOND_TEMPLATE_ID, SECOND_PLAN_ITEM_ID, date(2026, 9, 5), Decimal("2.00")),
+        ]
+        later_rows = [
+            ("44444444-4444-4444-8444-444444444444", SECOND_TEMPLATE_ID, SECOND_PLAN_ITEM_ID, date(2026, 9, 8), Decimal("2.00")),
+            ("55555555-5555-4555-8555-555555555556", TEMPLATE_ID, THIRD_PLAN_ITEM_ID, date(2026, 9, 15), Decimal("3.00")),
+        ]
+        connection, patches = self.patch_connection(
+            [
+                (["id", "status", "stopped_at"], [(PLAN_INSTANCE_ID, "ACTIVE", None)]),
+                (["id", "request_fingerprint", "inserted"], [("repeat-1", fitness_service._repeat_week_fingerprint(plan_instance_id=PLAN_INSTANCE_ID, week_start=date(2026, 8, 31)), True)]),
+                (selected_columns, selected_rows),
+                (later_columns, later_rows),
+                ([], []),
+                ([], []),
+                ([], []),
+                (["id"], [("99999999-9999-4999-8999-999999999991",)]),
+                ([], []),
+                (["id"], [("99999999-9999-4999-8999-999999999992",)]),
+                ([], []),
+                (["id"], [("99999999-9999-4999-8999-999999999993",)]),
+                ([], []),
+                (PLAN_INSTANCE_COLUMNS, [PLAN_INSTANCE_ROW]),
+                (SCHEDULED_COLUMNS, []),
+            ],
+            rowcounts=[1, 1, 1, 1, 2],
+        )
+
+        with patches:
+            result = fitness_service.repeat_plan_instance_week(
+                user_id=USER_ID,
+                instance_id=PLAN_INSTANCE_ID,
+                week_start=date(2026, 8, 31),
+                idempotency_key="repeat-key",
+            )
+
+        self.assertEqual(result["repeated_count"], 3)
+        self.assertEqual(result["shifted_count"], 2)
+        self.assertEqual(
+            result["repeated_scheduled_workout_ids"],
+            [
+                "99999999-9999-4999-8999-999999999991",
+                "99999999-9999-4999-8999-999999999992",
+                "99999999-9999-4999-8999-999999999993",
+            ],
+        )
+        self.assertEqual(
+            result["shifted_scheduled_workout_ids"],
+            [
+                "44444444-4444-4444-8444-444444444444",
+                "55555555-5555-4555-8555-555555555556",
+            ],
+        )
+        update_sql, update_params = connection.cursor_instance.executed[4]
+        self.assertIn("SET scheduled_date = scheduled_date + 7", update_sql)
+        self.assertNotIn("original_scheduled_date", update_sql)
+        self.assertEqual(update_params[1], result["shifted_scheduled_workout_ids"])
+        first_repeat_insert = connection.cursor_instance.executed[7][1]
+        self.assertEqual(first_repeat_insert[3], PLAN_ITEM_ID)
+        self.assertEqual(first_repeat_insert[5], date(2026, 9, 8))
+        self.assertEqual(first_repeat_insert[6], date(2026, 9, 8))
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 0)
+
+    def test_repeat_plan_instance_week_supports_legacy_null_plan_item_lineage(self):
+        selected_columns = [
+            "id",
+            "workout_template_id",
+            "plan_template_item_id",
+            "scheduled_date",
+            "planned_distance_miles",
+        ]
+        selected_rows = [
+            (
+                SCHEDULED_ID,
+                TEMPLATE_ID,
+                None,
+                date(2026, 9, 1),
+                Decimal("1.50"),
+            ),
+        ]
+        later_rows = [
+            (
+                "44444444-4444-4444-8444-444444444444",
+                SECOND_TEMPLATE_ID,
+                None,
+                date(2026, 9, 8),
+                Decimal("2.00"),
+            ),
+        ]
+
+        connection, patches = self.patch_connection(
+            [
+                (
+                    ["id", "status", "stopped_at"],
+                    [(PLAN_INSTANCE_ID, "ACTIVE", None)],
+                ),
+                (
+                    ["id", "request_fingerprint", "inserted"],
+                    [
+                        (
+                            "repeat-legacy-null",
+                            fitness_service._repeat_week_fingerprint(
+                                plan_instance_id=PLAN_INSTANCE_ID,
+                                week_start=date(2026, 8, 31),
+                            ),
+                            True,
+                        )
+                    ],
+                ),
+                (selected_columns, selected_rows),
+                (selected_columns, later_rows),
+                ([], []),
+                ([], []),
+                (
+                    ["id"],
+                    [("99999999-9999-4999-8999-999999999991",)],
+                ),
+                ([], []),
+                (PLAN_INSTANCE_COLUMNS, [PLAN_INSTANCE_ROW]),
+                (SCHEDULED_COLUMNS, []),
+            ],
+            rowcounts=[1, 1, 1, 1, 1],
+        )
+
+        with patches:
+            result = fitness_service.repeat_plan_instance_week(
+                user_id=USER_ID,
+                instance_id=PLAN_INSTANCE_ID,
+                week_start=date(2026, 8, 31),
+                idempotency_key="repeat-legacy-null-key",
+            )
+
+        self.assertEqual(result["repeated_count"], 1)
+        self.assertEqual(result["shifted_count"], 1)
+
+        update_sql, update_params = connection.cursor_instance.executed[4]
+        self.assertIn("SET scheduled_date = scheduled_date + 7", update_sql)
+        self.assertEqual(
+            update_params[1],
+            ["44444444-4444-4444-8444-444444444444"],
+        )
+
+        shifted_audit_params = connection.cursor_instance.executed[5][1]
+        self.assertIsNone(shifted_audit_params[5])
+
+        repeat_insert_params = connection.cursor_instance.executed[6][1]
+        self.assertIsNone(repeat_insert_params[3])
+        self.assertEqual(repeat_insert_params[5], date(2026, 9, 8))
+        self.assertEqual(repeat_insert_params[6], date(2026, 9, 8))
+
+        repeated_audit_params = connection.cursor_instance.executed[7][1]
+        self.assertIsNone(repeated_audit_params[5])
+
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 0)
+
+    def test_repeat_plan_instance_week_idempotent_replay_uses_persisted_workout_ids(self):
+        fingerprint = fitness_service._repeat_week_fingerprint(
+            plan_instance_id=PLAN_INSTANCE_ID,
+            week_start=date(2026, 8, 31),
+        )
+        connection, patches = self.patch_connection(
+            [
+                (["id", "status", "stopped_at"], [(PLAN_INSTANCE_ID, "ACTIVE", None)]),
+                (["id", "request_fingerprint", "inserted"], [("repeat-1", fingerprint, False)]),
+                (
+                    ["role", "scheduled_workout_id"],
+                    [
+                        ("REPEATED", "99999999-9999-4999-8999-999999999991"),
+                        ("SHIFTED", "44444444-4444-4444-8444-444444444444"),
+                    ],
+                ),
+                (PLAN_INSTANCE_COLUMNS, [PLAN_INSTANCE_ROW]),
+                (SCHEDULED_COLUMNS, []),
+            ]
+        )
+
+        with patches:
+            result = fitness_service.repeat_plan_instance_week(
+                user_id=USER_ID,
+                instance_id=PLAN_INSTANCE_ID,
+                week_start=date(2026, 8, 31),
+                idempotency_key="repeat-key",
+            )
+
+        executed_sql = "\n".join(sql for sql, _ in connection.cursor_instance.executed)
+        self.assertNotIn("SET scheduled_date = scheduled_date + 7", executed_sql)
+        self.assertNotIn("role,\n                        scheduled_workout_id", executed_sql)
+        self.assertEqual(result["repeated_scheduled_workout_ids"], ["99999999-9999-4999-8999-999999999991"])
+        self.assertEqual(result["shifted_scheduled_workout_ids"], ["44444444-4444-4444-8444-444444444444"])
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 0)
+
+    def test_repeat_plan_instance_week_rejects_inactive_instance(self):
+        connection, patches = self.patch_connection(
+            [
+                (["id", "status", "stopped_at"], [(PLAN_INSTANCE_ID, "COMPLETED", None)]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessConflictError, "Only active"):
+                fitness_service.repeat_plan_instance_week(
+                    user_id=USER_ID,
+                    instance_id=PLAN_INSTANCE_ID,
+                    week_start=date(2026, 8, 31),
+                )
+
+        self.assertEqual(connection.commits, 0)
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_repeat_plan_instance_week_rejects_empty_week_and_rolls_back(self):
+        fingerprint = fitness_service._repeat_week_fingerprint(
+            plan_instance_id=PLAN_INSTANCE_ID,
+            week_start=date(2026, 8, 31),
+        )
+        connection, patches = self.patch_connection(
+            [
+                (["id", "status", "stopped_at"], [(PLAN_INSTANCE_ID, "ACTIVE", None)]),
+                (["id", "request_fingerprint", "inserted"], [("repeat-1", fingerprint, True)]),
+                (
+                    [
+                        "id",
+                        "workout_template_id",
+                        "plan_template_item_id",
+                        "scheduled_date",
+                        "planned_distance_miles",
+                    ],
+                    [],
+                ),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessValidationError, "no workouts"):
+                fitness_service.repeat_plan_instance_week(
+                    user_id=USER_ID,
+                    instance_id=PLAN_INSTANCE_ID,
+                    week_start=date(2026, 8, 31),
+                    idempotency_key="repeat-key",
+                )
+
+        self.assertEqual(connection.commits, 0)
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_repeat_plan_instance_week_rejects_non_monday_week_start_before_db(self):
+        with self.assertRaisesRegex(fitness_service.FitnessValidationError, "Monday"):
+            fitness_service.repeat_plan_instance_week(
+                user_id=USER_ID,
+                instance_id=PLAN_INSTANCE_ID,
+                week_start=date(2026, 9, 1),
+            )
+
+    def test_repeat_plan_instance_week_idempotency_key_conflict_is_rejected(self):
+        connection, patches = self.patch_connection(
+            [
+                (["id", "status", "stopped_at"], [(PLAN_INSTANCE_ID, "ACTIVE", None)]),
+                (["id", "request_fingerprint", "inserted"], [("repeat-1", "different", False)]),
+            ]
+        )
+
+        with patches:
+            with self.assertRaisesRegex(fitness_service.FitnessConflictError, "Idempotency key"):
+                fitness_service.repeat_plan_instance_week(
+                    user_id=USER_ID,
+                    instance_id=PLAN_INSTANCE_ID,
+                    week_start=date(2026, 8, 31),
+                    idempotency_key="repeat-key",
+                )
+
+        self.assertEqual(connection.commits, 0)
+        self.assertEqual(connection.rollbacks, 1)
+
+    def test_shifted_plan_workout_with_changed_date_remains_training_plan_source(self):
+        shifted = list(PLANNED_RUNNING_ROW)
+        shifted[3] = PLAN_INSTANCE_ID
+        shifted[4] = date(2026, 9, 15)
+        shifted[5] = date(2026, 9, 8)
+        shifted[14] = "C25K"
+        shifted[23] = PLAN_ITEM_ID
+        shifted[24] = False
+        workout = fitness_service._with_running_result(
+            dict(zip(SCHEDULED_COLUMNS, shifted))
+        )
+
+        self.assertEqual(workout["source"]["type"], "TRAINING_PLAN")
+
+    def test_actual_reschedule_replacement_uses_replacement_source(self):
+        replacement = list(PLANNED_RUNNING_ROW)
+        replacement[4] = date(2026, 9, 15)
+        replacement[5] = date(2026, 9, 8)
+        replacement[24] = True
+        workout = fitness_service._with_running_result(
+            dict(zip(SCHEDULED_COLUMNS, replacement))
+        )
+
+        self.assertEqual(workout["source"]["type"], "RESCHEDULE_REPLACEMENT")
+
     def test_running_template_creation_persists_planned_distance(self):
         connection, patches = self.patch_connection(
             [
@@ -457,13 +774,26 @@ class FitnessServiceTests(unittest.TestCase):
             )
 
         scheduled_dates = [
-            params[4]
+            params[5]
             for sql, params in connection.cursor_instance.executed
             if "INSERT INTO public.fitness_scheduled_workouts" in sql
         ]
         self.assertEqual(
             scheduled_dates,
             [date(2026, 8, 10), date(2026, 8, 12), date(2026, 8, 12)],
+        )
+        plan_item_ids = [
+            params[3]
+            for sql, params in connection.cursor_instance.executed
+            if "INSERT INTO public.fitness_scheduled_workouts" in sql
+        ]
+        self.assertEqual(
+            plan_item_ids,
+            [
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            ],
         )
         self.assertEqual(len(instance["scheduled_workout_ids"]), 3)
 
@@ -733,7 +1063,7 @@ class FitnessServiceTests(unittest.TestCase):
             )
 
         insert_params = connection.cursor_instance.executed[1][1]
-        self.assertEqual(insert_params[6], 5.0)
+        self.assertEqual(insert_params[7], 5.0)
         self.assertIn("FOR UPDATE", connection.cursor_instance.executed[0][0])
         self.assertIn("AND status = 'PLANNED'", connection.cursor_instance.executed[2][0])
         self.assertEqual(result["replacement"]["planned_distance_miles"], 5.0)
@@ -766,7 +1096,7 @@ class FitnessServiceTests(unittest.TestCase):
             )
 
         insert_params = connection.cursor_instance.executed[1][1]
-        self.assertEqual(insert_params[3], SERIES_ID)
+        self.assertEqual(insert_params[4], SERIES_ID)
 
     def test_replace_scheduled_workout_template_updates_one_planned_occurrence(self):
         original = list(PLANNED_RUNNING_ROW)

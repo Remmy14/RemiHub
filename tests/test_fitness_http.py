@@ -76,6 +76,35 @@ class FitnessHttpTests(unittest.TestCase):
         self.assertEqual(get_plan_instance.call_args.kwargs["user_id"], USER.id)
         self.assertEqual(get_plan_instance.call_args.kwargs["instance_id"], "plan-instance")
 
+    def test_repeat_plan_instance_week_route_delegates_owner_and_idempotency(self):
+        repeat_week = MagicMock(
+            return_value={
+                "id": "plan-instance",
+                "repeat_operation_id": "repeat",
+                "repeated_scheduled_workout_ids": [],
+                "shifted_scheduled_workout_ids": [],
+            }
+        )
+        request = fitness.PlanInstanceRepeatWeekRequest(
+            week_start=date(2026, 8, 31),
+            idempotency_key="repeat-key",
+        )
+        with patch(
+            "backend.routers.fitness.fitness_service.repeat_plan_instance_week",
+            repeat_week,
+        ):
+            response = fitness.repeat_plan_instance_week(
+                "plan-instance",
+                request,
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(repeat_week.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(repeat_week.call_args.kwargs["instance_id"], "plan-instance")
+        self.assertEqual(repeat_week.call_args.kwargs["week_start"], date(2026, 8, 31))
+        self.assertEqual(repeat_week.call_args.kwargs["idempotency_key"], "repeat-key")
+
     def test_recurring_preview_route_delegates_owner(self):
         preview = MagicMock(return_value={"count": 15, "dates": []})
         request = fitness.RecurringSeriesRequest(
