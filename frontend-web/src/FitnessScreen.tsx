@@ -9,6 +9,7 @@ import {
   createRecurringSeries,
   createScheduledWorkout,
   createWorkoutTemplate,
+  getCurrentPlanInstance,
   getTrainingCalendar,
   getPlanInstance,
   getPlanTemplate,
@@ -19,7 +20,7 @@ import {
   listPlanInstances,
   listPlanTemplates,
   listScheduledWorkouts,
-  listTodayWorkouts,
+  listWorkoutHistory,
   listWorkoutTemplates,
   previewRecurringSeries,
   replaceLiftingTemplateExercises,
@@ -53,11 +54,11 @@ import {
 } from "./api/weightliftingApi";
 import type { WeightliftingExercise } from "./api/weightliftingApi";
 
-type FitnessTab = "today" | "schedule" | "calendar" | "templates" | "plans" | "weightlifting";
+type FitnessTab = "dashboard" | "schedule" | "calendar" | "templates" | "plans" | "weightlifting";
 type LoadState = "idle" | "loading" | "refreshing";
 
 const tabs: Array<{ id: FitnessTab; label: string; href: string }> = [
-  { id: "today", label: "Today", href: "/portal/fitness" },
+  { id: "dashboard", label: "Dashboard", href: "/portal/fitness" },
   { id: "schedule", label: "Schedule", href: "/portal/fitness/schedule" },
   { id: "calendar", label: "Calendar", href: "/portal/fitness/calendar" },
   {
@@ -251,7 +252,7 @@ function initialTabFromPath(path: string): FitnessTab {
   if (path.startsWith("/portal/fitness/weightlifting")) {
     return "weightlifting";
   }
-  return "today";
+  return "dashboard";
 }
 
 function Panel({
@@ -875,25 +876,114 @@ function DialogActions({
   );
 }
 
-function TodayView({
-  onComplete,
-  onRemove,
-  onReschedule,
-  onSkip,
-  onUndoReschedule,
-  pendingAction,
+function dayDifference(left: string, right: string): number {
+  const [leftYear, leftMonth, leftDay] = left.split("-").map(Number);
+  const [rightYear, rightMonth, rightDay] = right.split("-").map(Number);
+  const leftDate = Date.UTC(leftYear, leftMonth - 1, leftDay);
+  const rightDate = Date.UTC(rightYear, rightMonth - 1, rightDay);
+  return Math.floor((leftDate - rightDate) / 86400000);
+}
+
+function compareWorkoutDate(left: FitnessScheduledWorkout, right: FitnessScheduledWorkout): number {
+  return (
+    left.scheduled_date.localeCompare(right.scheduled_date) ||
+    (left.created_at ?? "").localeCompare(right.created_at ?? "") ||
+    left.id.localeCompare(right.id)
+  );
+}
+
+function completedWorkoutSummary(workout: FitnessScheduledWorkout): string {
+  if (workout.type === "LIFTING") {
+    const exerciseCount = workout.lifting_result?.entries.length;
+    if (exerciseCount !== null && exerciseCount !== undefined) {
+      return `${exerciseCount.toLocaleString()} ${exerciseCount === 1 ? "exercise" : "exercises"}`;
+    }
+    return "Lifting completed";
+  }
+  const result = workout.running_result;
+  if (!result) {
+    return distanceLabel(workout.planned_distance_miles);
+  }
+  return [
+    distanceLabel(result.completed_distance_miles),
+    formatDuration(result.duration_seconds),
+    paceLabel(result.completed_distance_miles, result.duration_seconds),
+    numberLabel(result.average_hr, " avg HR", 0),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function DashboardWorkoutLink({
+  compact = false,
+  onOpenCompletedDetail,
+  workout,
+}: {
+  compact?: boolean;
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
+  workout: FitnessScheduledWorkout;
+}) {
+  const content = (
+    <>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+        <Pill className={statusStyles[workout.status]}>
+          {workout.status === "COMPLETED" ? "Done" : workout.status.charAt(0) + workout.status.slice(1).toLowerCase()}
+        </Pill>
+      </div>
+      <div className="mt-2 font-black text-slate-950">{workout.workout_name}</div>
+      {!compact && (
+        <div className="mt-1 text-sm font-semibold text-slate-600">
+          {formatDate(workout.scheduled_date)}
+        </div>
+      )}
+      {workout.type === "RUNNING" && (
+        <div className="mt-1 text-sm font-semibold text-slate-700">
+          {workout.running_result
+            ? completedWorkoutSummary(workout)
+            : distanceLabel(workout.planned_distance_miles)}
+        </div>
+      )}
+    </>
+  );
+
+  if (workout.status === "COMPLETED") {
+    return (
+      <button
+        className="w-full rounded-md border border-slate-200 bg-white p-3 text-left hover:border-blue-300 hover:bg-blue-50/40"
+        onClick={() => onOpenCompletedDetail(workout)}
+        type="button"
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-slate-200 bg-white p-3">
+      {content}
+    </div>
+  );
+}
+
+function DashboardView({
+  onOpenCompletedDetail,
   refreshToken,
 }: {
-  onComplete: (workout: FitnessScheduledWorkout) => void;
-  onRemove: (workout: FitnessScheduledWorkout) => void;
-  onReschedule: (workout: FitnessScheduledWorkout) => void;
-  onSkip: (workout: FitnessScheduledWorkout) => void;
-  onUndoReschedule: (workout: FitnessScheduledWorkout) => void;
-  pendingAction: string | null;
+  onOpenCompletedDetail: (workout: FitnessScheduledWorkout) => void;
   refreshToken: number;
 }) {
-  const [date, setDate] = useState(localDateInputValue());
-  const [workouts, setWorkouts] = useState<FitnessScheduledWorkout[]>([]);
+  const today = localDateInputValue();
+  const weekStart = startOfIsoWeek(today);
+  const weekEnd = addDays(weekStart, 6);
+  const futureEnd = addDays(today, 120);
+  const historyStart = addDays(today, -120);
+  const [calendar, setCalendar] = useState<FitnessTrainingCalendar | null>(null);
+  const [futureWorkouts, setFutureWorkouts] = useState<FitnessScheduledWorkout[]>([]);
+  const [recentHistory, setRecentHistory] = useState<FitnessScheduledWorkout[]>([]);
+  const [currentPlan, setCurrentPlan] = useState<FitnessPlanInstance | null>(null);
+  const [nextRunTemplate, setNextRunTemplate] = useState<FitnessWorkoutTemplate | null>(null);
+  const [nextRunHistory, setNextRunHistory] = useState<FitnessScheduledWorkout[]>([]);
   const [state, setState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
 
@@ -901,62 +991,274 @@ function TodayView({
     setState((current) => (current === "idle" ? "loading" : "refreshing"));
     setError(null);
     try {
-      setWorkouts(await listTodayWorkouts(date));
+      const [calendarData, scheduled, history, activePlan] = await Promise.all([
+        getTrainingCalendar(weekStart, weekEnd),
+        listScheduledWorkouts(today, futureEnd),
+        listWorkoutHistory(historyStart, today),
+        getCurrentPlanInstance(),
+      ]);
+      const planned = scheduled
+        .filter((workout) => workout.status === "PLANNED")
+        .sort(compareWorkoutDate);
+      const upcomingRun = planned.find((workout) => workout.type === "RUNNING") ?? null;
+      const detailedPlan = activePlan ? await getPlanInstance(activePlan.id) : null;
+      const [template, templateHistory] = upcomingRun?.workout_template_id
+        ? await Promise.all([
+            getWorkoutTemplate(upcomingRun.workout_template_id),
+            listCompletedWorkoutsForTemplate(upcomingRun.workout_template_id),
+          ])
+        : [null, []];
+
+      setCalendar(calendarData);
+      setFutureWorkouts(scheduled);
+      setRecentHistory(history);
+      setCurrentPlan(detailedPlan);
+      setNextRunTemplate(template);
+      setNextRunHistory(templateHistory);
     } catch (caught) {
-      setError(messageFromError(caught, "Unable to load today's workouts."));
+      setError(messageFromError(caught, "Unable to load fitness dashboard."));
     } finally {
       setState("idle");
     }
-  }, [date, refreshToken]);
+  }, [futureEnd, historyStart, refreshToken, today, weekEnd, weekStart]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
+  const week = calendar?.weeks[0] ?? null;
+  const weekWorkouts = useMemo(
+    () => week?.days.flatMap((day) => day.workouts) ?? [],
+    [week],
+  );
+  const scheduledWeekWorkouts = weekWorkouts.filter((workout) => workout.status !== "RESCHEDULED");
+  const weeklyRuns = scheduledWeekWorkouts.filter((workout) => workout.type === "RUNNING");
+  const weeklyCompletedRuns = weeklyRuns.filter((workout) => workout.status === "COMPLETED");
+  const weeklyLifts = scheduledWeekWorkouts.filter((workout) => workout.type === "LIFTING");
+  const weeklyCompletedLifts = weeklyLifts.filter((workout) => workout.status === "COMPLETED");
+  const completedRunningDistance = weeklyCompletedRuns.reduce(
+    (total, workout) => total + (workout.running_result?.completed_distance_miles ?? 0),
+    0,
+  );
+  const plannedRunningDistance = weeklyRuns.reduce(
+    (total, workout) => total + (workout.planned_distance_miles ?? 0),
+    0,
+  );
+  const completedScheduledWorkouts = scheduledWeekWorkouts.filter((workout) => workout.status === "COMPLETED");
+  const plannedFutureWorkouts = useMemo(
+    () => futureWorkouts.filter((workout) => workout.status === "PLANNED").sort(compareWorkoutDate),
+    [futureWorkouts],
+  );
+  const upNext = plannedFutureWorkouts[0] ?? null;
+  const nextRun = plannedFutureWorkouts.find((workout) => workout.type === "RUNNING") ?? null;
+  const previousAttempts = nextRunHistory
+    .filter((workout) => workout.status === "COMPLETED" && workout.id !== nextRun?.id)
+    .slice(0, 5);
+  const recentCompleted = recentHistory
+    .filter((workout) => workout.status === "COMPLETED")
+    .slice(0, 5);
+  const planWorkouts = currentPlan?.scheduled_workouts ?? [];
+  const completedPlanWorkouts = planWorkouts.filter((workout) => workout.status === "COMPLETED");
+  const remainingPlanWorkouts = planWorkouts.filter((workout) => workout.status === "PLANNED");
+  const planHasRunningWorkouts = planWorkouts.some((workout) => workout.type === "RUNNING");
+  const planTotal = planWorkouts.length;
+  const planProgress = planTotal > 0 ? Math.round((completedPlanWorkouts.length / planTotal) * 100) : 0;
+  const lastPlanWorkout = planWorkouts
+    .slice()
+    .sort((left, right) => right.scheduled_date.localeCompare(left.scheduled_date))[0];
+  const totalPlanWeeks = currentPlan && lastPlanWorkout
+    ? Math.max(1, Math.floor(dayDifference(lastPlanWorkout.scheduled_date, currentPlan.start_date) / 7) + 1)
+    : null;
+  const currentPlanWeek = currentPlan && totalPlanWeeks
+    ? Math.min(
+        totalPlanWeeks,
+        Math.max(1, Math.floor(dayDifference(today, currentPlan.start_date) / 7) + 1),
+      )
+    : null;
+  const planProgressLabel = planHasRunningWorkouts && currentPlanWeek && totalPlanWeeks
+    ? `Week ${currentPlanWeek} of ${totalPlanWeeks}`
+    : `${planProgress}%`;
+
   return (
     <div className="space-y-4">
-      <Panel>
-        <div className="flex flex-wrap items-end justify-between gap-3">
+      <Panel className="space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h2 className="text-2xl font-black text-slate-950">Today</h2>
+            <h2 className="text-2xl font-black text-slate-950">This Week</h2>
             <p className="mt-1 text-sm text-slate-600">
-              Scheduled workouts for {formatDate(date)}.
+              {formatDate(weekStart)} through {formatDate(weekEnd)}
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <input
-              className={inputClasses}
-              onChange={(event) => setDate(event.target.value)}
-              type="date"
-              value={date}
-            />
-            <button className={secondaryButtonClasses} onClick={() => void load()} type="button">
-              Refresh
-            </button>
+          <button className={secondaryButtonClasses} onClick={() => void load()} type="button">
+            Refresh
+          </button>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-3">
+          <Metric
+            label="Running"
+            value={`${weeklyCompletedRuns.length.toLocaleString()} / ${weeklyRuns.length.toLocaleString()} runs`}
+          />
+          <Metric
+            label="Run distance"
+            value={`${distanceLabel(completedRunningDistance)} / ${distanceLabel(plannedRunningDistance)}`}
+          />
+          <Metric
+            label="Weightlifting"
+            value={`${weeklyCompletedLifts.length.toLocaleString()} / ${weeklyLifts.length.toLocaleString()} lifts`}
+          />
+          <Metric
+            label="Overall"
+            value={`${completedScheduledWorkouts.length.toLocaleString()} / ${scheduledWeekWorkouts.length.toLocaleString()} workouts completed`}
+          />
+        </div>
+        {week && (
+          <div className="grid gap-2 md:grid-cols-7">
+            {week.days.map((day) => (
+              <div className={`rounded-md border border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : "bg-slate-50"}`} key={day.date}>
+                <div className="text-xs font-black uppercase text-slate-500">{formatDate(day.date)}</div>
+                <div className="mt-2 space-y-2">
+                  {day.workouts.length === 0 && (
+                    <div className="text-xs font-semibold text-slate-500">-</div>
+                  )}
+                  {day.workouts.map((workout) => (
+                    <DashboardWorkoutLink
+                      compact
+                      key={workout.id}
+                      onOpenCompletedDetail={onOpenCompletedDetail}
+                      workout={workout}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
+        )}
+      </Panel>
+
+      <ErrorState message={error} />
+      {state === "loading" && <EmptyState>Loading dashboard...</EmptyState>}
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Panel>
+          <h2 className="text-lg font-black text-slate-950">Up Next</h2>
+          {upNext ? (
+            <div className="mt-3 space-y-3">
+              <div>
+                <div className="text-xl font-black text-slate-950">{upNext.workout_name}</div>
+                <div className="mt-1 text-sm font-semibold text-slate-600">{formatDate(upNext.scheduled_date)}</div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Pill className={typeStyles[upNext.type]}>{upNext.type === "RUNNING" ? "Running" : "Lifting"}</Pill>
+                <Pill className={statusStyles[upNext.status]}>Planned</Pill>
+                {upNext.source?.label && (
+                  <Pill className="border-slate-200 bg-slate-50 text-slate-600">{upNext.source.label}</Pill>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3">
+              <EmptyState>No planned workouts are scheduled.</EmptyState>
+            </div>
+          )}
+        </Panel>
+
+        <Panel>
+          <h2 className="text-lg font-black text-slate-950">Current Training Plan</h2>
+          {currentPlan ? (
+            <div className="mt-3 space-y-3">
+              <div>
+                <div className="text-xl font-black text-slate-950">{currentPlan.plan_template_name}</div>
+                <div className="mt-1 text-sm font-semibold text-slate-600">Started {formatDate(currentPlan.start_date)}</div>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <MiniStat label="Completed" value={completedPlanWorkouts.length} />
+                <MiniStat label="Remaining" value={remainingPlanWorkouts.length} />
+                <MiniStat label="Progress" value={planProgressLabel} />
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full bg-emerald-500" style={{ width: `${planProgress}%` }} />
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3">
+              <EmptyState>No active training plan.</EmptyState>
+            </div>
+          )}
+        </Panel>
+      </div>
+
+      <Panel>
+        <h2 className="text-lg font-black text-slate-950">Next Run</h2>
+        {nextRun ? (
+          <div className="mt-3 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,0.8fr)]">
+            <div className="space-y-3">
+              <div>
+                <div className="text-2xl font-black text-slate-950">{nextRun.workout_name}</div>
+                <div className="mt-1 text-sm font-semibold text-slate-600">{formatDate(nextRun.scheduled_date)}</div>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                <Metric label="Planned distance" value={distanceLabel(nextRun.planned_distance_miles)} />
+                {nextRun.source?.plan_template_name && (
+                  <Metric label="Training plan" value={nextRun.source.plan_template_name} />
+                )}
+              </div>
+              {nextRunTemplate?.notes && (
+                <p className="rounded-md bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-700">
+                  {nextRunTemplate.notes}
+                </p>
+              )}
+            </div>
+            <div>
+              <h3 className="text-sm font-black uppercase text-slate-500">Previous attempts</h3>
+              <div className="mt-2 space-y-2">
+                {previousAttempts.length === 0 && (
+                  <EmptyState>No prior completed attempts for this template.</EmptyState>
+                )}
+                {previousAttempts.map((workout) => (
+                  <DashboardWorkoutLink
+                    key={workout.id}
+                    onOpenCompletedDetail={onOpenCompletedDetail}
+                    workout={workout}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3">
+            <EmptyState>No planned running workouts are scheduled.</EmptyState>
+          </div>
+        )}
+      </Panel>
+
+      <Panel>
+        <h2 className="text-lg font-black text-slate-950">Recent Activity</h2>
+        <div className="mt-3 grid gap-2">
+          {recentCompleted.length === 0 && (
+            <EmptyState>No completed workouts found recently.</EmptyState>
+          )}
+          {recentCompleted.map((workout) => (
+            <button
+              className="w-full rounded-md border border-slate-200 bg-white p-3 text-left hover:border-blue-300 hover:bg-blue-50/40"
+              key={workout.id}
+              onClick={() => onOpenCompletedDetail(workout)}
+              type="button"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <div className="font-black text-slate-950">{workout.workout_name}</div>
+                  <div className="text-sm font-semibold text-slate-600">
+                    {formatDate(workout.scheduled_date)} · {completedWorkoutSummary(workout)}
+                  </div>
+                </div>
+                <Pill className={typeStyles[workout.type]}>{workout.type === "RUNNING" ? "Run" : "Lift"}</Pill>
+              </div>
+            </button>
+          ))}
         </div>
       </Panel>
-      <ErrorState message={error} />
-      {state === "loading" && <EmptyState>Loading workouts...</EmptyState>}
-      {state !== "loading" && workouts.length === 0 && (
-        <EmptyState>No workouts scheduled today.</EmptyState>
-      )}
-      <div className="grid gap-3">
-        {workouts.map((workout) => (
-          <WorkoutSummary
-            key={workout.id}
-            onComplete={onComplete}
-            onRemove={onRemove}
-            onReschedule={onReschedule}
-            onSkip={onSkip}
-            onUndoReschedule={onUndoReschedule}
-            pendingAction={pendingAction}
-            workout={workout}
-          />
-        ))}
-      </div>
       {state === "refreshing" && (
-        <div className="text-sm font-semibold text-slate-500">Refreshing...</div>
+        <div className="text-sm font-semibold text-slate-500">Refreshing dashboard...</div>
       )}
     </div>
   );
@@ -2760,14 +3062,9 @@ function FitnessScreen() {
 
       <ErrorState message={mutationError} />
       <div className="mt-4">
-        {activeTab === "today" && (
-          <TodayView
-            onComplete={requestComplete}
-            onRemove={(workout) => void removeWorkoutAction(workout)}
-            onReschedule={setRescheduleWorkout}
-            onSkip={(workout) => void skipWorkoutAction(workout)}
-            onUndoReschedule={(workout) => void undoRescheduleAction(workout)}
-            pendingAction={pendingAction}
+        {activeTab === "dashboard" && (
+          <DashboardView
+            onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)}
             refreshToken={refreshKey}
           />
         )}

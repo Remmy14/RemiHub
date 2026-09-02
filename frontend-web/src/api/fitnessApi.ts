@@ -262,6 +262,19 @@ export async function getTrainingCalendar(
   return response.data;
 }
 
+export async function listWorkoutHistory(
+  startDate: string,
+  endDate: string,
+): Promise<FitnessScheduledWorkout[]> {
+  const response = await apiRequest<FitnessResponse<FitnessScheduledWorkout[]>>(
+    `/fitness/history?${query({
+      start_date: startDate,
+      end_date: endDate,
+    })}`,
+  );
+  return response.data;
+}
+
 export async function getScheduledWorkout(
   workoutId: string,
 ): Promise<FitnessScheduledWorkout> {
@@ -604,6 +617,13 @@ export async function instantiatePlanTemplate(
 export async function listPlanInstances(): Promise<FitnessPlanInstance[]> {
   const response = await apiRequest<FitnessResponse<FitnessPlanInstance[]>>(
     "/fitness/plan-instances",
+  );
+  return response.data;
+}
+
+export async function getCurrentPlanInstance(): Promise<FitnessPlanInstance | null> {
+  const response = await apiRequest<FitnessResponse<FitnessPlanInstance | null>>(
+    "/fitness/plan-instances/current",
   );
   return response.data;
 }

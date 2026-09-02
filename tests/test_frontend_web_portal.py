@@ -382,6 +382,115 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertIn("scheduled_workouts", source)
         self.assertIn("Open detail", source)
 
+    def test_fitness_frontend_defaults_to_dashboard_landing(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('type FitnessTab = "dashboard"', source)
+        self.assertIn('{ id: "dashboard", label: "Dashboard", href: "/portal/fitness" }', source)
+        self.assertIn('return "dashboard";', source)
+        self.assertIn('activeTab === "dashboard"', source)
+        self.assertIn("function DashboardView({", source)
+        self.assertNotIn('activeTab === "today"', source)
+        self.assertNotIn("function TodayView", source)
+
+        for tab in (
+            '{ id: "schedule", label: "Schedule", href: "/portal/fitness/schedule" }',
+            '{ id: "calendar", label: "Calendar", href: "/portal/fitness/calendar" }',
+            'label: "Workout Templates"',
+            '{ id: "plans", label: "Training Plans", href: "/portal/fitness/plans" }',
+            '{ id: "weightlifting", label: "Weightlifting", href: "/portal/fitness/weightlifting" }',
+        ):
+            with self.subTest(tab=tab):
+                self.assertIn(tab, source)
+
+    def test_fitness_dashboard_composes_existing_durable_apis(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        screen_source = (frontend_root / "src" / "FitnessScreen.tsx").read_text(
+            encoding="utf-8",
+        )
+        api_source = (frontend_root / "src" / "api" / "fitnessApi.ts").read_text(
+            encoding="utf-8",
+        )
+
+        for api_fragment in (
+            "getTrainingCalendar(weekStart, weekEnd)",
+            "listScheduledWorkouts(today, futureEnd)",
+            "listWorkoutHistory(historyStart, today)",
+            "getCurrentPlanInstance()",
+            "getPlanInstance(activePlan.id)",
+            "getWorkoutTemplate(upcomingRun.workout_template_id)",
+            "listCompletedWorkoutsForTemplate(upcomingRun.workout_template_id)",
+        ):
+            with self.subTest(api_fragment=api_fragment):
+                self.assertIn(api_fragment, screen_source)
+
+        self.assertIn("/fitness/history?", api_source)
+        self.assertIn("/fitness/plan-instances/current", api_source)
+        self.assertIn("workout.status === \"PLANNED\"", screen_source)
+        self.assertIn('plannedFutureWorkouts.find((workout) => workout.type === "RUNNING")', screen_source)
+        self.assertNotIn("listCompletedWorkoutsForTemplate(upcomingRun.workout_name", screen_source)
+        self.assertNotIn("listCompletedWorkoutsForTemplate(nextRun.workout_name", screen_source)
+
+    def test_fitness_dashboard_renders_required_sections_and_summaries(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for section in (
+            "This Week",
+            "Up Next",
+            "Next Run",
+            "Previous attempts",
+            "Current Training Plan",
+            "Recent Activity",
+        ):
+            with self.subTest(section=section):
+                self.assertIn(section, source)
+
+        for calculation in (
+            'workout.status !== "RESCHEDULED"',
+            'workout.type === "RUNNING"',
+            'workout.type === "LIFTING"',
+            'workout.status === "COMPLETED"',
+            "completed_distance_miles",
+            "planned_distance_miles",
+            "completedPlanWorkouts.length",
+            "remainingPlanWorkouts.length",
+            "completedWorkoutSummary(workout)",
+            "No planned workouts are scheduled.",
+            "No planned running workouts are scheduled.",
+            "No prior completed attempts for this template.",
+            "No active training plan.",
+            "No completed workouts found recently.",
+        ):
+            with self.subTest(calculation=calculation):
+                self.assertIn(calculation, source)
+
+    def test_fitness_dashboard_completed_items_use_shared_detail_path(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(source.count("function CompletedWorkoutDetailDialog"), 1)
+        self.assertIn("function DashboardWorkoutLink({", source)
+        self.assertIn("onClick={() => onOpenCompletedDetail(workout)}", source)
+        self.assertIn("getScheduledWorkout(workout.id)", source)
+        self.assertIn("onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)}", source)
+        self.assertNotIn("function DashboardCompletedWorkoutDetail", source)
+        self.assertNotIn("function GarminDashboard", source)
+        self.assertNotIn("function WeightliftingDashboardResultDialog", source)
+
     def test_health_screen_does_not_duplicate_systemd_health_semantics(self):
         source = (
             Path(__file__).resolve().parents[1]
