@@ -12,6 +12,7 @@ import {
   createScheduledWorkout,
   createWorkoutTemplate,
   getCurrentPlanInstance,
+  getHistoricalEfforts,
   getTrainingCalendar,
   getPlanInstance,
   getPlanTemplate,
@@ -50,6 +51,9 @@ import type {
   FitnessScheduledWorkout,
   FitnessWorkoutTemplate,
   FitnessWorkoutType,
+  HistoricalEffortsData,
+  HistoricalEffortsLimit,
+  HistoricalMetricDefinition,
   RunningCompletionRequest,
 } from "./api/fitnessApi";
 import {
@@ -238,6 +242,48 @@ function speedLabel(metersPerSecond: number | null | undefined): string | null {
     return null;
   }
   return `${(metersPerSecond * 2.236936).toLocaleString(undefined, { maximumFractionDigits: 1 })} mph`;
+}
+
+function canOpenHistoricalEfforts(workout: FitnessScheduledWorkout): boolean {
+  return workout.status === "COMPLETED" && (
+    workout.type === "RUNNING" || workout.type === "CYCLING"
+  );
+}
+
+function formatPaceSeconds(secondsPerMile: number): string {
+  const roundedSeconds = Math.round(secondsPerMile);
+  const minutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")} / mi`;
+}
+
+function formatHistoricalMetricValue(
+  value: number | null | undefined,
+  metric: HistoricalMetricDefinition,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "-";
+  }
+  switch (metric.format) {
+    case "PACE_PER_MILE":
+      return formatPaceSeconds(value);
+    case "SECONDS":
+      return formatDuration(value);
+    case "MILES":
+      return distanceLabel(value);
+    case "BPM":
+      return numberLabel(value, " bpm", 0) ?? "-";
+    case "SPM":
+      return numberLabel(value, " spm", 0) ?? "-";
+    case "RPM":
+      return numberLabel(value, " rpm", 0) ?? "-";
+    case "WATTS":
+      return numberLabel(value, " W", 0) ?? "-";
+    case "METERS":
+      return numberLabel(value, " m", 1) ?? "-";
+    default:
+      return numberLabel(value) ?? "-";
+  }
 }
 
 function resultSourceLabel(workout: FitnessScheduledWorkout): string | null {
@@ -766,16 +812,18 @@ function WorkoutTemplateReplaceDialog({
 
 function Dialog({
   children,
+  className = "max-w-xl",
   onClose,
   title,
 }: {
   children: ReactNode;
+  className?: string;
   onClose: () => void;
   title: string;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/40 px-4 py-8">
-      <section className="w-full max-w-xl rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+      <section className={`w-full rounded-lg border border-slate-200 bg-white p-5 shadow-xl ${className}`}>
         <div className="mb-4 flex items-start justify-between gap-3">
           <h2 className="text-xl font-black text-slate-950">{title}</h2>
           <button
@@ -795,9 +843,11 @@ function Dialog({
 
 function CompletedWorkoutDetailDialog({
   onClose,
+  onOpenHistoricalEfforts,
   workout,
 }: {
   onClose: () => void;
+  onOpenHistoricalEfforts: (workout: FitnessScheduledWorkout) => void;
   workout: FitnessScheduledWorkout;
 }) {
   const result = workout.running_result;
@@ -849,6 +899,7 @@ function CompletedWorkoutDetailDialog({
   ];
   const visibleMetrics = detailMetrics.filter((metric) => metric.value !== null);
   const hasLiftingDetails = Boolean(liftingResult?.entries.length);
+  const hasRecordedWorkoutDetails = Boolean(result || cyclingResult || hasLiftingDetails);
 
   return (
     <Dialog onClose={onClose} title={workout.workout_name || "Completed workout"}>
@@ -888,7 +939,7 @@ function CompletedWorkoutDetailDialog({
             ))}
           </div>
         )}
-        {!result && !hasLiftingDetails && (
+        {!hasRecordedWorkoutDetails && (
           <EmptyState>
             No recorded workout details are available.
           </EmptyState>
@@ -898,9 +949,137 @@ function CompletedWorkoutDetailDialog({
             {result.notes}
           </p>
         )}
-        <div className="flex justify-end">
+        <div className="flex flex-wrap justify-end gap-2">
+          {canOpenHistoricalEfforts(workout) && (
+            <button
+              className={secondaryButtonClasses}
+              onClick={() => onOpenHistoricalEfforts(workout)}
+              type="button"
+            >
+              Historical Efforts
+            </button>
+          )}
           <button className={secondaryButtonClasses} onClick={onClose} type="button">
             Close
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function HistoricalEffortsDialog({
+  data,
+  error,
+  limit,
+  onClose,
+  onLimitChange,
+  onRetry,
+  referenceWorkout,
+  state,
+}: {
+  data: HistoricalEffortsData | null;
+  error: string | null;
+  limit: HistoricalEffortsLimit;
+  onClose: () => void;
+  onLimitChange: (limit: HistoricalEffortsLimit) => void;
+  onRetry: () => void;
+  referenceWorkout: FitnessScheduledWorkout;
+  state: LoadState;
+}) {
+  const selectedMetric = useMemo(() => {
+    if (!data) {
+      return null;
+    }
+    return data.metrics.find((metric) =>
+      data.efforts.some((effort) => effort.values[metric.key] !== null && effort.values[metric.key] !== undefined),
+    ) ?? data.metrics[0] ?? null;
+  }, [data]);
+
+  return (
+    <Dialog
+      className="max-w-3xl"
+      onClose={onClose}
+      title="Historical Efforts"
+    >
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="font-black text-slate-950">
+              {data?.workout.workout_name || referenceWorkout.workout_name || "Workout"}
+            </div>
+            <div className="mt-1 text-sm font-semibold text-slate-600">
+              {typeLabels[referenceWorkout.type]} · {formatDate(referenceWorkout.scheduled_date)}
+            </div>
+          </div>
+          <Field label="Attempts">
+            <select
+              className={inputClasses}
+              disabled={state === "loading"}
+              onChange={(event) => onLimitChange(event.target.value as HistoricalEffortsLimit)}
+              value={limit}
+            >
+              <option value="5">5</option>
+              <option value="10">10</option>
+              <option value="all">All</option>
+            </select>
+          </Field>
+        </div>
+        <ErrorState message={error} />
+        {state === "loading" && !data && (
+          <EmptyState>Loading Historical Efforts...</EmptyState>
+        )}
+        {data && (
+          <>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <Metric label="Efforts" value={data.total_efforts.toLocaleString()} />
+              <Metric label="Template" value={data.workout.workout_name || referenceWorkout.workout_name} />
+              {selectedMetric && <Metric label="Metric" value={selectedMetric.label} />}
+            </div>
+            {data.efforts.length === 0 ? (
+              <EmptyState>No historical efforts are available for this workout.</EmptyState>
+            ) : (
+              <div className="overflow-x-auto rounded-md border border-slate-200">
+                <table className="min-w-full divide-y divide-slate-200 text-sm">
+                  <thead className="bg-slate-50">
+                    <tr>
+                      <th className="px-3 py-2 text-left text-xs font-black uppercase text-slate-500">Date</th>
+                      {data.metrics.map((metric) => (
+                        <th className="px-3 py-2 text-left text-xs font-black uppercase text-slate-500" key={metric.key}>
+                          {metric.label}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 bg-white">
+                    {data.efforts.map((effort) => (
+                      <tr key={effort.scheduled_workout_id}>
+                        <td className="whitespace-nowrap px-3 py-2 font-semibold text-slate-900">
+                          {formatDate(effort.scheduled_date)}
+                        </td>
+                        {data.metrics.map((metric) => (
+                          <td className="whitespace-nowrap px-3 py-2 text-slate-700" key={metric.key}>
+                            {formatHistoricalMetricValue(effort.values[metric.key], metric)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+        {error && !data && (
+          <div className="flex justify-end">
+            <button className={secondaryButtonClasses} onClick={onRetry} type="button">
+              Retry
+            </button>
+          </div>
+        )}
+        <div className="flex justify-end">
+          <button className={secondaryButtonClasses} onClick={onClose} type="button">
+            Back to workout detail
           </button>
         </div>
       </div>
@@ -3201,6 +3380,11 @@ function FitnessScreen() {
   const [rescheduleWorkout, setRescheduleWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [editWorkout, setEditWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [detailWorkout, setDetailWorkout] = useState<FitnessScheduledWorkout | null>(null);
+  const [historicalWorkout, setHistoricalWorkout] = useState<FitnessScheduledWorkout | null>(null);
+  const [historicalData, setHistoricalData] = useState<HistoricalEffortsData | null>(null);
+  const [historicalLimit, setHistoricalLimit] = useState<HistoricalEffortsLimit>("5");
+  const [historicalState, setHistoricalState] = useState<LoadState>("idle");
+  const [historicalError, setHistoricalError] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -3371,6 +3555,7 @@ function FitnessScreen() {
     if (workout.status !== "COMPLETED") {
       return;
     }
+    setHistoricalWorkout(null);
     setMutationError(null);
     setDetailWorkout(workout);
     try {
@@ -3378,6 +3563,34 @@ function FitnessScreen() {
     } catch (caught) {
       setMutationError(messageFromError(caught, "Unable to open workout detail."));
     }
+  };
+
+  const loadHistoricalEfforts = async (
+    workout: FitnessScheduledWorkout,
+    limit: HistoricalEffortsLimit,
+    clearExisting = false,
+  ) => {
+    setHistoricalWorkout(workout);
+    setHistoricalLimit(limit);
+    setHistoricalState((current) => (current === "idle" ? "loading" : "refreshing"));
+    setHistoricalError(null);
+    if (clearExisting) {
+      setHistoricalData(null);
+    }
+    try {
+      setHistoricalData(await getHistoricalEfforts(workout.id, limit));
+    } catch (caught) {
+      setHistoricalError(messageFromError(caught, "Unable to load Historical Efforts."));
+    } finally {
+      setHistoricalState("idle");
+    }
+  };
+
+  const openHistoricalEfforts = (workout: FitnessScheduledWorkout) => {
+    if (!canOpenHistoricalEfforts(workout)) {
+      return;
+    }
+    void loadHistoricalEfforts(workout, "5", true);
   };
 
   return (
@@ -3482,7 +3695,20 @@ function FitnessScreen() {
       {detailWorkout && (
         <CompletedWorkoutDetailDialog
           onClose={() => setDetailWorkout(null)}
+          onOpenHistoricalEfforts={openHistoricalEfforts}
           workout={detailWorkout}
+        />
+      )}
+      {historicalWorkout && (
+        <HistoricalEffortsDialog
+          data={historicalData}
+          error={historicalError}
+          limit={historicalLimit}
+          onClose={() => setHistoricalWorkout(null)}
+          onLimitChange={(limit) => void loadHistoricalEfforts(historicalWorkout, limit)}
+          onRetry={() => void loadHistoricalEfforts(historicalWorkout, historicalLimit, !historicalData)}
+          referenceWorkout={historicalWorkout}
+          state={historicalState}
         />
       )}
     </main>

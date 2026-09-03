@@ -283,6 +283,37 @@ export type GarminCompletionResult =
   | { status: "AMBIGUOUS_MATCH"; candidates: GarminActivityCandidate[] }
   | { status: "COMPLETED"; workout: FitnessScheduledWorkout };
 
+export type HistoricalEffortsLimit = "5" | "10" | "all";
+
+export type HistoricalWorkoutSummary = {
+  workout_template_id: string;
+  workout_type: FitnessWorkoutType;
+  workout_name: string;
+  planned_distance_miles?: number | null;
+  planned_duration_seconds?: number | null;
+};
+
+export type HistoricalMetricDefinition = {
+  key: string;
+  label: string;
+  format: "PACE_PER_MILE" | "BPM" | "SPM" | "RPM" | "WATTS" | "DECIMAL" | "METERS" | "MILES" | "SECONDS" | string;
+  lower_is_better: boolean | null;
+};
+
+export type HistoricalEffort = {
+  scheduled_workout_id: string;
+  scheduled_date: string;
+  status: FitnessWorkoutStatus;
+  values: Record<string, number | null>;
+};
+
+export type HistoricalEffortsData = {
+  workout: HistoricalWorkoutSummary;
+  total_efforts: number;
+  metrics: HistoricalMetricDefinition[];
+  efforts: HistoricalEffort[];
+};
+
 export type FitnessRescheduleResult = {
   original: FitnessScheduledWorkout;
   replacement: FitnessScheduledWorkout;
@@ -349,6 +380,16 @@ export async function getScheduledWorkout(
 ): Promise<FitnessScheduledWorkout> {
   const response = await apiRequest<FitnessResponse<FitnessScheduledWorkout>>(
     `/fitness/scheduled-workouts/${workoutId}`,
+  );
+  return response.data;
+}
+
+export async function getHistoricalEfforts(
+  workoutId: string,
+  limit: HistoricalEffortsLimit = "5",
+): Promise<HistoricalEffortsData> {
+  const response = await apiRequest<FitnessResponse<HistoricalEffortsData>>(
+    `/fitness/scheduled-workouts/${workoutId}/historical-efforts?${query({ limit })}`,
   );
   return response.data;
 }

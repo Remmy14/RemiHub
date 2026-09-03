@@ -296,6 +296,7 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertIn("getScheduledWorkout(workout.id)", screen_source)
         self.assertIn("resultSourceLabel(workout)", screen_source)
         self.assertIn("liftingEntryLabel", screen_source)
+        self.assertIn("hasRecordedWorkoutDetails", screen_source)
         self.assertIn("No recorded workout details are available.", screen_source)
         self.assertNotIn(
             "This completed workout does not have external result metrics.",
@@ -303,6 +304,69 @@ class FrontendWebPortalTests(unittest.TestCase):
         )
         self.assertIn("listCompletedWorkoutsForTemplate", api_source)
         self.assertIn("/completed-workouts", api_source)
+
+    def test_fitness_completed_detail_exposes_scheduled_historical_efforts(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        screen_source = (frontend_root / "src" / "FitnessScreen.tsx").read_text(
+            encoding="utf-8",
+        )
+        api_source = (frontend_root / "src" / "api" / "fitnessApi.ts").read_text(
+            encoding="utf-8",
+        )
+
+        self.assertEqual(screen_source.count("function CompletedWorkoutDetailDialog"), 1)
+        self.assertIn("function canOpenHistoricalEfforts", screen_source)
+        self.assertIn('workout.status === "COMPLETED"', screen_source)
+        self.assertIn('workout.type === "RUNNING" || workout.type === "CYCLING"', screen_source)
+        self.assertNotIn('workout.type === "LIFTING" || workout.type === "RUNNING"', screen_source)
+        self.assertIn("onOpenHistoricalEfforts={openHistoricalEfforts}", screen_source)
+        self.assertIn("Historical Efforts", screen_source)
+        self.assertIn("getHistoricalEfforts(workout.id, limit)", screen_source)
+        self.assertIn("Back to workout detail", screen_source)
+        self.assertIn("export type HistoricalEffortsData", api_source)
+        self.assertIn("export async function getHistoricalEfforts", api_source)
+        self.assertIn("/fitness/scheduled-workouts/${workoutId}/historical-efforts", api_source)
+        self.assertIn("query({ limit })", api_source)
+
+    def test_fitness_dashboard_and_calendar_share_historical_effort_detail_action(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("function DashboardWorkoutLink({", source)
+        self.assertIn("function TrainingCalendarView({", source)
+        self.assertIn("function CalendarWorkoutCard({", source)
+        self.assertIn("onClick={() => onOpenCompletedDetail(workout)}", source)
+        self.assertIn("onOpenCompletedDetail={(workout) => void openCompletedDetail(workout)}", source)
+        self.assertIn("setDetailWorkout(await getScheduledWorkout(workout.id))", source)
+        self.assertEqual(source.count("onOpenHistoricalEfforts={openHistoricalEfforts}"), 1)
+        self.assertNotIn("DashboardHistoricalEfforts", source)
+        self.assertNotIn("CalendarHistoricalEfforts", source)
+
+    def test_fitness_cycling_recorded_details_suppress_false_empty_state(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("const cyclingResult = workout.cycling_result", source)
+        self.assertIn("const hasRecordedWorkoutDetails = Boolean(result || cyclingResult || hasLiftingDetails)", source)
+        self.assertIn("!hasRecordedWorkoutDetails &&", source)
+        self.assertNotIn("!result && !hasLiftingDetails &&", source)
+        for metric in (
+            "Ride distance",
+            "Ride duration",
+            "Average ride power",
+            "Resistance",
+            "No recorded workout details are available.",
+        ):
+            with self.subTest(metric=metric):
+                self.assertIn(metric, source)
 
     def test_fitness_frontend_models_optional_result_metrics(self):
         source = (
