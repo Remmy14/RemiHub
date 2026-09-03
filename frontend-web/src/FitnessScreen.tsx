@@ -63,6 +63,7 @@ import type { WeightliftingExercise } from "./api/weightliftingApi";
 
 type FitnessTab = "dashboard" | "schedule" | "calendar" | "templates" | "plans" | "weightlifting";
 type LoadState = "idle" | "loading" | "refreshing";
+type WorkoutTemplateTypeFilter = FitnessWorkoutType | "ALL";
 
 const tabs: Array<{ id: FitnessTab; label: string; href: string }> = [
   { id: "dashboard", label: "Dashboard", href: "/portal/fitness" },
@@ -2382,6 +2383,7 @@ function TemplatesView({
   const [historicalState, setHistoricalState] = useState<LoadState>("idle");
   const [historicalError, setHistoricalError] = useState<string | null>(null);
   const [includeArchived, setIncludeArchived] = useState(false);
+  const [templateTypeFilter, setTemplateTypeFilter] = useState<WorkoutTemplateTypeFilter>("ALL");
   const [type, setType] = useState<FitnessWorkoutType>("RUNNING");
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
@@ -2412,6 +2414,31 @@ function TemplatesView({
   useEffect(() => {
     void load();
   }, [load]);
+
+  const templateTypeOptions = useMemo(
+    () =>
+      Array.from(new Set(templates.map((template) => template.type))).sort(
+        (left, right) => typeLabels[left].localeCompare(typeLabels[right]),
+      ),
+    [templates],
+  );
+
+  useEffect(() => {
+    if (
+      templateTypeFilter !== "ALL" &&
+      !templateTypeOptions.includes(templateTypeFilter)
+    ) {
+      setTemplateTypeFilter("ALL");
+    }
+  }, [templateTypeFilter, templateTypeOptions]);
+
+  const visibleTemplates = useMemo(
+    () =>
+      templateTypeFilter === "ALL"
+        ? templates
+        : templates.filter((template) => template.type === templateTypeFilter),
+    [templateTypeFilter, templates],
+  );
 
   const editTemplate = async (template: FitnessWorkoutTemplate) => {
     setError(null);
@@ -2537,14 +2564,34 @@ function TemplatesView({
         <Panel>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-2xl font-black text-slate-950">Workout Templates</h2>
-            <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-              <input
-                checked={includeArchived}
-                onChange={(event) => setIncludeArchived(event.target.checked)}
-                type="checkbox"
-              />
-              Include archived
-            </label>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex min-w-[11rem] items-center gap-2 text-sm font-semibold text-slate-700">
+                <span className="shrink-0">Type</span>
+                <select
+                  className={inputClasses}
+                  disabled={templates.length === 0}
+                  onChange={(event) =>
+                    setTemplateTypeFilter(event.target.value as WorkoutTemplateTypeFilter)
+                  }
+                  value={templateTypeFilter}
+                >
+                  <option value="ALL">All</option>
+                  {templateTypeOptions.map((workoutType) => (
+                    <option key={workoutType} value={workoutType}>
+                      {typeLabels[workoutType]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                <input
+                  checked={includeArchived}
+                  onChange={(event) => setIncludeArchived(event.target.checked)}
+                  type="checkbox"
+                />
+                Include archived
+              </label>
+            </div>
           </div>
         </Panel>
         <ErrorState message={error} />
@@ -2552,8 +2599,11 @@ function TemplatesView({
         {state !== "loading" && templates.length === 0 && (
           <EmptyState>No workout templates yet.</EmptyState>
         )}
+        {state !== "loading" && templates.length > 0 && visibleTemplates.length === 0 && (
+          <EmptyState>No workout templates match this type.</EmptyState>
+        )}
         <div className="grid gap-3 md:grid-cols-2">
-          {templates.map((template) => (
+          {visibleTemplates.map((template) => (
             <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm" key={template.id}>
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <h3 className="break-words text-lg font-black text-slate-950">{template.name}</h3>
