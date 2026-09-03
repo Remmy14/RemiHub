@@ -3,15 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import logging
 import os
 from pathlib import Path
+import re
 from typing import Callable, Any
 
 
 GARMIN_TOKENSTORE_ENV = "GARMIN_TOKENSTORE"
 GARMIN_PROVIDER = "GARMIN"
 METERS_PER_MILE = Decimal("1609.344")
+CYCLING_GARMIN_QUERY_ACTIVITY_TYPE = "cycling"
 CYCLING_ACTIVITY_TYPE_KEYS = ("indoor_cycling",)
+logger = logging.getLogger("remihub.garmin_activity_provider")
 
 
 class GarminProviderError(RuntimeError):
@@ -337,27 +341,72 @@ def summarize_candidate(summary: dict) -> GarminActivityCandidate:
     )
 
 
-def _translate_garmin_error(exc: Exception) -> GarminProviderError:
-    name = exc.__class__.__name__.lower()
+def _garmin_http_status(exc: Exception) -> int | None:
     status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
     response = getattr(exc, "response", None)
     if status is None and response is not None:
         status = getattr(response, "status_code", None)
+
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+
+    match = re.search(r"\b(?:error|status|client error)\s*\(?(\d{3})\)?\b", str(exc), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _sanitize_garmin_error_message(exc: Exception) -> str:
+    message = " ".join(str(exc).split())
+    redactions = (
+        r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+",
+        r"(?i)\b(authorization)\s*[:=]\s*(?:bearer\s+)?[^,\s;]+",
+        r"(?i)\b(password|token|tokenstore|credential)\s*[:=]\s*[^,\s;]+",
+    )
+    for pattern in redactions:
+        message = re.sub(pattern, r"\1=[REDACTED]", message)
+    if len(message) > 500:
+        message = f"{message[:497]}..."
+    return message
+
+
+def _log_garmin_call_failure(*, operation: str, exc: Exception) -> None:
+    logger.warning(
+        "Garmin call failed: operation=%s exception_class=%s http_status=%s message=%s",
+        operation,
+        exc.__class__.__name__,
+        _garmin_http_status(exc),
+        _sanitize_garmin_error_message(exc),
+    )
+
+
+def _translate_garmin_error(exc: Exception) -> GarminProviderError:
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    status = _garmin_http_status(exc)
     if status == 429 or "ratelimit" in name or "too many" in str(exc).lower():
         return GarminRateLimitError("Garmin rate limit reached")
     if "auth" in name or "credential" in name or "token" in name:
         return GarminAuthError("Garmin authentication failed")
+    if status in {401, 403} and ("auth" in message or "token" in message or "credential" in message):
+        return GarminAuthError("Garmin authentication failed")
+    if status is not None:
+        return GarminApiError("Garmin API request failed")
     if "connection" in name or "timeout" in name or "network" in name:
         return GarminNetworkError("Garmin network request failed")
     return GarminApiError("Garmin API request failed")
 
 
-def _garmin_call(fn: Callable[[], Any]) -> Any:
+def _garmin_call(fn: Callable[[], Any], *, operation: str) -> Any:
     try:
         return fn()
     except GarminProviderError:
         raise
     except Exception as exc:
+        _log_garmin_call_failure(operation=operation, exc=exc)
         raise _translate_garmin_error(exc) from exc
 
 
@@ -365,7 +414,7 @@ def _runtime_api(tokenstore: str | None = None):
     resolved_tokenstore = tokenstore or configured_tokenstore()
     Garmin = _garmin_class()
     api = Garmin()
-    _garmin_call(lambda: api.login(resolved_tokenstore))
+    _garmin_call(lambda: api.login(resolved_tokenstore), operation="login")
     return api
 
 
@@ -382,7 +431,8 @@ def fetch_running_activity_summaries(
             garmin_date,
             activitytype="running",
             sortorder="asc",
-        )
+        ),
+        operation="running_activity_list",
     )
     if not isinstance(activities, list):
         raise GarminMalformedResponseError("Garmin activities response is not a list")
@@ -394,22 +444,24 @@ def fetch_cycling_activity_summaries(
     *,
     tokenstore: str | None = None,
 ) -> list[dict]:
-    summaries: list[dict] = []
-    for activity_type in CYCLING_ACTIVITY_TYPE_KEYS:
-        api = _runtime_api(tokenstore)
-        garmin_date = scheduled_date.isoformat()
-        activities = _garmin_call(
-            lambda: api.get_activities_by_date(
-                garmin_date,
-                garmin_date,
-                activitytype=activity_type,
-                sortorder="asc",
-            )
-        )
-        if not isinstance(activities, list):
-            raise GarminMalformedResponseError("Garmin activities response is not a list")
-        summaries.extend(activities)
-    return summaries
+    api = _runtime_api(tokenstore)
+    garmin_date = scheduled_date.isoformat()
+    activities = _garmin_call(
+        lambda: api.get_activities_by_date(
+            garmin_date,
+            garmin_date,
+            activitytype=CYCLING_GARMIN_QUERY_ACTIVITY_TYPE,
+            sortorder="asc",
+        ),
+        operation="cycling_activity_list",
+    )
+    if not isinstance(activities, list):
+        raise GarminMalformedResponseError("Garmin activities response is not a list")
+    return [
+        activity
+        for activity in activities
+        if isinstance(activity, dict) and _activity_type_key(activity) in CYCLING_ACTIVITY_TYPE_KEYS
+    ]
 
 
 def _activity_detail_metrics(detail: Any) -> list[dict]:
@@ -445,7 +497,7 @@ def _is_peloton(summary: dict) -> bool:
 
 
 def _fetch_activity_detail(api, activity_id: str) -> Any:
-    return _garmin_call(lambda: api.get_activity_details(activity_id))
+    return _garmin_call(lambda: api.get_activity_details(activity_id), operation="activity_details")
 
 
 def _normalize_cycling_summaries(
@@ -566,4 +618,4 @@ def bootstrap_garmin_tokenstore(
     Garmin = _garmin_class()
     kwargs = {"prompt_mfa": prompt_mfa} if prompt_mfa is not None else {}
     api = Garmin(email, password, **kwargs)
-    _garmin_call(lambda: api.login(str(tokenstore)))
+    _garmin_call(lambda: api.login(str(tokenstore)), operation="login")

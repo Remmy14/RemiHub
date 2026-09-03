@@ -73,7 +73,15 @@ class ConnectionFailure(Exception):
     pass
 
 
+class TimeoutFailure(Exception):
+    pass
+
+
 class AuthenticationFailure(Exception):
+    pass
+
+
+class GarminConnectConnectionError(Exception):
     pass
 
 
@@ -133,6 +141,7 @@ class GarminActivityProviderTests(unittest.TestCase):
             (AuthenticationFailure("bad token"), provider.GarminAuthError),
             (RateLimited("slow down"), provider.GarminRateLimitError),
             (ConnectionFailure("connection timeout"), provider.GarminNetworkError),
+            (TimeoutFailure("request timeout"), provider.GarminNetworkError),
         ]
         for exc, expected in cases:
             with self.subTest(expected=expected.__name__):
@@ -225,20 +234,126 @@ class GarminActivityProviderTests(unittest.TestCase):
         with self.assertRaises(provider.GarminMalformedResponseError):
             provider.normalize_activity_summary({"activityId": 1, "activityType": {"typeKey": "cycling"}})
 
-    def test_cycling_query_uses_verified_indoor_cycling_activity_type(self):
-        FakeGarminApi.activities = [{"activityId": 123, "activityName": "Ride"}]
+    def test_cycling_query_uses_parent_cycling_type_and_filters_supported_subtypes(self):
+        FakeGarminApi.activities = [
+            {
+                "activityId": 24215057984,
+                "activityName": "18 min Just Ride",
+                "activityType": {"typeKey": "indoor_cycling"},
+                "manufacturer": "PELOTON",
+                "distance": "8107.0498046875",
+                "duration": "1083.0",
+            },
+            {
+                "activityId": 789,
+                "activityName": "Unsupported Ride",
+                "activityType": {"typeKey": "road_biking"},
+                "distance": "12000",
+                "duration": "2400",
+            },
+        ]
 
         with self.patch_garmin():
-            provider.fetch_cycling_activity_summaries(
+            summaries = provider.fetch_cycling_activity_summaries(
                 date(2026, 8, 29),
                 tokenstore="/secure/garmin",
             )
 
         self.assertEqual(
             FakeGarminApi.date_calls,
-            [("2026-08-29", "2026-08-29", "indoor_cycling", "asc")],
+            [("2026-08-29", "2026-08-29", "cycling", "asc")],
         )
+        self.assertNotIn("indoor_cycling", [call[2] for call in FakeGarminApi.date_calls])
+        self.assertEqual([summary["activityId"] for summary in summaries], [24215057984])
+        self.assertEqual(provider._activity_type_key(summaries[0]), "indoor_cycling")
+        self.assertEqual(summaries[0]["manufacturer"], "PELOTON")
         self.assertEqual(FakeGarminApi.prohibited_calls, [])
+
+    def test_cycling_resolution_excludes_unsupported_parent_query_results(self):
+        FakeGarminApi.activities = [
+            {
+                "activityId": 456,
+                "activityName": "18 min Just Ride",
+                "activityType": {"typeKey": "indoor_cycling"},
+                "manufacturer": "PELOTON",
+                "distance": "8107.0498046875",
+                "duration": "1083.0",
+            },
+            {
+                "activityId": 789,
+                "activityName": "Outdoor Ride",
+                "activityType": {"typeKey": "cycling"},
+                "distance": "12000",
+                "duration": "2400",
+            },
+        ]
+        FakeGarminApi.activity_details = {
+            "456": {"activityDetailMetrics": [{"directResistance": "24"}]},
+        }
+
+        with self.patch_garmin():
+            resolution = provider.resolve_cycling_activities(
+                date(2026, 8, 29),
+                tokenstore="/secure/garmin",
+            )
+
+        self.assertEqual(len(resolution.activities), 1)
+        self.assertEqual(resolution.candidates, [])
+        activity = resolution.activities[0]
+        self.assertEqual(activity.external_activity_id, "456")
+        self.assertEqual(activity.external_activity_name, "18 min Just Ride")
+        self.assertEqual(activity.external_activity_type_key, "indoor_cycling")
+        self.assertEqual(activity.external_manufacturer, "PELOTON")
+
+    def test_http_400_connection_named_garmin_error_is_api_error(self):
+        exc = GarminConnectConnectionError(
+            "API call client error (400): API Error 400 - Activity type cannot be an activity sub type"
+        )
+
+        translated = provider._translate_garmin_error(exc)
+
+        self.assertIsInstance(translated, provider.GarminApiError)
+        self.assertNotIsInstance(translated, provider.GarminNetworkError)
+
+    def test_http_429_retains_rate_limit_classification(self):
+        exc = GarminConnectConnectionError("API call client error (429): API Error 429 - Too many requests")
+
+        translated = provider._translate_garmin_error(exc)
+
+        self.assertIsInstance(translated, provider.GarminRateLimitError)
+
+    def test_connection_and_timeout_without_http_status_remain_network_errors(self):
+        cases = [
+            ConnectionFailure("connection refused"),
+            TimeoutFailure("request timeout"),
+        ]
+        for exc in cases:
+            with self.subTest(exception=exc.__class__.__name__):
+                self.assertIsInstance(
+                    provider._translate_garmin_error(exc),
+                    provider.GarminNetworkError,
+                )
+
+    def test_garmin_call_logs_safe_failure_diagnostics(self):
+        FakeGarminApi.activities_error = GarminConnectConnectionError(
+            "API call client error (400): token=secret Authorization: Bearer abc123"
+        )
+
+        with self.patch_garmin(), self.assertLogs("remihub.garmin_activity_provider", level="WARNING") as logs:
+            with self.assertRaises(provider.GarminApiError):
+                provider.fetch_running_activity_summaries(
+                    date(2026, 8, 21),
+                    tokenstore="/secure/garmin",
+                )
+
+        message = "\n".join(logs.output)
+        self.assertIn("operation=running_activity_list", message)
+        self.assertIn("exception_class=GarminConnectConnectionError", message)
+        self.assertIn("http_status=400", message)
+        self.assertIn("token=[REDACTED]", message)
+        self.assertIn("Authorization=[REDACTED]", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("abc123", message)
 
     def test_cycling_summary_metrics_and_manufacturer_are_canonical(self):
         activity = provider.normalize_cycling_activity_summary(
