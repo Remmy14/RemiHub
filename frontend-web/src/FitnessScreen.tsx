@@ -51,6 +51,8 @@ import type {
   FitnessScheduledWorkout,
   FitnessWorkoutTemplate,
   FitnessWorkoutType,
+  GarminActivityCandidate,
+  GarminCompletionResult,
   HistoricalEffortsData,
   HistoricalEffortsLimit,
   HistoricalMetricDefinition,
@@ -64,6 +66,13 @@ import type { WeightliftingExercise } from "./api/weightliftingApi";
 type FitnessTab = "dashboard" | "schedule" | "calendar" | "templates" | "plans" | "weightlifting";
 type LoadState = "idle" | "loading" | "refreshing";
 type WorkoutTemplateTypeFilter = FitnessWorkoutType | "ALL";
+type GarminCompletionUiState = {
+  workout: FitnessScheduledWorkout;
+  status: "LOOKUP" | "NO_MATCH" | "AMBIGUOUS_MATCH" | "ERROR";
+  candidates: GarminActivityCandidate[];
+  selectedActivityId: string | null;
+  message: string | null;
+};
 
 const tabs: Array<{ id: FitnessTab; label: string; href: string }> = [
   { id: "dashboard", label: "Dashboard", href: "/portal/fitness" },
@@ -212,6 +221,13 @@ function distanceLabel(value: number | null | undefined): string {
     return "No distance";
   }
   return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} mi`;
+}
+
+function garminCandidateDistanceLabel(value: number | null | undefined): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  return distanceLabel(value / 1609.344);
 }
 
 function numberLabel(
@@ -650,6 +666,153 @@ function RunningCompletionDialog({
         <ErrorState message={error} />
         <DialogActions onClose={onClose} submitting={submitting} submitLabel="Complete run" />
       </form>
+    </Dialog>
+  );
+}
+
+function GarminCompletionDialog({
+  garminState,
+  onClose,
+  onCompleteManual,
+  onRetry,
+  onSelectCandidate,
+  onSubmitSelection,
+  submitting,
+}: {
+  garminState: GarminCompletionUiState;
+  onClose: () => void;
+  onCompleteManual: (workout: FitnessScheduledWorkout) => void;
+  onRetry: (workout: FitnessScheduledWorkout) => void;
+  onSelectCandidate: (activityId: string) => void;
+  onSubmitSelection: (workout: FitnessScheduledWorkout, activityId: string) => void;
+  submitting: boolean;
+}) {
+  const { workout } = garminState;
+  const showManualFallback = workout.type === "RUNNING";
+  const activityNoun = workout.type === "CYCLING" ? "cycling activity" : "Running activity";
+  const title = workout.workout_name || `Complete ${typeLabels[workout.type]}`;
+  const close = () => {
+    if (!submitting) {
+      onClose();
+    }
+  };
+  const submitSelection = () => {
+    if (garminState.selectedActivityId) {
+      onSubmitSelection(workout, garminState.selectedActivityId);
+    }
+  };
+
+  return (
+    <Dialog onClose={close} title={title}>
+      <div className="space-y-4">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Metric label="Scheduled date" value={formatDate(workout.scheduled_date)} />
+          {workout.type === "RUNNING" && (
+            <Metric label="Planned distance" value={distanceLabel(workout.planned_distance_miles)} />
+          )}
+          {workout.type === "CYCLING" && (
+            <Metric label="Planned duration" value={formatDuration(workout.planned_duration_seconds)} />
+          )}
+        </div>
+
+        {garminState.status === "LOOKUP" && (
+          <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-3 text-sm font-semibold text-blue-800">
+            Checking Garmin for a matching {activityNoun}...
+          </div>
+        )}
+
+        {garminState.status === "AMBIGUOUS_MATCH" && (
+          <div className="space-y-3">
+            <p className="text-sm font-semibold text-slate-700">
+              Choose the Garmin activity for this workout.
+            </p>
+            <div className="space-y-2">
+              {garminState.candidates.map((candidate) => {
+                const details = [
+                  candidate.startTimeLocal,
+                  garminCandidateDistanceLabel(candidate.distance),
+                  formatDuration(candidate.duration),
+                ].filter(Boolean);
+                const selected = candidate.activityId === garminState.selectedActivityId;
+                return (
+                  <button
+                    aria-pressed={selected}
+                    className={`w-full rounded-md border px-3 py-2 text-left text-sm ${
+                      selected
+                        ? "border-blue-500 bg-blue-50 ring-2 ring-blue-100"
+                        : "border-slate-200 bg-white hover:bg-slate-50"
+                    }`}
+                    disabled={submitting}
+                    key={candidate.activityId}
+                    onClick={() => onSelectCandidate(candidate.activityId)}
+                    type="button"
+                  >
+                    <div className="font-black text-slate-950">
+                      {candidate.activityName || "Garmin activity"}
+                    </div>
+                    <div className="mt-1 font-semibold text-slate-600">
+                      {details.length > 0 ? details.join(" · ") : candidate.activityId}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {(garminState.status === "NO_MATCH" || garminState.status === "ERROR") && (
+          <div
+            className={`rounded-md border px-3 py-3 text-sm font-semibold ${
+              garminState.status === "ERROR"
+                ? "border-red-200 bg-red-50 text-red-700"
+                : "border-amber-200 bg-amber-50 text-amber-800"
+            }`}
+          >
+            {garminState.message}
+          </div>
+        )}
+
+        <div className="flex flex-wrap justify-end gap-2">
+          {garminState.status !== "LOOKUP" && showManualFallback && (
+            <button
+              className={secondaryButtonClasses}
+              disabled={submitting}
+              onClick={() => onCompleteManual(workout)}
+              type="button"
+            >
+              Complete manually
+            </button>
+          )}
+          {garminState.status !== "LOOKUP" && (
+            <button
+              className={secondaryButtonClasses}
+              disabled={submitting}
+              onClick={() => onRetry(workout)}
+              type="button"
+            >
+              {submitting ? "Retrying..." : "Retry Garmin"}
+            </button>
+          )}
+          {garminState.status === "AMBIGUOUS_MATCH" && (
+            <button
+              className={buttonClasses}
+              disabled={submitting || !garminState.selectedActivityId}
+              onClick={submitSelection}
+              type="button"
+            >
+              {submitting ? "Saving..." : "Complete"}
+            </button>
+          )}
+          <button
+            className={secondaryButtonClasses}
+            disabled={submitting}
+            onClick={close}
+            type="button"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
     </Dialog>
   );
 }
@@ -3427,6 +3590,7 @@ function FitnessScreen() {
     initialTabFromPath(window.location.pathname),
   );
   const [completeWorkout, setCompleteWorkout] = useState<FitnessScheduledWorkout | null>(null);
+  const [garminCompletion, setGarminCompletion] = useState<GarminCompletionUiState | null>(null);
   const [rescheduleWorkout, setRescheduleWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [editWorkout, setEditWorkout] = useState<FitnessScheduledWorkout | null>(null);
   const [detailWorkout, setDetailWorkout] = useState<FitnessScheduledWorkout | null>(null);
@@ -3449,6 +3613,91 @@ function FitnessScreen() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
+  const garminNoMatchMessage = (workout: FitnessScheduledWorkout): string => (
+    workout.type === "CYCLING"
+      ? "No matching Garmin cycling activity was found for this scheduled date."
+      : "No matching Garmin Running activity was found for this scheduled date."
+  );
+
+  const handleGarminCompletionResult = (
+    workout: FitnessScheduledWorkout,
+    result: GarminCompletionResult,
+  ): boolean => {
+    if (result.status === "COMPLETED") {
+      setGarminCompletion(null);
+      setCompleteWorkout(null);
+      refresh();
+      return true;
+    }
+    if (result.status === "AMBIGUOUS_MATCH") {
+      setGarminCompletion({
+        workout,
+        status: "AMBIGUOUS_MATCH",
+        candidates: result.candidates,
+        selectedActivityId: null,
+        message: null,
+      });
+      return false;
+    }
+    setGarminCompletion({
+      workout,
+      status: "NO_MATCH",
+      candidates: [],
+      selectedActivityId: null,
+      message: garminNoMatchMessage(workout),
+    });
+    return false;
+  };
+
+  const attemptGarminCompletionAction = async (workout: FitnessScheduledWorkout) => {
+    setPendingAction(`garmin-complete:${workout.id}`);
+    setMutationError(null);
+    setCompleteWorkout(null);
+    setGarminCompletion({
+      workout,
+      status: "LOOKUP",
+      candidates: [],
+      selectedActivityId: null,
+      message: null,
+    });
+    try {
+      const result = await completeScheduledWorkoutWithGarmin(workout.id);
+      handleGarminCompletionResult(workout, result);
+    } catch (caught) {
+      setGarminCompletion({
+        workout,
+        status: "ERROR",
+        candidates: [],
+        selectedActivityId: null,
+        message: messageFromError(caught, `Unable to retrieve this ${workout.type === "CYCLING" ? "ride" : "run"} from Garmin.`),
+      });
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const submitGarminSelectionAction = async (
+    workout: FitnessScheduledWorkout,
+    activityId: string,
+  ) => {
+    setPendingAction(`garmin-selection:${workout.id}`);
+    setMutationError(null);
+    try {
+      const result = await completeScheduledWorkoutWithGarminSelection(workout.id, activityId);
+      handleGarminCompletionResult(workout, result);
+    } catch (caught) {
+      setGarminCompletion((current) => ({
+        workout,
+        status: "ERROR",
+        candidates: current?.workout.id === workout.id ? current.candidates : [],
+        selectedActivityId: activityId,
+        message: messageFromError(caught, `Unable to retrieve this ${workout.type === "CYCLING" ? "ride" : "run"} from Garmin.`),
+      }));
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
   const completeWorkoutAction = async (
     workout: FitnessScheduledWorkout,
     running?: RunningCompletionRequest,
@@ -3457,25 +3706,9 @@ function FitnessScreen() {
     setPendingAction(`complete:${workout.id}`);
     setMutationError(null);
     try {
-      if (workout.type === "CYCLING") {
-        const result = await completeScheduledWorkoutWithGarmin(workout.id);
-        if (result.status === "AMBIGUOUS_MATCH") {
-          const selected = window.prompt(
-            `Choose Garmin ride activity ID: ${result.candidates
-              .map((candidate) => `${candidate.activityId} ${candidate.activityName ?? ""}`.trim())
-              .join(", ")}`,
-          );
-          if (!selected) {
-            throw new Error("Choose a Garmin activity to complete this ride.");
-          }
-          await completeScheduledWorkoutWithGarminSelection(workout.id, selected);
-        } else if (result.status === "NO_MATCH") {
-          throw new Error("No matching Garmin cycling activity was found.");
-        }
-      } else {
-        await completeScheduledWorkout(workout.id, running);
-      }
+      await completeScheduledWorkout(workout.id, running);
       setCompleteWorkout(null);
+      setGarminCompletion(null);
       refresh();
     } catch (caught) {
       const message = messageFromError(caught, "Unable to complete workout.");
@@ -3594,11 +3827,16 @@ function FitnessScreen() {
   };
 
   const requestComplete = (workout: FitnessScheduledWorkout) => {
-    if (workout.type === "RUNNING") {
-      setCompleteWorkout(workout);
+    if (workout.type === "RUNNING" || workout.type === "CYCLING") {
+      attemptGarminCompletionAction(workout).catch(() => undefined);
       return;
     }
     completeWorkoutAction(workout).catch(() => undefined);
+  };
+
+  const openManualRunningCompletion = (workout: FitnessScheduledWorkout) => {
+    setGarminCompletion(null);
+    setCompleteWorkout(workout);
   };
 
   const openCompletedDetail = async (workout: FitnessScheduledWorkout) => {
@@ -3724,6 +3962,26 @@ function FitnessScreen() {
           onSubmit={(payload) => completeWorkoutAction(completeWorkout, payload, false)}
           submitting={pendingAction === `complete:${completeWorkout.id}`}
           workout={completeWorkout}
+        />
+      )}
+      {garminCompletion && (
+        <GarminCompletionDialog
+          garminState={garminCompletion}
+          onClose={() => setGarminCompletion(null)}
+          onCompleteManual={openManualRunningCompletion}
+          onRetry={(workout) => void attemptGarminCompletionAction(workout)}
+          onSelectCandidate={(activityId) => {
+            setGarminCompletion((current) => (
+              current
+                ? { ...current, selectedActivityId: activityId }
+                : current
+            ));
+          }}
+          onSubmitSelection={(workout, activityId) => void submitGarminSelectionAction(workout, activityId)}
+          submitting={
+            pendingAction === `garmin-complete:${garminCompletion.workout.id}` ||
+            pendingAction === `garmin-selection:${garminCompletion.workout.id}`
+          }
         />
       )}
       {rescheduleWorkout && (

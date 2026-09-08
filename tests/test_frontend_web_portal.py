@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -437,6 +438,102 @@ class FrontendWebPortalTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, screen_source)
+
+    def test_fitness_frontend_runs_use_garmin_completion_before_manual_fallback(self):
+        frontend_root = Path(__file__).resolve().parents[1] / "frontend-web"
+        api_source = (frontend_root / "src" / "api" / "fitnessApi.ts").read_text(
+            encoding="utf-8"
+        )
+        screen_source = (frontend_root / "src" / "FitnessScreen.tsx").read_text(
+            encoding="utf-8"
+        )
+
+        for api_fragment in (
+            "completeScheduledWorkoutWithGarmin",
+            "/fitness/scheduled-workouts/${workoutId}/garmin/complete",
+            "completeScheduledWorkoutWithGarminSelection",
+            "/fitness/scheduled-workouts/${workoutId}/garmin/complete-selection",
+            "body: JSON.stringify({ activity_id: activityId })",
+        ):
+            with self.subTest(api_fragment=api_fragment):
+                self.assertIn(api_fragment, api_source)
+
+        self.assertIn('workout.type === "RUNNING" || workout.type === "CYCLING"', screen_source)
+        self.assertIn("attemptGarminCompletionAction(workout).catch(() => undefined)", screen_source)
+        self.assertIn("setCompleteWorkout(workout)", screen_source)
+        self.assertIn("Complete manually", screen_source)
+        self.assertIn("completeScheduledWorkout(workout.id, running)", screen_source)
+        self.assertNotIn("window.prompt", screen_source)
+
+    def test_fitness_frontend_handles_garmin_completion_outcomes(self):
+        screen_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for marker in (
+            'status: "LOOKUP"',
+            'result.status === "COMPLETED"',
+            'result.status === "AMBIGUOUS_MATCH"',
+            'status: "NO_MATCH"',
+            "No matching Garmin Running activity was found for this scheduled date.",
+            "No matching Garmin cycling activity was found for this scheduled date.",
+            "Retry Garmin",
+            "Unable to retrieve this",
+            "handleGarminCompletionResult(workout, result)",
+            "setGarminCompletion(null)",
+            "refresh()",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, screen_source)
+
+    def test_fitness_frontend_garmin_ambiguous_selection_uses_backend_candidates(self):
+        screen_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for marker in (
+            "function GarminCompletionDialog",
+            "garminState.candidates.map((candidate)",
+            "candidate.activityName || \"Garmin activity\"",
+            "candidate.startTimeLocal",
+            "garminCandidateDistanceLabel(candidate.distance)",
+            "formatDuration(candidate.duration)",
+            "onSelectCandidate(candidate.activityId)",
+            "completeScheduledWorkoutWithGarminSelection(workout.id, activityId)",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, screen_source)
+
+    def test_fitness_frontend_garmin_failure_does_not_mark_completed(self):
+        screen_source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('status: "ERROR"', screen_source)
+        self.assertIn("messageFromError(caught", screen_source)
+        self.assertIn("Retry Garmin", screen_source)
+        self.assertIn("Complete manually", screen_source)
+        garmin_attempt_error = re.search(
+            r"const attemptGarminCompletionAction[\s\S]+?\} catch \(caught\) \{(?P<body>[\s\S]+?)\n    \} finally",
+            screen_source,
+        )
+        garmin_selection_error = re.search(
+            r"const submitGarminSelectionAction[\s\S]+?\} catch \(caught\) \{(?P<body>[\s\S]+?)\n    \} finally",
+            screen_source,
+        )
+        self.assertIsNotNone(garmin_attempt_error)
+        self.assertIsNotNone(garmin_selection_error)
+        self.assertNotIn("refresh()", garmin_attempt_error.group("body"))
+        self.assertNotIn("refresh()", garmin_selection_error.group("body"))
 
     def test_fitness_frontend_models_lifting_results_as_aggregate_entries(self):
         api_source = (
