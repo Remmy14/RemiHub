@@ -656,7 +656,9 @@ class FrontendWebPortalTests(unittest.TestCase):
                 self.assertIn(section, source)
 
         for calculation in (
+            "isVisibleScheduledWorkout",
             'workout.status !== "RESCHEDULED"',
+            'workout.status !== "SKIPPED"',
             'workout.type === "RUNNING"',
             'workout.type === "LIFTING"',
             'workout.status === "COMPLETED"',
@@ -709,7 +711,8 @@ class FrontendWebPortalTests(unittest.TestCase):
             "later workouts will move back 7 days",
             "repeatPlanInstanceWeek",
             "idempotency_key: repeatDialog.idempotencyKey",
-            'workout.status !== "RESCHEDULED"',
+            "canonicalPlanWorkouts",
+            "filter(isVisibleScheduledWorkout)",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, screen_source)
@@ -717,6 +720,27 @@ class FrontendWebPortalTests(unittest.TestCase):
         self.assertIn("plan_template_item_id: string | null", api_source)
         self.assertIn("/repeat-week", api_source)
         self.assertIn("FitnessPlanInstanceRepeatWeekResult", api_source)
+
+    def test_fitness_dashboard_schedule_and_calendar_hide_skipped_and_rescheduled_workouts(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "frontend-web"
+            / "src"
+            / "FitnessScreen.tsx"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            "function isVisibleScheduledWorkout(workout: FitnessScheduledWorkout): boolean",
+            'workout.status !== "RESCHEDULED" && workout.status !== "SKIPPED"',
+            "weekWorkouts.filter(isVisibleScheduledWorkout)",
+            "(currentPlan?.scheduled_workouts ?? []).filter(isVisibleScheduledWorkout)",
+            "workouts.filter(isVisibleScheduledWorkout).forEach",
+            "const visibleDayWorkouts = day.workouts.filter(isVisibleScheduledWorkout)",
+            "visibleDayWorkouts.length === 0",
+            "visibleDayWorkouts.map((workout) =>",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, source)
 
     def test_health_screen_does_not_duplicate_systemd_health_semantics(self):
         source = (

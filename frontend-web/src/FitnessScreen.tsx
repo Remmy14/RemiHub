@@ -94,6 +94,10 @@ const statusStyles = {
   RESCHEDULED: "border-slate-300 bg-slate-100 text-slate-600",
 };
 
+function isVisibleScheduledWorkout(workout: FitnessScheduledWorkout): boolean {
+  return workout.status !== "RESCHEDULED" && workout.status !== "SKIPPED";
+}
+
 const typeStyles = {
   RUNNING: "border-cyan-200 bg-cyan-50 text-cyan-800",
   LIFTING: "border-violet-200 bg-violet-50 text-violet-800",
@@ -1455,7 +1459,7 @@ function DashboardView({
     () => week?.days.flatMap((day) => day.workouts) ?? [],
     [week],
   );
-  const scheduledWeekWorkouts = weekWorkouts.filter((workout) => workout.status !== "RESCHEDULED");
+  const scheduledWeekWorkouts = weekWorkouts.filter(isVisibleScheduledWorkout);
   const weeklyRuns = scheduledWeekWorkouts.filter((workout) => workout.type === "RUNNING");
   const weeklyCompletedRuns = weeklyRuns.filter((workout) => workout.status === "COMPLETED");
   const weeklyLifts = scheduledWeekWorkouts.filter((workout) => workout.type === "LIFTING");
@@ -1495,7 +1499,7 @@ function DashboardView({
   const recentCompleted = recentHistory
     .filter((workout) => workout.status === "COMPLETED")
     .slice(0, 5);
-  const planWorkouts = currentPlan?.scheduled_workouts ?? [];
+  const planWorkouts = (currentPlan?.scheduled_workouts ?? []).filter(isVisibleScheduledWorkout);
   const completedPlanWorkouts = planWorkouts.filter((workout) => workout.status === "COMPLETED");
   const remainingPlanWorkouts = planWorkouts.filter((workout) => workout.status === "PLANNED");
   const planHasRunningWorkouts = planWorkouts.some((workout) => workout.type === "RUNNING");
@@ -1563,24 +1567,27 @@ function DashboardView({
         </div>
         {week && (
           <div className="grid gap-2 md:grid-cols-7">
-            {week.days.map((day) => (
-              <div className={`rounded-md border border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : "bg-slate-50"}`} key={day.date}>
-                <div className="text-xs font-black uppercase text-slate-500">{formatDate(day.date)}</div>
-                <div className="mt-2 space-y-2">
-                  {day.workouts.length === 0 && (
-                    <div className="text-xs font-semibold text-slate-500">-</div>
-                  )}
-                  {day.workouts.map((workout) => (
-                    <DashboardWorkoutLink
-                      compact
-                      key={workout.id}
-                      onOpenCompletedDetail={onOpenCompletedDetail}
-                      workout={workout}
-                    />
-                  ))}
+            {week.days.map((day) => {
+              const visibleDayWorkouts = day.workouts.filter(isVisibleScheduledWorkout);
+              return (
+                <div className={`rounded-md border border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : "bg-slate-50"}`} key={day.date}>
+                  <div className="text-xs font-black uppercase text-slate-500">{formatDate(day.date)}</div>
+                  <div className="mt-2 space-y-2">
+                    {visibleDayWorkouts.length === 0 && (
+                      <div className="text-xs font-semibold text-slate-500">-</div>
+                    )}
+                    {visibleDayWorkouts.map((workout) => (
+                      <DashboardWorkoutLink
+                        compact
+                        key={workout.id}
+                        onOpenCompletedDetail={onOpenCompletedDetail}
+                        workout={workout}
+                      />
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Panel>
@@ -1775,7 +1782,7 @@ function ScheduleView({
 
   const grouped = useMemo(() => {
     const dates = new Map<string, FitnessScheduledWorkout[]>();
-    workouts.forEach((workout) => {
+    workouts.filter(isVisibleScheduledWorkout).forEach((workout) => {
       const list = dates.get(workout.scheduled_date) ?? [];
       list.push(workout);
       dates.set(workout.scheduled_date, list);
@@ -2317,36 +2324,39 @@ function TrainingCalendarView({
             {calendar.weeks.map((week) => (
               <div className="grid grid-cols-[7rem_repeat(7,minmax(7rem,1fr))_13rem] border-b border-slate-200 last:border-b-0" key={week.week_start}>
                 <div className="p-3 text-sm font-black text-slate-900">{formatDate(week.week_start)}</div>
-                {week.days.map((day) => (
-                  <div className={`min-h-36 space-y-2 border-l border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : ""}`} key={day.date}>
-                    <div className="text-xs font-bold text-slate-500">{formatDate(day.date)}</div>
-                    {day.workouts.map((workout) => {
-                      const pending = pendingAction?.endsWith(workout.id) ?? false;
-                      const expanded = selectedWorkoutId === workout.id;
-                      return (
-                        <CalendarWorkoutCard
-                          expanded={expanded}
-                          key={workout.id}
-                          onComplete={onComplete}
-                          onEdit={onEdit}
-                          onOpenCompletedDetail={onOpenCompletedDetail}
-                          onRemove={onRemove}
-                          onReschedule={onReschedule}
-                          onSelect={(item) => {
-                            setSelectedWorkoutId((current) => (current === item.id ? null : item.id));
-                            setOverflowWorkoutId(null);
-                          }}
-                          onSkip={onSkip}
-                          onUndoReschedule={onUndoReschedule}
-                          overflowOpen={overflowWorkoutId === workout.id}
-                          pending={pending}
-                          setOverflowOpen={(open) => setOverflowWorkoutId(open ? workout.id : null)}
-                          workout={workout}
-                        />
-                      );
-                    })}
-                  </div>
-                ))}
+                {week.days.map((day) => {
+                  const visibleDayWorkouts = day.workouts.filter(isVisibleScheduledWorkout);
+                  return (
+                    <div className={`min-h-36 space-y-2 border-l border-slate-200 p-2 ${day.is_today ? "bg-blue-50" : ""}`} key={day.date}>
+                      <div className="text-xs font-bold text-slate-500">{formatDate(day.date)}</div>
+                      {visibleDayWorkouts.map((workout) => {
+                        const pending = pendingAction?.endsWith(workout.id) ?? false;
+                        const expanded = selectedWorkoutId === workout.id;
+                        return (
+                          <CalendarWorkoutCard
+                            expanded={expanded}
+                            key={workout.id}
+                            onComplete={onComplete}
+                            onEdit={onEdit}
+                            onOpenCompletedDetail={onOpenCompletedDetail}
+                            onRemove={onRemove}
+                            onReschedule={onReschedule}
+                            onSelect={(item) => {
+                              setSelectedWorkoutId((current) => (current === item.id ? null : item.id));
+                              setOverflowWorkoutId(null);
+                            }}
+                            onSkip={onSkip}
+                            onUndoReschedule={onUndoReschedule}
+                            overflowOpen={overflowWorkoutId === workout.id}
+                            pending={pending}
+                            setOverflowOpen={(open) => setOverflowWorkoutId(open ? workout.id : null)}
+                            workout={workout}
+                          />
+                        );
+                      })}
+                    </div>
+                  );
+                })}
                 <WeeklyMiniSummary summary={week.summary} />
               </div>
             ))}
@@ -2977,7 +2987,7 @@ type RepeatWeekDialogState = {
 };
 
 function canonicalPlanWorkouts(instance: FitnessPlanInstance): FitnessScheduledWorkout[] {
-  return (instance.scheduled_workouts ?? []).filter((workout) => workout.status !== "RESCHEDULED");
+  return (instance.scheduled_workouts ?? []).filter(isVisibleScheduledWorkout);
 }
 
 function eligiblePlanWeeks(instance: FitnessPlanInstance): string[] {
