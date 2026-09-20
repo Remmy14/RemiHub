@@ -39,6 +39,7 @@ from backend.routers import (
         kids_investing,
         mead,
         spotify,
+        vehicles,
     )
 from backend.tasks import (
         swimming_pool_monitor,
@@ -143,6 +144,7 @@ protected_routers = [
     mead.router,
     weightlifting.router,
     spotify.router,
+    vehicles.router,
 ]
 
 for router in protected_routers:
