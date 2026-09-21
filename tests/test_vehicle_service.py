@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 from psycopg2 import pool
 
@@ -21,6 +22,241 @@ class OfflineThreadedConnectionPool:
 pool.ThreadedConnectionPool = OfflineThreadedConnectionPool
 
 from backend.services import vehicle_service
+
+
+USER_ID = "11111111-1111-4111-8111-111111111111"
+VEHICLE_ID = "22222222-2222-4222-8222-222222222222"
+ODOMETER_ID = "33333333-3333-4333-8333-333333333333"
+FUEL_ID = "44444444-4444-4444-8444-444444444444"
+SCHEDULE_ID = "55555555-5555-4555-8555-555555555555"
+EVENT_ID = "66666666-6666-4666-8666-666666666666"
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+VEHICLE_COLUMNS = [
+    "id",
+    "user_id",
+    "year",
+    "make",
+    "model",
+    "trim",
+    "engine",
+    "fuel_type",
+    "tank_capacity_gallons",
+    "vin",
+    "license_plate",
+    "license_state",
+    "purchase_date",
+    "purchase_odometer_miles",
+    "active",
+    "created_at",
+    "updated_at",
+]
+VEHICLE_ROW = (
+    VEHICLE_ID,
+    USER_ID,
+    2026,
+    "Generic",
+    "Vehicle",
+    None,
+    None,
+    "gasoline",
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    True,
+    NOW,
+    NOW,
+)
+
+ODOMETER_COLUMNS = [
+    "id",
+    "vehicle_id",
+    "odometer_miles",
+    "observed_at",
+    "source",
+    "source_record_type",
+    "source_record_id",
+    "created_at",
+]
+ODOMETER_ROW = (
+    ODOMETER_ID,
+    VEHICLE_ID,
+    Decimal("10000.0"),
+    NOW,
+    "MANUAL",
+    None,
+    None,
+    NOW,
+)
+
+FUEL_COLUMNS = [
+    "id",
+    "vehicle_id",
+    "filled_at",
+    "odometer_miles",
+    "gallons",
+    "total_cost",
+    "price_per_gallon",
+    "is_full_fill",
+    "driving_context",
+    "fuel_grade",
+    "station_name",
+    "notes",
+    "created_at",
+    "updated_at",
+]
+FUEL_ROW = (
+    FUEL_ID,
+    VEHICLE_ID,
+    NOW,
+    Decimal("10000.0"),
+    Decimal("20.000"),
+    Decimal("80.00"),
+    Decimal("4.000"),
+    True,
+    "NORMAL",
+    None,
+    None,
+    None,
+    NOW,
+    NOW,
+)
+
+SCHEDULE_COLUMNS = [
+    "id",
+    "vehicle_id",
+    "name",
+    "category",
+    "description",
+    "mileage_interval_miles",
+    "time_interval_days",
+    "last_service_odometer_miles",
+    "last_service_date",
+    "due_soon_miles",
+    "due_soon_days",
+    "overdue_miles",
+    "overdue_days",
+    "active",
+    "created_at",
+    "updated_at",
+]
+SCHEDULE_ROW = (
+    SCHEDULE_ID,
+    VEHICLE_ID,
+    "Oil",
+    "engine oil/filter",
+    None,
+    Decimal("5000.0"),
+    None,
+    None,
+    None,
+    Decimal("500.0"),
+    14,
+    Decimal("500.0"),
+    14,
+    True,
+    NOW,
+    NOW,
+)
+
+EVENT_COLUMNS = [
+    "id",
+    "vehicle_id",
+    "maintenance_schedule_id",
+    "performed_at",
+    "odometer_miles",
+    "category",
+    "action",
+    "description",
+    "cost",
+    "service_provider",
+    "notes",
+    "created_at",
+    "updated_at",
+]
+EVENT_ROW = (
+    EVENT_ID,
+    VEHICLE_ID,
+    None,
+    NOW,
+    Decimal("10000.0"),
+    "engine oil/filter",
+    "REPLACED",
+    "Changed oil and filter",
+    None,
+    None,
+    None,
+    NOW,
+    NOW,
+)
+
+
+class FakeCursor:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.executed = []
+        self.description = []
+        self.rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        columns, rows = self.responses.pop(0)
+        self.description = [(column,) for column in columns]
+        self.rows = list(rows)
+
+    def fetchone(self):
+        return self.rows.pop(0) if self.rows else None
+
+    def fetchall(self):
+        rows = self.rows
+        self.rows = []
+        return rows
+
+
+class FakeConnection:
+    def __init__(self, responses):
+        self.cursor_instance = FakeCursor(responses)
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def patch_vehicle_connection(responses):
+    connection = FakeConnection(responses)
+    return connection, patch.multiple(
+        vehicle_service,
+        get_db_conn=lambda: connection,
+        put_db_conn=lambda _connection: None,
+    )
+
+
+def normalized_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def insert_sqls(connection: FakeConnection, table: str) -> list[str]:
+    return [
+        sql
+        for sql, _params in connection.cursor_instance.executed
+        if f"INSERT INTO {table}" in sql
+    ]
 
 
 def fuel_record(
@@ -50,6 +286,165 @@ def fuel_record(
         "created_at": filled_at,
         "updated_at": filled_at,
     }
+
+
+class VehicleInsertAliasSqlTests(unittest.TestCase):
+    def assert_insert_alias(self, sql: str, *, table: str, alias: str):
+        normalized = normalized_sql(sql)
+        self.assertIn(f"INSERT INTO {table} AS {alias} (", normalized)
+        self.assertIn(f"RETURNING {alias}.id", normalized)
+
+    def test_create_vehicle_declares_vehicle_returning_alias(self):
+        connection, patches = patch_vehicle_connection(
+            [(VEHICLE_COLUMNS, [VEHICLE_ROW])]
+        )
+
+        with patches:
+            vehicle_service.create_vehicle(
+                user_id=USER_ID,
+                year=2026,
+                make="Generic",
+                model="Vehicle",
+                fuel_type="gasoline",
+            )
+
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 0)
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicles")[0],
+            table="public.vehicles",
+            alias="vehicle",
+        )
+
+    def test_create_vehicle_purchase_odometer_declares_observation_returning_alias(self):
+        connection, patches = patch_vehicle_connection(
+            [
+                (VEHICLE_COLUMNS, [VEHICLE_ROW]),
+                (ODOMETER_COLUMNS, [ODOMETER_ROW]),
+            ]
+        )
+
+        with patches:
+            vehicle_service.create_vehicle(
+                user_id=USER_ID,
+                year=2026,
+                make="Generic",
+                model="Vehicle",
+                fuel_type="gasoline",
+                purchase_odometer_miles=Decimal("10000"),
+            )
+
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_odometer_observations")[0],
+            table="public.vehicle_odometer_observations",
+            alias="observation",
+        )
+
+    def test_manual_odometer_insert_declares_observation_returning_alias(self):
+        connection, patches = patch_vehicle_connection(
+            [
+                (VEHICLE_COLUMNS, [VEHICLE_ROW]),
+                (ODOMETER_COLUMNS, [ODOMETER_ROW]),
+            ]
+        )
+
+        with patches:
+            vehicle_service.create_manual_odometer_observation(
+                user_id=USER_ID,
+                vehicle_id=VEHICLE_ID,
+                odometer_miles=Decimal("10000"),
+                observed_at=NOW,
+            )
+
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_odometer_observations")[0],
+            table="public.vehicle_odometer_observations",
+            alias="observation",
+        )
+
+    def test_fuel_and_linked_odometer_inserts_declare_returning_aliases(self):
+        connection, patches = patch_vehicle_connection(
+            [
+                (VEHICLE_COLUMNS, [VEHICLE_ROW]),
+                (FUEL_COLUMNS, [FUEL_ROW]),
+                (ODOMETER_COLUMNS, [ODOMETER_ROW]),
+            ]
+        )
+
+        with patches:
+            vehicle_service.create_fuel_record(
+                user_id=USER_ID,
+                vehicle_id=VEHICLE_ID,
+                filled_at=NOW,
+                odometer_miles=Decimal("10000"),
+                gallons=Decimal("20"),
+                total_cost=Decimal("80"),
+            )
+
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_fuel_records")[0],
+            table="public.vehicle_fuel_records",
+            alias="fuel",
+        )
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_odometer_observations")[0],
+            table="public.vehicle_odometer_observations",
+            alias="observation",
+        )
+
+    def test_maintenance_schedule_insert_declares_schedule_returning_alias(self):
+        connection, patches = patch_vehicle_connection(
+            [
+                (VEHICLE_COLUMNS, [VEHICLE_ROW]),
+                (SCHEDULE_COLUMNS, [SCHEDULE_ROW]),
+            ]
+        )
+
+        with patches:
+            vehicle_service.create_maintenance_schedule(
+                user_id=USER_ID,
+                vehicle_id=VEHICLE_ID,
+                name="Oil",
+                category="engine oil/filter",
+                mileage_interval_miles=Decimal("5000"),
+            )
+
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_maintenance_schedules")[0],
+            table="public.vehicle_maintenance_schedules",
+            alias="schedule",
+        )
+
+    def test_maintenance_event_and_linked_odometer_inserts_declare_returning_aliases(self):
+        connection, patches = patch_vehicle_connection(
+            [
+                (VEHICLE_COLUMNS, [VEHICLE_ROW]),
+                (EVENT_COLUMNS, [EVENT_ROW]),
+                (ODOMETER_COLUMNS, [ODOMETER_ROW]),
+            ]
+        )
+
+        with patches:
+            vehicle_service.create_maintenance_event(
+                user_id=USER_ID,
+                vehicle_id=VEHICLE_ID,
+                performed_at=NOW,
+                odometer_miles=Decimal("10000"),
+                category="engine oil/filter",
+                action="REPLACED",
+                description="Changed oil and filter",
+            )
+
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_maintenance_events")[0],
+            table="public.vehicle_maintenance_events",
+            alias="event",
+        )
+        self.assert_insert_alias(
+            insert_sqls(connection, "public.vehicle_odometer_observations")[0],
+            table="public.vehicle_odometer_observations",
+            alias="observation",
+        )
 
 
 class VehicleFuelCalculationTests(unittest.TestCase):

@@ -312,7 +312,7 @@ def _upsert_linked_odometer(
         raise VehicleValidationError("Linked odometer source must be FUEL or MAINTENANCE")
     cur.execute(
         f"""
-        INSERT INTO public.vehicle_odometer_observations (
+        INSERT INTO public.vehicle_odometer_observations AS observation (
             vehicle_id,
             odometer_miles,
             observed_at,
@@ -377,7 +377,7 @@ def create_vehicle(*, user_id: str, **fields) -> dict:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    INSERT INTO public.vehicles (
+                    INSERT INTO public.vehicles AS vehicle (
                         user_id,
                         year,
                         make,
@@ -415,7 +415,7 @@ def create_vehicle(*, user_id: str, **fields) -> dict:
                 if fields.get("purchase_odometer_miles") is not None:
                     cur.execute(
                         f"""
-                        INSERT INTO public.vehicle_odometer_observations (
+                        INSERT INTO public.vehicle_odometer_observations AS observation (
                             vehicle_id,
                             odometer_miles,
                             observed_at,
@@ -578,7 +578,7 @@ def create_manual_odometer_observation(
                 _assert_vehicle_owner(cur, user_id=user_id, vehicle_id=vehicle_id)
                 cur.execute(
                     f"""
-                    INSERT INTO public.vehicle_odometer_observations (
+                    INSERT INTO public.vehicle_odometer_observations AS observation (
                         vehicle_id,
                         odometer_miles,
                         observed_at,
@@ -635,7 +635,7 @@ def create_fuel_record(*, user_id: str, vehicle_id: str, **fields) -> dict:
                 _assert_vehicle_owner(cur, user_id=user_id, vehicle_id=vehicle_id)
                 cur.execute(
                     f"""
-                    INSERT INTO public.vehicle_fuel_records (
+                    INSERT INTO public.vehicle_fuel_records AS fuel (
                         vehicle_id,
                         filled_at,
                         odometer_miles,
@@ -948,7 +948,7 @@ def create_maintenance_schedule(*, user_id: str, vehicle_id: str, **fields) -> d
                 _assert_vehicle_owner(cur, user_id=user_id, vehicle_id=vehicle_id)
                 cur.execute(
                     f"""
-                    INSERT INTO public.vehicle_maintenance_schedules (
+                    INSERT INTO public.vehicle_maintenance_schedules AS schedule (
                         vehicle_id,
                         name,
                         category,
@@ -1181,7 +1181,7 @@ def create_maintenance_event(*, user_id: str, vehicle_id: str, **fields) -> dict
                     )
                 cur.execute(
                     f"""
-                    INSERT INTO public.vehicle_maintenance_events (
+                    INSERT INTO public.vehicle_maintenance_events AS event (
                         vehicle_id,
                         maintenance_schedule_id,
                         performed_at,
