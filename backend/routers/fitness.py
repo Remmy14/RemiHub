@@ -17,6 +17,8 @@ from backend.models.fitness_models import (
     RecurringSeriesRequest,
     ScheduledWorkoutCreate,
     ScheduledWorkoutTemplateReplace,
+    WeightMeasurementUpsert,
+    WeightReminderUpdate,
     WorkoutCompleteRequest,
     WorkoutRescheduleRequest,
     WorkoutTemplateCreate,
@@ -34,6 +36,82 @@ def _handle_service_error(exc: ValueError) -> HTTPException:
     if isinstance(exc, fitness_service.FitnessConflictError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.put("/weight-measurements")
+def upsert_weight_measurement(
+    request: WeightMeasurementUpsert,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.upsert_weight_measurement(
+                user_id=principal.id,
+                measurement_date=request.date,
+                weight=request.weight,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/weight-measurements")
+def list_weight_measurements(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.list_weight_measurements(
+                user_id=principal.id,
+                start_date=start_date,
+                end_date=end_date,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get("/weight-measurements/latest")
+def get_latest_weight_measurement(
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.get_latest_weight_measurement(user_id=principal.id),
+    }
+
+
+@router.get("/weight-reminder")
+def get_weight_reminder_settings(
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    return {
+        "success": True,
+        "data": fitness_service.get_weight_reminder_settings(user_id=principal.id),
+    }
+
+
+@router.put("/weight-reminder")
+def update_weight_reminder_settings(
+    request: WeightReminderUpdate,
+    principal: AuthenticatedPrincipal = Depends(require_current_principal),
+):
+    try:
+        return {
+            "success": True,
+            "data": fitness_service.update_weight_reminder_settings(
+                user_id=principal.id,
+                enabled=request.enabled,
+                reminder_time=request.reminder_time,
+                timezone_name=request.timezone,
+            ),
+        }
+    except ValueError as exc:
+        raise _handle_service_error(exc)
 
 
 @router.get("/workout-templates")

@@ -36,6 +36,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0012", "fitness_repeat_training_week"),
                 ("0013", "fitness_cycling_discipline"),
                 ("0014", "vehicles_foundation"),
+                ("0015", "fitness_weight_tracking"),
             ],
         )
 
@@ -59,6 +60,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0012", "fitness_repeat_training_week"),
                 ("0013", "fitness_cycling_discipline"),
                 ("0014", "vehicles_foundation"),
+                ("0015", "fitness_weight_tracking"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
@@ -178,6 +180,31 @@ class MigrationDiscoveryTests(unittest.TestCase):
         self.assertIn("external_activity_id text", up)
         self.assertIn("fitness_running_results_external_activity_uidx", up)
         self.assertIn("WHERE external_provider IS NOT NULL", up)
+
+    def test_fitness_weight_tracking_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0015_fitness_weight_tracking.up.sql"
+        down = MIGRATIONS_DIR / "0015_fitness_weight_tracking.down.sql"
+
+        GitBackendDeploymentManager._validate_migration_sql(
+            up,
+            direction="up",
+        )
+        GitBackendDeploymentManager._validate_migration_sql(
+            down,
+            direction="down",
+        )
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_fitness_weight_tracking_migration_enforces_daily_uniqueness(self):
+        up = (MIGRATIONS_DIR / "0015_fitness_weight_tracking.up.sql").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("CREATE TABLE public.fitness_weight_measurements", up)
+        self.assertIn("weight_lb numeric(8, 2) NOT NULL", up)
+        self.assertIn("fitness_weight_measurements_user_date_uidx", up)
+        self.assertIn("(user_id, measurement_date)", up)
+        self.assertIn("fitness_weight_reminder_runs_user_date_uidx", up)
 
     def test_service_health_migration_is_current_state_only(self):
         up = (

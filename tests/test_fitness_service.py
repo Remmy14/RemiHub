@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -488,6 +488,208 @@ class FitnessServiceTests(unittest.TestCase):
             get_db_conn=lambda: connection,
             put_db_conn=lambda _connection: None,
         )
+
+    def test_upsert_weight_measurement_uses_user_date_conflict_and_returns_persisted_row(self):
+        columns = ["id", "user_id", "date", "weight", "created_at", "updated_at"]
+        connection, patches = self.patch_connection(
+            [
+                (
+                    columns,
+                    [
+                        (
+                            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            USER_ID,
+                            date(2026, 9, 22),
+                            Decimal("238.60"),
+                            NOW,
+                            NOW,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with patches:
+            measurement = fitness_service.upsert_weight_measurement(
+                user_id=USER_ID,
+                measurement_date=date(2026, 9, 22),
+                weight=Decimal("238.6"),
+            )
+
+        sql, params = connection.cursor_instance.executed[0]
+        self.assertIn("ON CONFLICT (user_id, measurement_date)", sql)
+        self.assertIn("DO UPDATE SET", sql)
+        self.assertEqual(params, (USER_ID, date(2026, 9, 22), Decimal("238.6")))
+        self.assertEqual(measurement["date"], "2026-09-22")
+        self.assertEqual(measurement["weight"], 238.6)
+        self.assertEqual(measurement["unit"], "lb")
+        self.assertEqual(connection.commits, 1)
+
+    def test_upsert_weight_measurement_rejects_invalid_values(self):
+        for value in [0, -1, "not-a-number", Decimal("1000.01")]:
+            with self.subTest(value=value):
+                with self.assertRaises(fitness_service.FitnessValidationError):
+                    fitness_service.upsert_weight_measurement(
+                        user_id=USER_ID,
+                        measurement_date=date(2026, 9, 22),
+                        weight=value,
+                    )
+
+    def test_list_weight_measurements_orders_chronologically_and_filters_dates(self):
+        columns = ["id", "user_id", "date", "weight", "created_at", "updated_at"]
+        connection, patches = self.patch_connection(
+            [
+                (
+                    columns,
+                    [
+                        (
+                            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            USER_ID,
+                            date(2026, 9, 21),
+                            Decimal("239.10"),
+                            NOW,
+                            NOW,
+                        ),
+                        (
+                            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                            USER_ID,
+                            date(2026, 9, 22),
+                            Decimal("238.60"),
+                            NOW,
+                            NOW,
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        with patches:
+            measurements = fitness_service.list_weight_measurements(
+                user_id=USER_ID,
+                start_date=date(2026, 9, 1),
+                end_date=date(2026, 9, 30),
+            )
+
+        sql, params = connection.cursor_instance.executed[0]
+        self.assertIn("WHERE user_id = %s", sql)
+        self.assertIn("measurement_date >= %s", sql)
+        self.assertIn("measurement_date <= %s", sql)
+        self.assertIn("ORDER BY measurement_date", sql)
+        self.assertEqual(params, (USER_ID, date(2026, 9, 1), date(2026, 9, 30)))
+        self.assertEqual([row["date"] for row in measurements], ["2026-09-21", "2026-09-22"])
+
+    def test_list_weight_measurements_rejects_inverted_range(self):
+        with self.assertRaises(fitness_service.FitnessValidationError):
+            fitness_service.list_weight_measurements(
+                user_id=USER_ID,
+                start_date=date(2026, 9, 30),
+                end_date=date(2026, 9, 1),
+            )
+
+    def test_get_latest_weight_measurement_uses_latest_date_query(self):
+        columns = ["id", "user_id", "date", "weight", "created_at", "updated_at"]
+        connection, patches = self.patch_connection(
+            [
+                (
+                    columns,
+                    [
+                        (
+                            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                            USER_ID,
+                            date(2026, 9, 22),
+                            Decimal("238.60"),
+                            NOW,
+                            NOW,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with patches:
+            measurement = fitness_service.get_latest_weight_measurement(user_id=USER_ID)
+
+        sql, params = connection.cursor_instance.executed[0]
+        self.assertIn("ORDER BY measurement_date DESC", sql)
+        self.assertIn("LIMIT 1", sql)
+        self.assertEqual(params, (USER_ID,))
+        self.assertEqual(measurement["date"], "2026-09-22")
+
+    def test_get_weight_reminder_settings_creates_default_configuration(self):
+        columns = ["user_id", "enabled", "reminder_time", "timezone", "created_at", "updated_at"]
+        connection, patches = self.patch_connection(
+            [
+                ([], []),
+                (
+                    columns,
+                    [
+                        (
+                            USER_ID,
+                            True,
+                            time(9, 0),
+                            "America/New_York",
+                            NOW,
+                            NOW,
+                        )
+                    ],
+                ),
+            ]
+        )
+
+        with patches:
+            settings = fitness_service.get_weight_reminder_settings(user_id=USER_ID)
+
+        self.assertIn("ON CONFLICT (user_id) DO NOTHING", connection.cursor_instance.executed[0][0])
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["reminder_time"], "09:00")
+        self.assertEqual(settings["timezone"], "America/New_York")
+        self.assertEqual(connection.commits, 1)
+
+    def test_update_weight_reminder_settings_updates_time_timezone_and_enabled_state(self):
+        columns = ["user_id", "enabled", "reminder_time", "timezone", "created_at", "updated_at"]
+        connection, patches = self.patch_connection(
+            [
+                ([], []),
+                ([], []),
+                (
+                    columns,
+                    [
+                        (
+                            USER_ID,
+                            False,
+                            time(6, 30),
+                            "America/Chicago",
+                            NOW,
+                            NOW,
+                        )
+                    ],
+                ),
+            ]
+        )
+
+        with patches:
+            settings = fitness_service.update_weight_reminder_settings(
+                user_id=USER_ID,
+                enabled=False,
+                reminder_time=time(6, 30),
+                timezone_name="America/Chicago",
+            )
+
+        sql, params = connection.cursor_instance.executed[1]
+        self.assertIn("enabled = %s", sql)
+        self.assertIn("reminder_time = %s", sql)
+        self.assertIn("timezone = %s", sql)
+        self.assertEqual(params, (False, time(6, 30), "America/Chicago", USER_ID))
+        self.assertFalse(settings["enabled"])
+        self.assertEqual(settings["reminder_time"], "06:30")
+        self.assertEqual(settings["timezone"], "America/Chicago")
+
+    def test_update_weight_reminder_settings_rejects_invalid_timezone(self):
+        with self.assertRaises(fitness_service.FitnessValidationError):
+            fitness_service.update_weight_reminder_settings(
+                user_id=USER_ID,
+                timezone_name="Not/AZone",
+            )
 
     def test_repeat_plan_instance_week_repeats_selected_and_shifts_later_workouts(self):
         selected_columns = [

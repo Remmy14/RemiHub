@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as local_time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg2.extras import Json
@@ -21,6 +21,7 @@ FITNESS_EVENING_HOUR_ENV = "REMIHUB_FITNESS_EVENING_HOUR"
 DEFAULT_FITNESS_TIMEZONE = "America/New_York"
 DEFAULT_MORNING_HOUR = 8
 DEFAULT_EVENING_HOUR = 20
+DEFAULT_WEIGHT_REMINDER_TIME = local_time(9, 0)
 
 
 def fitness_timezone() -> ZoneInfo:
@@ -83,6 +84,28 @@ def _rows_to_dicts(cur, rows) -> list[dict]:
     ]
 
 
+def _time_value(value) -> local_time:
+    if isinstance(value, local_time):
+        return value.replace(second=0, microsecond=0)
+    return local_time.fromisoformat(str(value)).replace(second=0, microsecond=0)
+
+
+def weight_reminder_local_context(setting: dict, now: datetime | None = None) -> tuple | None:
+    if not setting.get("enabled", True):
+        return None
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    timezone_name = (setting.get("timezone") or DEFAULT_FITNESS_TIMEZONE).strip()
+    tz = ZoneInfo(timezone_name)
+    local_now = reference.astimezone(tz)
+    reminder_time = _time_value(setting.get("reminder_time") or DEFAULT_WEIGHT_REMINDER_TIME)
+    current_time = local_now.time().replace(second=0, microsecond=0)
+    if current_time < reminder_time:
+        return None
+    return local_now.date(), timezone_name, reminder_time
+
+
 def get_users_with_planned_workouts(conn, *, target_date) -> list[str]:
     with conn.cursor() as cur:
         cur.execute(
@@ -96,6 +119,31 @@ def get_users_with_planned_workouts(conn, *, target_date) -> list[str]:
             (target_date,),
         )
         return [str(row[0]) for row in cur.fetchall()]
+
+
+def get_weight_reminder_settings(conn) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT users.id AS user_id,
+                   COALESCE(settings.enabled, true) AS enabled,
+                   COALESCE(settings.reminder_time, TIME '09:00') AS reminder_time,
+                   COALESCE(NULLIF(btrim(settings.timezone), ''), %s) AS timezone
+            FROM public.remihub_users AS users
+            LEFT JOIN public.fitness_weight_reminder_settings AS settings
+              ON settings.user_id = users.id
+            WHERE users.is_active = true
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.device_push_tokens AS token
+                  WHERE token.user_id = users.id
+                    AND token.is_active = true
+              )
+            ORDER BY users.id
+            """,
+            (DEFAULT_FITNESS_TIMEZONE,),
+        )
+        return _rows_to_dicts(cur, cur.fetchall())
 
 
 def get_planned_workouts(conn, *, user_id: str, target_date) -> list[dict]:
@@ -163,6 +211,29 @@ def build_notification(*, phase: str, target_date, timezone_name: str, user_id: 
             "timezone": timezone_name,
             "user_id": str(user_id),
             "scheduled_workout_ids": ",".join(str(workout["id"]) for workout in workouts),
+        },
+    )
+
+
+def build_weight_reminder_notification(
+    *,
+    target_date,
+    timezone_name: str,
+    reminder_time: local_time,
+    user_id: str,
+) -> Notification:
+    return Notification(
+        title="Time to record today's weight.",
+        body="Time to record today's weight.",
+        module=FITNESS_NOTIFICATION_MODULE,
+        priority=0,
+        data={
+            "type": "fitness_weight_reminder",
+            "destination": "fitness_weight",
+            "fitness_date": target_date.isoformat(),
+            "timezone": timezone_name,
+            "reminder_time": reminder_time.strftime("%H:%M"),
+            "user_id": str(user_id),
         },
     )
 
@@ -254,6 +325,68 @@ def process_fitness_notifications_for_user(
     return True
 
 
+def process_weight_reminder_for_user(
+    conn,
+    *,
+    user_id: str,
+    target_date,
+    timezone_name: str,
+    reminder_time: local_time,
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.fitness_weight_reminder_runs (
+                user_id,
+                reminder_date,
+                timezone,
+                reminder_time
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, reminder_date) DO NOTHING
+            """,
+            (user_id, target_date, timezone_name, reminder_time),
+        )
+        cur.execute(
+            """
+            SELECT id, notification_id
+            FROM public.fitness_weight_reminder_runs
+            WHERE user_id = %s
+              AND reminder_date = %s
+            FOR UPDATE
+            """,
+            (user_id, target_date),
+        )
+        run_id, notification_id = cur.fetchone()
+        if notification_id:
+            return False
+
+    notice = build_weight_reminder_notification(
+        target_date=target_date,
+        timezone_name=timezone_name,
+        reminder_time=reminder_time,
+        user_id=user_id,
+    )
+    notification_id = insert_notification(notice, conn=conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fitness_weight_reminder_runs
+            SET notification_id = %s,
+                metadata = %s,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (
+                notification_id,
+                Json({"type": "fitness_weight_reminder"}),
+                run_id,
+            ),
+        )
+    return True
+
+
 def process_fitness_notifications_once(
     *,
     phase: str,
@@ -283,6 +416,33 @@ def process_fitness_notifications_once(
         put_db_conn(conn)
 
 
+def process_weight_reminders_once(*, now: datetime | None = None) -> int:
+    conn = get_db_conn()
+    inserted = 0
+    try:
+        for setting in get_weight_reminder_settings(conn):
+            context = weight_reminder_local_context(setting, now=now)
+            if not context:
+                continue
+            target_date, timezone_name, reminder_time = context
+            if process_weight_reminder_for_user(
+                conn,
+                user_id=str(setting["user_id"]),
+                target_date=target_date,
+                timezone_name=timezone_name,
+                reminder_time=reminder_time,
+            ):
+                inserted += 1
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        logger.exception("Fitness weight reminder worker error")
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def run_fitness_notification_worker():
     logger.info("Fitness notification worker started")
     while True:
@@ -292,6 +452,7 @@ def run_fitness_notification_worker():
             phase = eligible_phase(now)
             if phase:
                 process_fitness_notifications_once(phase=phase, now=now)
+            process_weight_reminders_once(now=now)
             logger.debug("Fitness notification check complete for %s", local_date)
         except Exception:
             logger.exception("Failed to process Fitness notifications")

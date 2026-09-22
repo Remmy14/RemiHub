@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from unittest.mock import patch
 
 from psycopg2 import pool
@@ -131,6 +131,105 @@ class FitnessNotificationWorkerTests(unittest.TestCase):
 
         self.assertEqual(late_morning, "morning")
         self.assertEqual(late_evening, "evening")
+
+    def test_weight_reminder_context_respects_user_timezone_and_local_time(self):
+        setting = {
+            "user_id": USER_ID,
+            "enabled": True,
+            "reminder_time": time(9, 0),
+            "timezone": "America/New_York",
+        }
+
+        not_due = fitness_worker.weight_reminder_local_context(
+            setting,
+            now=datetime(2026, 9, 22, 12, 59, tzinfo=timezone.utc),
+        )
+        due = fitness_worker.weight_reminder_local_context(
+            setting,
+            now=datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNone(not_due)
+        self.assertEqual(due[0].isoformat(), "2026-09-22")
+        self.assertEqual(due[1], "America/New_York")
+        self.assertEqual(due[2], time(9, 0))
+
+    def test_weight_reminder_context_skips_disabled_settings(self):
+        setting = {
+            "user_id": USER_ID,
+            "enabled": False,
+            "reminder_time": time(9, 0),
+            "timezone": "America/New_York",
+        }
+
+        due = fitness_worker.weight_reminder_local_context(
+            setting,
+            now=datetime(2026, 9, 22, 14, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNone(due)
+
+    def test_weight_reminder_settings_query_defaults_missing_user_settings(self):
+        cursor = FakeCursor(columns=["user_id"], rows=[])
+        conn = SequenceConnection([cursor])
+
+        fitness_worker.get_weight_reminder_settings(conn)
+
+        sql, params = cursor.executed[0]
+        self.assertIn("LEFT JOIN public.fitness_weight_reminder_settings", sql)
+        self.assertIn("COALESCE(settings.enabled, true)", sql)
+        self.assertIn("COALESCE(settings.reminder_time, TIME '09:00')", sql)
+        self.assertIn("device_push_tokens", sql)
+        self.assertEqual(params, ("America/New_York",))
+
+    def test_weight_reminder_notification_is_inserted_once_in_caller_transaction(self):
+        lock_cursor = FakeCursor(
+            columns=["id", "notification_id"],
+            rows=[(RUN_ID, None)],
+        )
+        notification_cursor = FakeCursor(columns=["id"], rows=[(10,)])
+        update_cursor = FakeCursor()
+        conn = SequenceConnection([lock_cursor, notification_cursor, update_cursor])
+
+        inserted = fitness_worker.process_weight_reminder_for_user(
+            conn,
+            user_id=USER_ID,
+            target_date=datetime(2026, 9, 22).date(),
+            timezone_name="America/New_York",
+            reminder_time=time(9, 0),
+        )
+
+        self.assertTrue(inserted)
+        self.assertIn("ON CONFLICT (user_id, reminder_date) DO NOTHING", lock_cursor.executed[0][0])
+        self.assertIn("FOR UPDATE", lock_cursor.executed[1][0])
+        params = notification_cursor.executed[0][1]
+        self.assertEqual(params[0], "Time to record today's weight.")
+        self.assertEqual(params[1], "Time to record today's weight.")
+        self.assertEqual(params[2], "Fitness")
+        notification_data = params[4].adapted
+        self.assertEqual(notification_data["type"], "fitness_weight_reminder")
+        self.assertEqual(notification_data["destination"], "fitness_weight")
+        self.assertEqual(notification_data["user_id"], USER_ID)
+        self.assertIn("notification_id = %s", update_cursor.executed[0][0])
+        self.assertEqual(conn.commits, 0)
+
+    def test_existing_weight_reminder_run_does_not_insert_duplicate_notification(self):
+        lock_cursor = FakeCursor(
+            columns=["id", "notification_id"],
+            rows=[(RUN_ID, 10)],
+        )
+        conn = SequenceConnection([lock_cursor])
+
+        inserted = fitness_worker.process_weight_reminder_for_user(
+            conn,
+            user_id=USER_ID,
+            target_date=datetime(2026, 9, 22).date(),
+            timezone_name="America/New_York",
+            reminder_time=time(9, 0),
+        )
+
+        self.assertFalse(inserted)
+        self.assertEqual(len(conn.used_cursors), 1)
 
     def test_combined_morning_notification_is_inserted_once_in_caller_transaction(self):
         workout_cursor = FakeCursor(

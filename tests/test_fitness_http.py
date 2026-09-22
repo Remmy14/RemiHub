@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
+from datetime import date, time
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
@@ -23,7 +23,7 @@ pool.ThreadedConnectionPool = OfflineThreadedConnectionPool
 
 from backend.core.auth import AuthenticatedPrincipal, require_current_principal
 from backend.routers import fitness
-from backend.models.fitness_models import WorkoutTemplateCreate
+from backend.models.fitness_models import WeightMeasurementUpsert, WeightReminderUpdate, WorkoutTemplateCreate
 
 
 USER = AuthenticatedPrincipal(
@@ -36,6 +36,98 @@ USER = AuthenticatedPrincipal(
 
 
 class FitnessHttpTests(unittest.TestCase):
+    def test_weight_measurement_model_rejects_invalid_weights(self):
+        request = WeightMeasurementUpsert(date=date(2026, 9, 22), weight="238.6")
+
+        self.assertEqual(str(request.weight), "238.6")
+        for value in [0, -1, "not-a-number", "1000.01"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    WeightMeasurementUpsert(date=date(2026, 9, 22), weight=value)
+
+    def test_weight_measurement_routes_require_strict_principal_dependency(self):
+        route = next(
+            route
+            for route in fitness.router.routes
+            if getattr(route, "path", "") == "/fitness/weight-measurements"
+            and "PUT" in getattr(route, "methods", set())
+        )
+
+        dependency_calls = [
+            dependency.call
+            for dependency in route.dependant.dependencies
+        ]
+
+        self.assertIn(require_current_principal, dependency_calls)
+
+    def test_weight_measurement_upsert_route_delegates_owner(self):
+        upsert = MagicMock(return_value={"date": "2026-09-22", "weight": 238.6, "unit": "lb"})
+        request = WeightMeasurementUpsert(date=date(2026, 9, 22), weight="238.6")
+        with patch(
+            "backend.routers.fitness.fitness_service.upsert_weight_measurement",
+            upsert,
+        ):
+            response = fitness.upsert_weight_measurement(request, principal=USER)
+
+        self.assertTrue(response["success"])
+        self.assertEqual(upsert.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(upsert.call_args.kwargs["measurement_date"], date(2026, 9, 22))
+
+    def test_weight_history_route_delegates_owner_and_range(self):
+        history = MagicMock(return_value=[])
+        with patch(
+            "backend.routers.fitness.fitness_service.list_weight_measurements",
+            history,
+        ):
+            response = fitness.list_weight_measurements(
+                start_date=date(2026, 9, 1),
+                end_date=date(2026, 9, 30),
+                principal=USER,
+            )
+
+        self.assertTrue(response["success"])
+        self.assertEqual(history.call_args.kwargs["user_id"], USER.id)
+        self.assertEqual(history.call_args.kwargs["start_date"], date(2026, 9, 1))
+        self.assertEqual(history.call_args.kwargs["end_date"], date(2026, 9, 30))
+
+    def test_latest_weight_route_delegates_owner(self):
+        latest = MagicMock(return_value={"date": "2026-09-22", "weight": 238.6})
+        with patch(
+            "backend.routers.fitness.fitness_service.get_latest_weight_measurement",
+            latest,
+        ):
+            response = fitness.get_latest_weight_measurement(principal=USER)
+
+        self.assertTrue(response["success"])
+        self.assertEqual(latest.call_args.kwargs["user_id"], USER.id)
+
+    def test_weight_reminder_routes_delegate_owner(self):
+        get_settings = MagicMock(return_value={"enabled": True, "reminder_time": "09:00"})
+        update_settings = MagicMock(return_value={"enabled": False, "reminder_time": "06:30"})
+        request = WeightReminderUpdate(
+            enabled=False,
+            reminder_time=time(6, 30),
+            timezone="America/Chicago",
+        )
+        with patch(
+            "backend.routers.fitness.fitness_service.get_weight_reminder_settings",
+            get_settings,
+        ):
+            get_response = fitness.get_weight_reminder_settings(principal=USER)
+        with patch(
+            "backend.routers.fitness.fitness_service.update_weight_reminder_settings",
+            update_settings,
+        ):
+            update_response = fitness.update_weight_reminder_settings(request, principal=USER)
+
+        self.assertTrue(get_response["success"])
+        self.assertEqual(get_settings.call_args.kwargs["user_id"], USER.id)
+        self.assertTrue(update_response["success"])
+        self.assertEqual(update_settings.call_args.kwargs["user_id"], USER.id)
+        self.assertFalse(update_settings.call_args.kwargs["enabled"])
+        self.assertEqual(update_settings.call_args.kwargs["reminder_time"], time(6, 30))
+        self.assertEqual(update_settings.call_args.kwargs["timezone_name"], "America/Chicago")
+
     def test_cycling_template_model_requires_positive_planned_duration(self):
         template = WorkoutTemplateCreate(
             name="Easy Ride",

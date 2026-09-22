@@ -1,0 +1,11 @@
+DROP INDEX fitness_weight_reminder_runs_user_date_uidx;
+
+DROP TABLE public.fitness_weight_reminder_runs;
+
+DROP TABLE public.fitness_weight_reminder_settings;
+
+DROP INDEX fitness_weight_measurements_user_latest_idx;
+
+DROP INDEX fitness_weight_measurements_user_date_uidx;
+
+DROP TABLE public.fitness_weight_measurements;

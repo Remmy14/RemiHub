@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from enum import Enum
 from typing import Literal
@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FITNESS_RECURRENCE_MAX_WEEKS = 260
 FITNESS_DURATION_SECONDS_MAX = 864000
+FITNESS_WEIGHT_LB_MAX = Decimal("1000")
 
 
 class FitnessRequestModel(BaseModel):
@@ -102,6 +103,17 @@ class PlanInstanceRepeatWeekRequest(FitnessRequestModel):
 class ScheduledWorkoutCreate(FitnessRequestModel):
     workout_template_id: UUID
     scheduled_date: date
+
+
+class WeightMeasurementUpsert(FitnessRequestModel):
+    date: date
+    weight: Decimal = Field(gt=0, le=FITNESS_WEIGHT_LB_MAX)
+
+
+class WeightReminderUpdate(FitnessRequestModel):
+    enabled: bool | None = None
+    reminder_time: time | None = None
+    timezone: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class ScheduledWorkoutTemplateReplace(FitnessRequestModel):

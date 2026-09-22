@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -87,6 +87,8 @@ CYCLING_RESULT_COLUMNS = (
 FITNESS_TIMEZONE_ENV = "REMIHUB_FITNESS_TIMEZONE"
 DEFAULT_FITNESS_TIMEZONE = "America/New_York"
 HISTORICAL_EFFORT_LIMITS = {"5": 5, "10": 10, "all": None}
+DEFAULT_WEIGHT_REMINDER_TIME = time(9, 0)
+FITNESS_WEIGHT_LB_MAX = Decimal("1000")
 
 
 class FitnessNotFoundError(ValueError):
@@ -173,6 +175,60 @@ def _date_value(value) -> date:
         raise FitnessValidationError("Invalid date value") from exc
 
 
+def _time_value(value) -> time:
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    try:
+        parsed = time.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise FitnessValidationError("Invalid time value") from exc
+    return parsed.replace(second=0, microsecond=0)
+
+
+def _timezone_name(value: str | None) -> str:
+    name = (value or os.environ.get(FITNESS_TIMEZONE_ENV, DEFAULT_FITNESS_TIMEZONE)).strip()
+    if not name:
+        name = DEFAULT_FITNESS_TIMEZONE
+    try:
+        ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise FitnessValidationError(f"Invalid timezone: {name}") from exc
+    return name
+
+
+def _weight_decimal(value) -> Decimal:
+    weight = _decimal(value)
+    if not weight.is_finite():
+        raise FitnessValidationError("Invalid weight value")
+    if weight <= 0:
+        raise FitnessValidationError("Weight must be greater than zero")
+    if weight > FITNESS_WEIGHT_LB_MAX:
+        raise FitnessValidationError("Weight is outside the supported range")
+    return weight
+
+
+def _weight_measurement_row(cur, row) -> dict | None:
+    measurement = _row_to_dict(cur, row)
+    if not measurement:
+        return None
+    measurement["unit"] = "lb"
+    return measurement
+
+
+def _weight_measurement_rows(cur, rows) -> list[dict]:
+    measurements = _rows_to_dicts(cur, rows)
+    for measurement in measurements:
+        measurement["unit"] = "lb"
+    return measurements
+
+
+def _weight_reminder_row(cur, row) -> dict:
+    settings = _row_to_dict(cur, row)
+    if settings and settings.get("reminder_time") is not None:
+        settings["reminder_time"] = _time_value(settings["reminder_time"]).strftime("%H:%M")
+    return settings
+
+
 def fitness_timezone() -> ZoneInfo:
     name = os.environ.get(FITNESS_TIMEZONE_ENV, DEFAULT_FITNESS_TIMEZONE).strip()
     try:
@@ -186,6 +242,203 @@ def current_fitness_date(now: datetime | None = None) -> date:
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
     return reference.astimezone(fitness_timezone()).date()
+
+
+def _ensure_weight_reminder_settings(cur, user_id: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.fitness_weight_reminder_settings (
+            user_id,
+            enabled,
+            reminder_time,
+            timezone
+        )
+        VALUES (%s, true, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id, DEFAULT_WEIGHT_REMINDER_TIME, _timezone_name(None)),
+    )
+
+
+def upsert_weight_measurement(*, user_id: str, measurement_date: date, weight) -> dict:
+    normalized_weight = _weight_decimal(weight)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.fitness_weight_measurements (
+                    user_id,
+                    measurement_date,
+                    weight_lb
+                )
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, measurement_date)
+                DO UPDATE SET
+                    weight_lb = EXCLUDED.weight_lb,
+                    updated_at = now()
+                RETURNING id,
+                          user_id,
+                          measurement_date AS date,
+                          weight_lb AS weight,
+                          created_at,
+                          updated_at
+                """,
+                (user_id, measurement_date, normalized_weight),
+            )
+            measurement = _weight_measurement_row(cur, cur.fetchone())
+        conn.commit()
+        return measurement
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def list_weight_measurements(
+    *,
+    user_id: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> list[dict]:
+    if start_date and end_date and end_date < start_date:
+        raise FitnessValidationError("end_date must be on or after start_date")
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            params = [user_id]
+            sql = """
+                SELECT id,
+                       user_id,
+                       measurement_date AS date,
+                       weight_lb AS weight,
+                       created_at,
+                       updated_at
+                FROM public.fitness_weight_measurements
+                WHERE user_id = %s
+            """
+            if start_date:
+                sql += " AND measurement_date >= %s"
+                params.append(start_date)
+            if end_date:
+                sql += " AND measurement_date <= %s"
+                params.append(end_date)
+            sql += " ORDER BY measurement_date, created_at, id"
+            cur.execute(sql, tuple(params))
+            return _weight_measurement_rows(cur, cur.fetchall())
+    finally:
+        put_db_conn(conn)
+
+
+def get_latest_weight_measurement(*, user_id: str) -> dict | None:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id,
+                       user_id,
+                       measurement_date AS date,
+                       weight_lb AS weight,
+                       created_at,
+                       updated_at
+                FROM public.fitness_weight_measurements
+                WHERE user_id = %s
+                ORDER BY measurement_date DESC, updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            return _weight_measurement_row(cur, cur.fetchone())
+    finally:
+        put_db_conn(conn)
+
+
+def get_weight_reminder_settings(*, user_id: str) -> dict:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_weight_reminder_settings(cur, user_id)
+            cur.execute(
+                """
+                SELECT user_id,
+                       enabled,
+                       reminder_time,
+                       timezone,
+                       created_at,
+                       updated_at
+                FROM public.fitness_weight_reminder_settings
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            settings = _weight_reminder_row(cur, cur.fetchone())
+        conn.commit()
+        return settings
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def update_weight_reminder_settings(
+    *,
+    user_id: str,
+    enabled: bool | None = None,
+    reminder_time: time | str | None = None,
+    timezone_name: str | None = None,
+) -> dict:
+    normalized_reminder_time = _time_value(reminder_time) if reminder_time is not None else None
+    normalized_timezone = _timezone_name(timezone_name) if timezone_name is not None else None
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_weight_reminder_settings(cur, user_id)
+            updates = []
+            values = []
+            if enabled is not None:
+                updates.append("enabled = %s")
+                values.append(bool(enabled))
+            if normalized_reminder_time is not None:
+                updates.append("reminder_time = %s")
+                values.append(normalized_reminder_time)
+            if normalized_timezone is not None:
+                updates.append("timezone = %s")
+                values.append(normalized_timezone)
+            if updates:
+                updates.append("updated_at = now()")
+                values.append(user_id)
+                cur.execute(
+                    f"""
+                    UPDATE public.fitness_weight_reminder_settings
+                    SET {", ".join(updates)}
+                    WHERE user_id = %s
+                    """,
+                    tuple(values),
+                )
+            cur.execute(
+                """
+                SELECT user_id,
+                       enabled,
+                       reminder_time,
+                       timezone,
+                       created_at,
+                       updated_at
+                FROM public.fitness_weight_reminder_settings
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            settings = _weight_reminder_row(cur, cur.fetchone())
+        conn.commit()
+        return settings
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
 
 
 def _normalize_weekdays(weekdays: list[int]) -> list[int]:
