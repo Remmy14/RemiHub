@@ -336,6 +336,20 @@ def process_weight_reminder_for_user(
     with conn.cursor() as cur:
         cur.execute(
             """
+            SELECT 1
+            FROM public.fitness_weight_measurements
+            WHERE user_id = %s
+              AND measurement_date = %s
+            LIMIT 1
+            """,
+            (user_id, target_date),
+        )
+        if cur.fetchone():
+            return False
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
             INSERT INTO public.fitness_weight_reminder_runs (
                 user_id,
                 reminder_date,

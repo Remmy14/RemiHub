@@ -183,13 +183,16 @@ class FitnessNotificationWorkerTests(unittest.TestCase):
         self.assertEqual(params, ("America/New_York",))
 
     def test_weight_reminder_notification_is_inserted_once_in_caller_transaction(self):
+        measurement_cursor = FakeCursor(rows=[])
         lock_cursor = FakeCursor(
             columns=["id", "notification_id"],
             rows=[(RUN_ID, None)],
         )
         notification_cursor = FakeCursor(columns=["id"], rows=[(10,)])
         update_cursor = FakeCursor()
-        conn = SequenceConnection([lock_cursor, notification_cursor, update_cursor])
+        conn = SequenceConnection(
+            [measurement_cursor, lock_cursor, notification_cursor, update_cursor]
+        )
 
         inserted = fitness_worker.process_weight_reminder_for_user(
             conn,
@@ -213,12 +216,9 @@ class FitnessNotificationWorkerTests(unittest.TestCase):
         self.assertIn("notification_id = %s", update_cursor.executed[0][0])
         self.assertEqual(conn.commits, 0)
 
-    def test_existing_weight_reminder_run_does_not_insert_duplicate_notification(self):
-        lock_cursor = FakeCursor(
-            columns=["id", "notification_id"],
-            rows=[(RUN_ID, 10)],
-        )
-        conn = SequenceConnection([lock_cursor])
+    def test_weight_reminder_skips_when_weight_already_recorded_for_day(self):
+        measurement_cursor = FakeCursor(rows=[(1,)])
+        conn = SequenceConnection([measurement_cursor])
 
         inserted = fitness_worker.process_weight_reminder_for_user(
             conn,
@@ -229,7 +229,30 @@ class FitnessNotificationWorkerTests(unittest.TestCase):
         )
 
         self.assertFalse(inserted)
+        sql, params = measurement_cursor.executed[0]
+        self.assertIn("FROM public.fitness_weight_measurements", sql)
+        self.assertIn("measurement_date = %s", sql)
+        self.assertEqual(params, (USER_ID, datetime(2026, 9, 22).date()))
         self.assertEqual(len(conn.used_cursors), 1)
+
+    def test_existing_weight_reminder_run_does_not_insert_duplicate_notification(self):
+        measurement_cursor = FakeCursor(rows=[])
+        lock_cursor = FakeCursor(
+            columns=["id", "notification_id"],
+            rows=[(RUN_ID, 10)],
+        )
+        conn = SequenceConnection([measurement_cursor, lock_cursor])
+
+        inserted = fitness_worker.process_weight_reminder_for_user(
+            conn,
+            user_id=USER_ID,
+            target_date=datetime(2026, 9, 22).date(),
+            timezone_name="America/New_York",
+            reminder_time=time(9, 0),
+        )
+
+        self.assertFalse(inserted)
+        self.assertEqual(len(conn.used_cursors), 2)
 
     def test_combined_morning_notification_is_inserted_once_in_caller_transaction(self):
         workout_cursor = FakeCursor(
