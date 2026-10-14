@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 import AgentScreen from "./AgentScreen";
@@ -279,6 +279,19 @@ function PrivateApp() {
 
 function AppRoutes() {
   const path = window.location.pathname;
+
+  useEffect(() => {
+    const favicon = document.getElementById("app-favicon") as HTMLLinkElement | null;
+    if (!favicon) return;
+
+    if (path === "/race" || path.startsWith("/race/")) {
+      favicon.href = "/favicon.png";
+      favicon.type = "image/png";
+    } else {
+      favicon.href = "/remihub-favicon.svg";
+      favicon.type = "image/svg+xml";
+    }
+  }, [path]);
 
   if (path.startsWith("/race/draft")) {
     return <DraftCompanionScreen />;

@@ -221,6 +221,11 @@ async def serve_portal(full_path: str = ""):
 async def web_favicon():
     return FileResponse(WEB_DIST_DIR / "favicon.png")
 
+
+@app.get("/remihub-favicon.svg", include_in_schema=False)
+async def web_portal_favicon():
+    return FileResponse(WEB_DIST_DIR / "remihub-favicon.svg")
+
 app.mount(
     '/race',
     StaticFiles(directory=str(WEB_DIST_DIR), html=True, check_dir=False),
