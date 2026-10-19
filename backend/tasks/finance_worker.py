@@ -738,6 +738,34 @@ def _extract_kbb_private_party_value_from_widget(html: str) -> tuple[Decimal | N
         "svg_text_values": text_values,
     }
 
+def _current_kbb_widget_url(kbb_widget_url: str) -> str:
+    """Refresh valuation date; preserve options, ZIP and mileage."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parsed = urlsplit(kbb_widget_url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+
+    if not any(
+        key.lower() == "requesteddataversiondate"
+        for key, _ in pairs
+    ):
+        return kbb_widget_url
+
+    pairs = [
+        (
+            key,
+            date.today().strftime("%m/%d/%Y")
+            if key.lower() == "requesteddataversiondate"
+            else value,
+        )
+        for key, value in pairs
+    ]
+
+    return urlunsplit(
+        parsed._replace(query=urlencode(pairs, safe=",/"))
+    )
+
+
 def _fetch_kbb_widget_html(*, vehicle_label: str, kbb_widget_url: str,) -> str | None:
     headers = {
         "User-Agent": (
@@ -751,7 +779,7 @@ def _fetch_kbb_widget_html(*, vehicle_label: str, kbb_widget_url: str,) -> str |
 
     try:
         response = requests.get(
-            kbb_widget_url,
+            _current_kbb_widget_url(kbb_widget_url),
             headers=headers,
             timeout=20,
         )
@@ -780,9 +808,9 @@ def get_kbb_vehicle_values() -> list[dict]:
             "url": finance_config.get("vehicle_kia_url"),
         },
         {
-            "valuation_key": "vehicle_camry",
-            "label": "2014 Toyota Camry",
-            "url": finance_config.get("vehicle_camry_url"),
+            "valuation_key": "vehicle_ram",
+            "label": "2026 RAM 2500 Big Horn",
+            "url": finance_config.get("vehicle_ram_url"),
         },
     ]
 
