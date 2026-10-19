@@ -122,6 +122,17 @@ def next_interval_boundary(now: datetime, interval_minutes: int) -> datetime:
 
     return next_run
 
+
+def run_pool_monitor_once(_config):
+    if not pool_watch_meta.get_summer_mode():
+        logger.info("Pool monitor scrape skipped in winter mode.")
+        return False
+
+    temps = fetch_raymote_temperatures(_config["Pool Monitor"])
+    save_data_to_database(temps)
+    return True
+
+
 def run_pool_monitor(_config=None):
     if not _config:
         _config = config.load_application_config()
@@ -135,8 +146,7 @@ def run_pool_monitor(_config=None):
         logger.error(f"Next pool scrape scheduled for {next_run.isoformat()}")
         time.sleep(sleep_seconds)
         try:
-            temps = fetch_raymote_temperatures(_config["Pool Monitor"])
-            save_data_to_database(temps)
+            run_pool_monitor_once(_config)
         except Exception as e:
             logger.error(f"Error during scheduled run: {e}")
 
