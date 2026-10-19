@@ -16,6 +16,17 @@ from backend.database.migration_runner import (
 
 
 class MigrationDiscoveryTests(unittest.TestCase):
+    def test_manual_finance_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0016_finance_manual_accounts.up.sql"
+        down = MIGRATIONS_DIR / "0016_finance_manual_accounts.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+        sql = up.read_text(encoding="utf-8")
+        self.assertIn("CREATE UNIQUE INDEX finance_manual_active_name_uidx", sql)
+        self.assertIn("CREATE UNIQUE INDEX finance_manual_valuation_key_uidx", sql)
+        self.assertNotIn("CREATE UNIQUE INDEX public.", sql)
+
     def test_repository_migration_is_discoverable(self):
         migrations = discover_migrations(MIGRATIONS_DIR)
 
@@ -37,6 +48,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0013", "fitness_cycling_discipline"),
                 ("0014", "vehicles_foundation"),
                 ("0015", "fitness_weight_tracking"),
+                ("0016", "finance_manual_accounts"),
             ],
         )
 
@@ -61,6 +73,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0013", "fitness_cycling_discipline"),
                 ("0014", "vehicles_foundation"),
                 ("0015", "fitness_weight_tracking"),
+                ("0016", "finance_manual_accounts"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
