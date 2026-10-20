@@ -1,4 +1,6 @@
+from argparse import ArgumentParser
 from datetime import date
+from uuid import UUID
 
 from backend.tasks.finance_worker import upsert_manual_asset
 
@@ -7,9 +9,19 @@ def main() -> None:
     """
     One-off helper for creating/updating manual finance assets.
 
-    Edit the values below, run the task, and the monthly snapshot will use
-    the latest stored values.
+    Edit the values below and supply each existing account UUID with
+    --asset-id 'Original label=UUID'. UUIDs remain valid after a rename.
     """
+    parser = ArgumentParser()
+    parser.add_argument("--asset-id", action="append", required=True,
+                        metavar="LABEL=UUID")
+    args = parser.parse_args()
+    identifiers = {}
+    for entry in args.asset_id:
+        label, separator, identifier = entry.partition("=")
+        if not separator or not label or label in identifiers:
+            parser.error("Each --asset-id must be a unique LABEL=UUID pair")
+        identifiers[label] = str(UUID(identifier))
     today = date.today().isoformat()
 
     manual_assets = [
@@ -56,7 +68,9 @@ def main() -> None:
     ]
 
     for asset in manual_assets:
-        stored = upsert_manual_asset(**asset)
+        if asset["label"] not in identifiers:
+            parser.error(f"Missing --asset-id for {asset['label']}")
+        stored = upsert_manual_asset(**asset, asset_id=identifiers[asset["label"]])
         print(
             f"Stored manual asset: "
             f"{stored['label']} | "

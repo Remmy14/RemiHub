@@ -456,13 +456,17 @@ def upsert_manual_asset(
     *,
     label: str,
     asset_category: str,
-    current_value: float,
+    current_value: Decimal | str,
     as_of_date: str,
     include_in_net_worth: bool = True,
     notes: str | None = None,
+    asset_id: str | None = None,
 ) -> dict:
     """
-    Upsert a manually-maintained asset by label.
+    Update an existing manual account by UUID, or resolve a legacy label.
+
+    Unknown labels and UUIDs fail closed. Account creation belongs to the
+    authenticated API, so a renamed or archived record cannot be duplicated.
 
     Used for things Plaid cannot currently connect:
     - HSA
@@ -473,65 +477,56 @@ def upsert_manual_asset(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            if asset_id is None:
+                cur.execute(
+                    "SELECT id, active FROM finance_manual_assets WHERE lower(btrim(label)) = lower(btrim(%s))",
+                    (label,),
+                )
+                matches = cur.fetchall()
+                if len(matches) != 1:
+                    raise ValueError("Manual asset label is missing or ambiguous; use its UUID")
+                if not matches[0][1]:
+                    raise ValueError("Archived manual asset requires its UUID")
+                asset_id = matches[0][0]
+            else:
+                asset_id = str(uuid.UUID(str(asset_id)))
+            cur.execute(
+                "SELECT id FROM finance_manual_assets WHERE id = %s",
+                (asset_id,),
+            )
+            if cur.fetchone() is None:
+                raise ValueError("Manual asset UUID not found")
+            try:
+                monetary_value = Decimal(str(current_value))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise ValueError("Invalid manual asset value") from exc
+            if not monetary_value.is_finite() or monetary_value < 0:
+                raise ValueError("Manual asset value must be finite and nonnegative")
+            if monetary_value.as_tuple().exponent < -2:
+                raise ValueError("Manual asset value must have at most two decimal places")
+            if asset_category not in {"cash", "brokerage", "retirement", "hsa", "education", "home", "vehicle", "other", "liability"}:
+                raise ValueError("Invalid manual asset category")
+            cur.execute(
+                "SELECT valuation_key, asset_category FROM finance_manual_assets WHERE id = %s",
+                (asset_id,),
+            )
+            valuation_key, old_category = cur.fetchone()
+            if valuation_key and asset_category != old_category:
+                raise ValueError("Valuation fallback category cannot be changed")
             cur.execute(
                 """
-                SELECT id
-                FROM finance_manual_assets
-                WHERE label = %s
+                UPDATE finance_manual_assets
+                SET asset_category = %s,
+                    current_value = %s,
+                    as_of_date = %s,
+                    include_in_net_worth = %s,
+                    notes = %s,
+                    updated_at = now()
+                WHERE id = %s
                 """,
-                (label,),
+                (asset_category, monetary_value, as_of_date,
+                 include_in_net_worth, notes, asset_id),
             )
-            row = cur.fetchone()
-
-            if row:
-                asset_id = row[0]
-                cur.execute(
-                    """
-                    UPDATE finance_manual_assets
-                    SET asset_category = %s,
-                        current_value = %s,
-                        as_of_date = %s,
-                        include_in_net_worth = %s,
-                        notes = %s,
-                        updated_at = now()
-                    WHERE id = %s
-                    """,
-                    (
-                        asset_category,
-                        current_value,
-                        as_of_date,
-                        include_in_net_worth,
-                        notes,
-                        asset_id,
-                    ),
-                )
-            else:
-                asset_id = str(uuid.uuid4())
-                cur.execute(
-                    """
-                    INSERT INTO finance_manual_assets (
-                        id,
-                        label,
-                        asset_category,
-                        current_value,
-                        as_of_date,
-                        include_in_net_worth,
-                        notes,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now())
-                    """,
-                    (
-                        asset_id,
-                        label,
-                        asset_category,
-                        current_value,
-                        as_of_date,
-                        include_in_net_worth,
-                        notes,
-                    ),
-                )
 
         conn.commit()
 
@@ -544,6 +539,9 @@ def upsert_manual_asset(
             "include_in_net_worth": include_in_net_worth,
             "notes": notes,
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         put_db_conn(conn)
 
@@ -565,7 +563,7 @@ def get_manual_assets(*, included_only: bool = True) -> list[dict]:
                            updated_at,
                            valuation_key
                     FROM finance_manual_assets
-                    WHERE include_in_net_worth = true
+                    WHERE include_in_net_worth = true AND active = true
                     ORDER BY asset_category, label
                     """
                 )
