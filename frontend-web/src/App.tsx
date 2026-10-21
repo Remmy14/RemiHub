@@ -5,6 +5,7 @@ import AgentScreen from "./AgentScreen";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import DraftCompanionScreen from "./DraftCompanionScreen";
 import FitnessScreen from "./FitnessScreen";
+import FinanceScreen from "./FinanceScreen";
 import HealthScreen from "./HealthScreen";
 import RaceScreen from "./RaceScreen";
 import RhStorageStatusScreen from "./RhStorageStatusScreen";
@@ -31,6 +32,12 @@ const modules: ModuleEntry[] = [
     href: "/race/draft",
     status: "Public",
     publicModule: true,
+  },
+  {
+    name: "Finance",
+    description: "Financial snapshots, history, and account management.",
+    href: "/portal/finance",
+    status: "Authenticated",
   },
   {
     name: "Fitness",
@@ -241,6 +248,14 @@ function PortalHome() {
 
 function PrivateApp() {
   const path = window.location.pathname;
+
+  if (path === "/portal/finance" || path.startsWith("/portal/finance/")) {
+    return (
+      <PortalLayout>
+        <FinanceScreen />
+      </PortalLayout>
+    );
+  }
 
   if (path.startsWith("/storage")) {
     return (

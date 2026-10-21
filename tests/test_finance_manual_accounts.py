@@ -10,11 +10,12 @@ from decimal import Decimal
 from unittest.mock import patch
 from uuid import UUID
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from backend.core.auth import AuthenticatedPrincipal, get_current_principal, require_current_principal
+from backend.core.auth import AuthenticatedPrincipal, get_current_principal, require_admin_principal, require_current_principal
 from backend.models.finance_models import ManualAccountCreate, ManualAccountPatch
 
 
@@ -59,6 +60,63 @@ class ManualAccountValidationTests(unittest.TestCase):
         self.assertIsNone(ManualAccountPatch.model_validate({"notes": None}).notes)
         self.assertEqual(ManualAccountPatch.model_validate(
             {"as_of_date": date.today().isoformat()}).as_of_date, date.today())
+
+
+class FinanceRouterContractTests(unittest.TestCase):
+    def test_finance_guard_matrix_in_both_modes_without_http_socket(self):
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="test-token")
+        for mode in ("transition", "required"):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"REMIHUB_AUTH_MODE": mode}):
+                with self.assertRaises(HTTPException) as anonymous:
+                    require_current_principal(None)
+                self.assertEqual(anonymous.exception.status_code, 401)
+                for principal in (MEMBER, ADMIN):
+                    with patch("backend.core.auth._principal_from_credentials", return_value=principal):
+                        authenticated = require_current_principal(credentials)
+                    self.assertIs(authenticated, principal)
+                    if principal is MEMBER:
+                        with self.assertRaises(HTTPException) as forbidden:
+                            require_admin_principal(authenticated)
+                        self.assertEqual(forbidden.exception.status_code, 403)
+                    else:
+                        self.assertIs(require_admin_principal(authenticated), ADMIN)
+
+    def test_all_finance_operations_have_strict_auth_and_existing_openapi_shapes(self):
+        original = sys.modules.get("backend.database.database")
+        fake = types.ModuleType("backend.database.database")
+        fake.get_db_conn = lambda: None
+        fake.put_db_conn = lambda _conn: None
+        sys.modules["backend.database.database"] = fake
+        try:
+            finance = importlib.import_module("backend.routers.finance")
+        finally:
+            if original is None:
+                sys.modules.pop("backend.database.database", None)
+            else:
+                sys.modules["backend.database.database"] = original
+        app = FastAPI()
+        app.include_router(finance.router, dependencies=[Depends(get_current_principal)])
+        expected = {
+            ("/finance/summary", "GET"), ("/finance/history", "GET"),
+            ("/finance/accounts", "GET"), ("/finance/accounts/{account_id}", "PATCH"),
+            ("/finance/manual-accounts", "GET"), ("/finance/manual-accounts", "POST"),
+            ("/finance/manual-accounts/{account_id}", "GET"),
+            ("/finance/manual-accounts/{account_id}", "PATCH"),
+        }
+        actual = set()
+        for route in app.routes:
+            if not getattr(route, "path", "").startswith("/finance/"):
+                continue
+            for method in route.methods & {"GET", "POST", "PATCH"}:
+                actual.add((route.path, method))
+            dependencies = {dependency.call for dependency in route.dependant.dependencies}
+            guard = require_admin_principal if "/manual-accounts" in route.path else require_current_principal
+            self.assertIn(guard, dependencies, route.path)
+        self.assertEqual(actual, expected)
+        schema = app.openapi()
+        self.assertEqual(schema["paths"]["/finance/summary"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/FinanceSummary")
+        self.assertIn("ManualAccountCreate", schema["components"]["schemas"])
+        self.assertIn("ManualAccountPatch", schema["components"]["schemas"])
 
 
 @unittest.skipUnless(os.environ.get("REMIHUB_HTTP_TESTS") == "1",
@@ -135,6 +193,55 @@ class ManualAccountHttpTests(unittest.TestCase):
                     self.assertEqual(self.client.get("/finance/manual-accounts").status_code, 403)
                 finally:
                     self.app.dependency_overrides.clear()
+
+    def test_all_finance_routes_require_a_session_and_preserve_admin_boundary(self):
+        summary = {
+            "snapshot_id": ACCOUNT_ID, "snapshot_month": "2026-10-01",
+            "status": "success", "total_assets": 100.0,
+            "total_liabilities": 25.0, "net_worth": 75.0,
+            "notes": None, "items": [], "categories": [],
+        }
+        account = {
+            "id": ACCOUNT_ID, "source": "plaid", "source_account_id": "plaid-1",
+            "institution_label": "Bank", "name": "Checking", "official_name": None,
+            "mask": "1234", "type": "depository", "subtype": "checking",
+            "asset_category": "cash", "include_in_net_worth": True,
+            "display_name": None, "display_order": 1, "updated_at": None,
+        }
+        routes = (
+            ("get", "/finance/summary", None),
+            ("get", "/finance/history", None),
+            ("get", "/finance/accounts", None),
+            ("patch", f"/finance/accounts/{ACCOUNT_ID}", {"display_name": "Main"}),
+            ("get", "/finance/manual-accounts", None),
+            ("post", "/finance/manual-accounts", CREATE),
+            ("get", f"/finance/manual-accounts/{ACCOUNT_ID}", None),
+            ("patch", f"/finance/manual-accounts/{ACCOUNT_ID}", {"active": False}),
+        )
+        with patch.object(self.finance.finance_service, "get_finance_summary", return_value=summary), \
+             patch.object(self.finance.finance_service, "get_finance_history", return_value=[]), \
+             patch.object(self.finance.finance_service, "get_finance_accounts", return_value=[account]), \
+             patch.object(self.finance.finance_service, "update_finance_account", return_value=account), \
+             patch.object(self.finance.manual_service, "list_accounts", return_value=[ACCOUNT]), \
+             patch.object(self.finance.manual_service, "create_account", return_value=ACCOUNT), \
+             patch.object(self.finance.manual_service, "get_account", return_value=ACCOUNT), \
+             patch.object(self.finance.manual_service, "update_account", return_value=ACCOUNT):
+            for mode in ("transition", "required"):
+                with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": mode}):
+                    for method, path, body in routes:
+                        with self.subTest(mode=mode, role="anonymous", path=path):
+                            response = getattr(self.client, method)(path, json=body) if body else getattr(self.client, method)(path)
+                            self.assertEqual(response.status_code, 401)
+                    for principal, role in ((MEMBER, "member"), (ADMIN, "admin")):
+                        self.app.dependency_overrides[require_current_principal] = lambda principal=principal: principal
+                        try:
+                            for method, path, body in routes:
+                                with self.subTest(mode=mode, role=role, path=path):
+                                    response = getattr(self.client, method)(path, json=body) if body else getattr(self.client, method)(path)
+                                    expected = 403 if role == "member" and "/manual-accounts" in path else 201 if method == "post" else 200
+                                    self.assertEqual(response.status_code, expected)
+                        finally:
+                            self.app.dependency_overrides.clear()
 
 
 class ManualSnapshotTests(unittest.TestCase):

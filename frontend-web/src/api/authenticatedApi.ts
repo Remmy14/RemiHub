@@ -10,6 +10,13 @@ export class ApiAuthenticationError extends Error {
   }
 }
 
+export class ApiForbiddenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiForbiddenError";
+  }
+}
+
 type ApiRequestOptions = RequestInit & {
   authenticated?: boolean;
 };
@@ -34,13 +41,16 @@ export async function apiRequest<T>(
     headers,
   });
 
-  if (response.status === 401 || response.status === 403) {
-    const message =
-      response.status === 401
-        ? "Your RemiHub session expired. Sign in again."
-        : "This RemiHub account is not authorized for that request.";
+  if (response.status === 401) {
+    const message = "Your RemiHub session expired. Sign in again.";
     markAuthenticationExpired(message);
     throw new ApiAuthenticationError(message);
+  }
+
+  if (response.status === 403) {
+    throw new ApiForbiddenError(
+      "This RemiHub account is not authorized for that request.",
+    );
   }
 
   const data = await response.json().catch(() => null);
@@ -48,6 +58,11 @@ export async function apiRequest<T>(
     const detail =
       typeof data?.detail === "string"
         ? data.detail
+        : Array.isArray(data?.detail)
+          ? (data.detail as Array<{ msg?: string }>)
+              .map((entry) => entry?.msg)
+              .filter((message): message is string => typeof message === "string")
+              .join("; ") || "Check the supplied values."
         : "RemiHub request failed.";
     throw new Error(detail);
   }

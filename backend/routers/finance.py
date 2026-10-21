@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from backend.core.auth import require_admin_principal
+from backend.core.auth import require_admin_principal, require_current_principal
 
 # Local Imports
 from backend.models.finance_models import (
@@ -62,7 +62,8 @@ def patch_manual_account(account_id: UUID, request: ManualAccountPatch):
         _manual_error(exc)
 
 
-@router.get("/summary", response_model=FinanceSummary)
+@router.get("/summary", response_model=FinanceSummary,
+            dependencies=[Depends(require_current_principal)])
 def get_summary():
     summary = finance_service.get_finance_summary()
 
@@ -72,12 +73,13 @@ def get_summary():
     return summary
 
 
-@router.get("/history", response_model=list[FinanceHistoryPoint])
+@router.get("/history", response_model=list[FinanceHistoryPoint],
+            dependencies=[Depends(require_current_principal)])
 def get_history(limit: int = 24):
     return finance_service.get_finance_history(limit=limit)
 
 
-@router.get("/accounts")
+@router.get("/accounts", dependencies=[Depends(require_current_principal)])
 def get_accounts():
     return {
         "success": True,
@@ -85,7 +87,7 @@ def get_accounts():
     }
 
 
-@router.patch("/accounts/{account_id}")
+@router.patch("/accounts/{account_id}", dependencies=[Depends(require_current_principal)])
 def update_account(account_id: str, req: FinanceAccountUpdate):
     try:
         updated = finance_service.update_finance_account(

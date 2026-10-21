@@ -5,6 +5,27 @@ from pathlib import Path
 
 
 class FrontendWebPortalTests(unittest.TestCase):
+    def test_finance_route_is_inside_existing_authenticated_boundary(self):
+        root = Path(__file__).resolve().parents[1] / "frontend-web" / "src"
+        app = (root / "App.tsx").read_text(encoding="utf-8")
+        finance = (root / "api" / "financeApi.ts").read_text(encoding="utf-8")
+        self.assertIn('href: "/portal/finance"', app)
+        self.assertIn('path.startsWith("/portal/finance/")', app)
+        self.assertLess(app.index('if (path === "/portal/finance"'), app.index('return <PortalHome />'))
+        self.assertLess(app.index('<AuthenticatedRoute>'), app.index('<PrivateApp />'))
+        self.assertIn('apiRequest<FinanceSummary>("/finance/summary"', finance)
+        self.assertNotIn("authenticated: false", finance)
+
+    def test_shared_api_403_keeps_session_and_health_reports_permission_error(self):
+        root = Path(__file__).resolve().parents[1] / "frontend-web" / "src"
+        helper = (root / "api" / "authenticatedApi.ts").read_text(encoding="utf-8")
+        health = (root / "HealthScreen.tsx").read_text(encoding="utf-8")
+        self.assertIn('if (response.status === 401)', helper)
+        self.assertIn('if (response.status === 403)', helper)
+        self.assertIn('throw new ApiForbiddenError(', helper)
+        self.assertLess(helper.index('markAuthenticationExpired(message)'), helper.index('if (response.status === 403)'))
+        self.assertIn('error instanceof ApiForbiddenError', health)
+
     def test_firebase_browser_config_is_source_controlled_and_complete(self):
         config_path = (
             Path(__file__).resolve().parents[1]

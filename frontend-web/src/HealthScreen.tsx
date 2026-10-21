@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-import { ApiAuthenticationError } from "./api/authenticatedApi";
+import { ApiAuthenticationError, ApiForbiddenError } from "./api/authenticatedApi";
 import { getServiceHealthSnapshot } from "./api/healthApi";
 import type {
   HealthComponent,
@@ -108,7 +108,7 @@ function formatDateTime(value: string | null | undefined): string {
 }
 
 function safeRefreshError(error: unknown): string {
-  if (error instanceof ApiAuthenticationError) {
+  if (error instanceof ApiAuthenticationError || error instanceof ApiForbiddenError) {
     return error.message;
   }
   return "Service health is temporarily unavailable.";
