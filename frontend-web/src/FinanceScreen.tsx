@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 import { financeApi } from "./api/financeApi";
@@ -76,7 +76,42 @@ function SnapshotItems({ items }: { items: SnapshotItem[] }) {
   </div>;
 }
 
+function chartCurrency(value: number) {
+  if (value === 0) return "$0";
+  const magnitude = Math.abs(value);
+  const unit = magnitude >= 1_000_000 ? 1_000_000 : magnitude >= 1_000 ? 1_000 : 1;
+  const suffix = unit === 1_000_000 ? "M" : unit === 1_000 ? "K" : "";
+  return `${value < 0 ? "-" : ""}$${Number((magnitude / unit).toFixed(2))}${suffix}`;
+}
+
+function chartScale(values: number[]) {
+  const minimum = Math.min(0, ...values);
+  const maximum = Math.max(0, ...values);
+  const roughStep = (maximum - minimum) / 5 || 1;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const step = [1, 2, 2.5, 5, 10].map((factor) => factor * magnitude).find((candidate) => candidate >= roughStep) ?? 10 * magnitude;
+  const first = Math.floor(minimum / step);
+  const last = Math.max(first + 1, Math.ceil(maximum / step));
+  return {
+    minimum: first * step,
+    maximum: last * step,
+    ticks: Array.from({ length: last - first + 1 }, (_, index) => Number(((first + index) * step).toPrecision(12))),
+  };
+}
+
 function HistoryChart({ points }: { points: FinanceHistoryPoint[] }) {
+  const container = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(320);
+  useEffect(() => {
+    if (!container.current) return;
+    const element = container.current;
+    const measure = () => setWidth(Math.max(280, Math.floor(element.getBoundingClientRect().width)));
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [points]);
   if (points.length < 2) return <p className="text-sm text-slate-600">At least two persisted snapshots are needed for a trend chart.</p>;
   const sorted = [...points].sort((a, b) => a.snapshot_month.localeCompare(b.snapshot_month));
   const monthNumber = (month: string) => {
@@ -86,27 +121,43 @@ function HistoryChart({ points }: { points: FinanceHistoryPoint[] }) {
   const months = sorted.map((point) => monthNumber(point.snapshot_month));
   if (months.some((month) => !Number.isFinite(month))) return <Notice kind="warning">Historical dates are unavailable for a chart. Use the table below.</Notice>;
   const values = sorted.flatMap((point) => [point.total_assets, point.total_liabilities, point.net_worth]);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const x = (index: number) => 44 + (months[index] - months[0]) / (months[months.length - 1] - months[0] || 1) * 676;
-  const y = (value: number) => 215 - (value - min) / range * 175;
+  const scale = chartScale(values);
+  const left = 62;
+  const right = width - 16;
+  const top = 24;
+  const bottom = 210;
+  const x = (index: number) => left + (months[index] - months[0]) / (months[months.length - 1] - months[0] || 1) * (right - left);
+  const y = (value: number) => bottom - (value - scale.minimum) / (scale.maximum - scale.minimum) * (bottom - top);
+  const monthLabel = (month: string) => {
+    const [year, number] = month.split("-").map(Number);
+    return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][number - 1]} '${String(year).slice(-2)}`;
+  };
+  const labelIndexes = [0];
+  for (let index = 1; index < sorted.length - 1; index += 1) {
+    if (x(index) - x(labelIndexes[labelIndexes.length - 1]) >= 72 && x(sorted.length - 1) - x(index) >= 72) labelIndexes.push(index);
+  }
+  if (x(sorted.length - 1) - x(labelIndexes[labelIndexes.length - 1]) >= 72) labelIndexes.push(sorted.length - 1);
   const series: { key: "total_assets" | "total_liabilities" | "net_worth"; title: string; color: string }[] = [
     { key: "total_assets", title: "Assets", color: "#2563eb" },
     { key: "total_liabilities", title: "Liabilities", color: "#dc2626" },
     { key: "net_worth", title: "Net worth", color: "#059669" },
   ];
-  return <div>
+  return <div ref={container}>
     <div className="mb-2 flex flex-wrap gap-4 text-xs font-semibold">{series.map((line) => <span key={line.key} style={{ color: line.color }}>● {line.title}</span>)}</div>
-    <svg role="img" aria-label="Persisted monthly assets, liabilities, and net worth. Missing months are left blank." viewBox="0 0 760 250" className="w-full" preserveAspectRatio="xMidYMid meet">
-      <line x1="44" x2="720" y1="215" y2="215" stroke="#cbd5e1" />
+    <svg role="img" aria-label="Persisted monthly assets, liabilities, and net worth in dollars. Missing months are left blank." viewBox={`0 0 ${width} 250`} className="w-full" preserveAspectRatio="xMidYMid meet">
+      {scale.ticks.map((tick) => <g key={tick}>
+        <line x1={left} x2={right} y1={y(tick)} y2={y(tick)} stroke="currentColor" opacity="0.13" />
+        <line x1={left - 4} x2={left} y1={y(tick)} y2={y(tick)} stroke="currentColor" opacity="0.5" />
+        <text x={left - 8} y={y(tick)} dy="0.32em" textAnchor="end" fontSize="11" fill="currentColor" opacity="0.7">{chartCurrency(tick)}</text>
+      </g>)}
+      <line x1={left} x2={left} y1={top} y2={bottom} stroke="currentColor" opacity="0.3" />
+      <line x1={left} x2={right} y1={bottom} y2={bottom} stroke="currentColor" opacity="0.3" />
       {series.flatMap((line) => sorted.slice(1).map((point, index) => {
         if (months[index + 1] - months[index] !== 1) return null;
         return <line key={`${line.key}:${point.snapshot_id}`} x1={x(index)} x2={x(index + 1)} y1={y(sorted[index][line.key])} y2={y(point[line.key])} stroke={line.color} strokeWidth="2" />;
       }))}
       {series.flatMap((line) => sorted.map((point, index) => <circle key={`${line.key}:${point.snapshot_id}`} cx={x(index)} cy={y(point[line.key])} r="3.5" fill={line.color}><title>{`${point.snapshot_month}: ${line.title} ${money(point[line.key])}${point.status !== "success" ? ` (${point.status})` : ""}`}</title></circle>))}
-      <text x="44" y="242" fontSize="12" fill="#475569">{sorted[0].snapshot_month}</text>
-      <text x="720" y="242" textAnchor="end" fontSize="12" fill="#475569">{sorted[sorted.length - 1].snapshot_month}</text>
+      {labelIndexes.map((index) => <text key={sorted[index].snapshot_id} x={x(index)} y="239" textAnchor={index === 0 ? "start" : index === sorted.length - 1 ? "end" : "middle"} fontSize="11" fill="currentColor" opacity="0.7">{monthLabel(sorted[index].snapshot_month)}</text>)}
     </svg>
     <p className="text-xs text-slate-500">Points are persisted snapshots. Lines stop across missing months.</p>
   </div>;
