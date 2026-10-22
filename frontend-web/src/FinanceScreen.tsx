@@ -289,11 +289,35 @@ function ManualEditor({ id }: { id?: string }) {
   const [active, setActive] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  useEffect(() => { if (state.value) { setDraft(state.value); setActive(state.value.active); } }, [state.value]);
+  useEffect(() => {
+    if (state.value) {
+      setDraft({
+        name: state.value.name,
+        classification: state.value.classification,
+        asset_category: state.value.asset_category,
+        current_balance: state.value.current_balance,
+        as_of_date: state.value.as_of_date,
+        include_in_net_worth: state.value.include_in_net_worth,
+        notes: state.value.notes,
+      });
+      setActive(state.value.active);
+    }
+  }, [state.value]);
   const save = async (event: FormEvent) => {
     event.preventDefault(); setError(null); setSuccess(null);
     try {
-      const result = id ? await financeApi.updateManualAccount(id, { ...draft, active }) : await financeApi.createManualAccount(draft);
+      const accountFields: ManualAccountCreate = {
+        name: draft.name,
+        classification: draft.classification,
+        asset_category: draft.asset_category,
+        current_balance: draft.current_balance,
+        as_of_date: draft.as_of_date,
+        include_in_net_worth: draft.include_in_net_worth,
+        notes: draft.notes,
+      };
+      const result = id
+        ? await financeApi.updateManualAccount(id, { ...accountFields, active })
+        : await financeApi.createManualAccount(accountFields);
       if (id) await state.refresh();
       else { window.location.assign(`${base}/manual/${result.id}`); return; }
       setSuccess("Account saved. The published net-worth snapshot has not been recalculated; it updates on its normal schedule.");
