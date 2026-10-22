@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 import { apiRequest } from "./api/authenticatedApi";
+import WorkerManagement from "./WorkerManagement";
 
 type DriftSummary = {
   total: number;
@@ -319,6 +320,7 @@ const RhStorageStatusScreen: React.FC = () => {
   const [status, setStatus] = useState<RhStorageStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedPoolId, setSelectedPoolId] = useState<string>("all");
+  const [workerRefreshToken, setWorkerRefreshToken] = useState(0);
 
   const fetchStatus = async () => {
     try {
@@ -398,7 +400,7 @@ const RhStorageStatusScreen: React.FC = () => {
             </select>
 
             <button
-              onClick={fetchStatus}
+              onClick={() => { void fetchStatus(); setWorkerRefreshToken((current) => current + 1); }}
               className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-bold text-white shadow-sm hover:bg-slate-700"
             >
               Refresh
@@ -423,6 +425,8 @@ const RhStorageStatusScreen: React.FC = () => {
           <StatCard label="Running jobs" value={totals.running} />
           <StatCard label="Failed jobs" value={totals.failed} />
         </div>
+
+        <WorkerManagement refreshToken={workerRefreshToken} />
 
         <div className="grid gap-5">
           {visiblePools.map((pool) => (
