@@ -5,6 +5,7 @@ export const AgentActions = {
   APPROVE_IMPLEMENTATION: "approve_implementation",
   APPROVE_DEPLOYMENT: "approve_deployment",
   RETRY: "retry",
+  RETURN_TO_IMPLEMENTATION: "return_to_implementation",
   RETRY_GITHUB_SYNC: "retry_github_sync",
   CANCEL: "cancel",
   CLOSE: "close",
@@ -192,9 +193,21 @@ export async function performAgentAction(
   action: AgentAction,
   notes?: string | null,
 ): Promise<AgentCardDetail> {
+  const correctionInstructions = notes?.trim() ?? "";
+  const returningToImplementation =
+    action === AgentActions.RETURN_TO_IMPLEMENTATION;
+
+  if (returningToImplementation && !correctionInstructions) {
+    throw new Error(
+      "Correction instructions are required to return to implementation.",
+    );
+  }
+
   const commonOptions = {
     method: "POST",
-    body: decisionBody(notes),
+    body: returningToImplementation
+      ? JSON.stringify({ content: correctionInstructions })
+      : decisionBody(notes),
   };
 
   const path = (() => {
@@ -205,6 +218,8 @@ export async function performAgentAction(
         return `/agent/cards/${card.id}/approve-deployment`;
       case AgentActions.RETRY:
         return `/agent/cards/${card.id}/retry`;
+      case AgentActions.RETURN_TO_IMPLEMENTATION:
+        return `/agent/cards/${card.id}/return-to-implementation`;
       case AgentActions.RETRY_GITHUB_SYNC:
         if (!card.deployment_recovery?.deployment_run_id) {
           throw new Error("Deployment recovery details are no longer available.");

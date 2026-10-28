@@ -38,6 +38,7 @@ class AgentCardAction(str, Enum):
     APPROVE_IMPLEMENTATION = "approve_implementation"
     APPROVE_DEPLOYMENT = "approve_deployment"
     RETRY = "retry"
+    RETURN_TO_IMPLEMENTATION = "return_to_implementation"
     RETRY_GITHUB_SYNC = "retry_github_sync"
     CANCEL = "cancel"
     CLOSE = "close"

@@ -77,6 +77,8 @@ function actionLabel(action: AgentAction): string {
       return "Approve Deployment";
     case AgentActions.RETRY:
       return "Retry Failed Run";
+    case AgentActions.RETURN_TO_IMPLEMENTATION:
+      return "Return to Implementation";
     case AgentActions.RETRY_GITHUB_SYNC:
       return "Retry GitHub Sync";
     case AgentActions.CANCEL:
@@ -502,6 +504,14 @@ function ActionPanel({
     if (!pendingAction) {
       return;
     }
+
+    if (
+      pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION &&
+      !notes.trim()
+    ) {
+      return;
+    }
+
     onAction(pendingAction, notes);
     setNotes("");
     setPendingAction(null);
@@ -536,13 +546,23 @@ function ActionPanel({
             {actionLabel(pendingAction)}
           </div>
           <p className="mt-1 text-sm text-slate-600">
-            Review the current card state before confirming this lifecycle action.
+            {pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
+              ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
+              : "Review the current card state before confirming this lifecycle action."}
           </p>
           <textarea
             className="mt-3 min-h-24 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-            maxLength={2000}
+            maxLength={
+              pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
+                ? 20000
+                : 2000
+            }
             onChange={(event) => setNotes(event.target.value)}
-            placeholder="Notes (optional)"
+            placeholder={
+              pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
+                ? "Required: describe the fix the implementer should make"
+                : "Notes (optional)"
+            }
             value={notes}
           />
           <div className="mt-3 flex flex-wrap justify-end gap-2">
@@ -556,7 +576,13 @@ function ActionPanel({
             </button>
             <button
               className="rounded-md bg-slate-950 px-3 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-              disabled={actionInProgress !== null}
+              disabled={
+                actionInProgress !== null ||
+                (
+                  pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION &&
+                  !notes.trim()
+                )
+              }
               onClick={confirm}
               type="button"
             >

@@ -192,6 +192,29 @@ def approve_deployment(
     return {"success": True, "data": card}
 
 
+
+@router.post(
+    "/cards/{card_id}/return-to-implementation",
+    response_model=AgentCardResponse,
+    responses=CARD_ERROR_RESPONSES,
+)
+def return_to_implementation(
+    card_id: UUID,
+    request: AgentMessageCreate,
+    principal: AuthenticatedPrincipal = Depends(require_admin_principal),
+):
+    try:
+        card = agent_service.return_to_implementation(
+            card_id=str(card_id),
+            requested_by=principal.id,
+            instructions=request.content,
+        )
+    except Exception as exc:
+        _raise_http_error(exc)
+
+    return {"success": True, "data": card}
+
+
 @router.post(
     "/cards/{card_id}/retry",
     response_model=AgentCardResponse,

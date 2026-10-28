@@ -252,7 +252,44 @@ def _deployment_recovery_from_run(run: dict | None) -> dict | None:
     )
 
 
-def _allowed_actions(card: dict) -> list[str]:
+
+def _safe_reimplementation_failure(card: dict, latest_run: dict | None) -> bool:
+    """Only permit recovery from recognized pre-application QA failures."""
+    if (
+        card.get("status") != CardStatus.FAILED.value
+        or card.get("repository_scope") != RepositoryScope.BACKEND.value
+        or latest_run is None
+        or latest_run.get("phase") != RunPhase.DEPLOYMENT.value
+        or latest_run.get("status") != RunStatus.FAILED.value
+        or latest_run.get("card_revision") != card.get("revision")
+    ):
+        return False
+
+    metadata = _run_metadata(latest_run)
+
+    # A completed QA handoff means this run may have entered
+    # production. Never reopen that revision automatically.
+    if "deployment_pipeline" in metadata:
+        return False
+
+    if metadata.get("environment") not in (None, "qa"):
+        return False
+
+    recovery = _deployment_recovery_from_run(latest_run)
+    if isinstance(recovery, dict) and recovery.get("production_deployed"):
+        return False
+
+    error = latest_run.get("error_message") or ""
+    if "rollback was incomplete" in error.lower():
+        return False
+
+    return any(marker in error for marker in (
+        "Unable to apply the approved implementation patch",
+        "Deployment candidate changed files do not match approval evidence",
+    ))
+
+
+def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]:
     status = CardStatus(card["status"])
     scope = coerce_repository_scope(card["repository_scope"])
     actions: list[str] = []
@@ -278,6 +315,8 @@ def _allowed_actions(card: dict) -> list[str]:
 
     if status is CardStatus.FAILED:
         actions.append("retry")
+        if _safe_reimplementation_failure(card, latest_run):
+            actions.append("return_to_implementation")
 
     recovery = card.get("deployment_recovery")
     if (
@@ -302,7 +341,7 @@ def _decorate_card(card: dict, *, latest_run: dict | None = None) -> dict:
     result = dict(card)
     result["latest_run"] = _latest_run_summary(latest_run)
     result["deployment_recovery"] = _deployment_recovery_from_run(latest_run)
-    result["allowed_actions"] = _allowed_actions(result)
+    result["allowed_actions"] = _allowed_actions(result, latest_run=latest_run)
     return result
 
 
@@ -1268,6 +1307,129 @@ def approve_deployment(
     else:
         _request_deployment_worker(repository_scope)
     return result
+
+
+
+def return_to_implementation(
+    *,
+    card_id: str,
+    requested_by: str,
+    instructions: str,
+) -> dict:
+    """Create a fresh implementation revision after a safe QA failure."""
+    instructions = _required_text(
+        instructions, field="instructions", maximum=20000
+    )
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+
+            _require_implementation_scope(
+                card, action="Return to implementation"
+            )
+
+            cur.execute(
+                """
+                SELECT id, phase, status, card_revision, error_message,
+                       result_metadata, created_at, updated_at
+                FROM agent.runs
+                WHERE card_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (card_id,),
+            )
+
+            failed_run = _row_to_dict(cur, cur.fetchone())
+
+            if not _safe_reimplementation_failure(card, failed_run):
+                raise AgentStateConflictError(
+                    "Return to implementation requires a verified "
+                    "pre-application backend QA failure"
+                )
+
+            # Prevent reopening a revision that already passed QA.
+            # A subsequent failure might belong to production.
+            cur.execute(
+                """
+                SELECT 1
+                FROM agent.runs
+                WHERE card_id = %s
+                  AND phase = 'deployment'
+                  AND card_revision = %s
+                  AND status = 'succeeded'
+                LIMIT 1
+                """,
+                (card_id, card["revision"]),
+            )
+
+            if cur.fetchone() is not None:
+                raise AgentStateConflictError(
+                    "A deployment already succeeded for this revision; "
+                    "manual recovery review is required"
+                )
+
+            target = CardStatus.IMPLEMENTATION_QUEUED
+            _require_transition(card["status"], target)
+
+            revision = card["revision"] + 1
+
+            message_id = _insert_message(
+                cur,
+                card_id=card_id,
+                author_type="user",
+                content=instructions,
+                created_by=requested_by,
+                client_message_id=None,
+            )
+
+            run_id = _insert_run(
+                cur,
+                card_id=card_id,
+                phase=RunPhase.IMPLEMENTATION,
+                card_revision=revision,
+                requested_by=requested_by,
+                input_message_id=message_id,
+            )
+
+            _update_card_status(
+                cur,
+                card_id=card_id,
+                status=target,
+                revision=revision,
+            )
+
+            _insert_event(
+                cur,
+                card_id=card_id,
+                event_type="card.deployment_returned_to_implementation",
+                actor_type="user",
+                actor_user_id=requested_by,
+                payload={
+                    "failed_deployment_run_id": failed_run["id"],
+                    "old_revision": card["revision"],
+                    "revision": revision,
+                    "implementation_run_id": run_id,
+                    "input_message_id": message_id,
+                    "to_status": target.value,
+                },
+            )
+
+        result = _card_detail(conn, card_id)
+        conn.commit()
+        return result
+
+    except errors.UniqueViolation as exc:
+        conn.rollback()
+        raise _unique_violation_error(exc) from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
 
 
 def retry_card(
