@@ -4,6 +4,7 @@ import type { FormEvent, ReactNode } from "react";
 import AgentScreen from "./AgentScreen";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import DraftCompanionScreen from "./DraftCompanionScreen";
+import DownloadsScreen from "./DownloadsScreen";
 import FitnessScreen from "./FitnessScreen";
 import FinanceScreen from "./FinanceScreen";
 import HealthScreen from "./HealthScreen";
@@ -37,6 +38,12 @@ const modules: ModuleEntry[] = [
     name: "Finance",
     description: "Financial snapshots, history, and account management.",
     href: "/portal/finance",
+    status: "Authenticated",
+  },
+  {
+    name: "Downloads",
+    description: "Track downloads from submission through Plex processing.",
+    href: "/portal/downloads",
     status: "Authenticated",
   },
   {
@@ -248,6 +255,14 @@ function PortalHome() {
 
 function PrivateApp() {
   const path = window.location.pathname;
+
+  if (path === "/portal/downloads" || path.startsWith("/portal/downloads/")) {
+    return (
+      <PortalLayout>
+        <DownloadsScreen />
+      </PortalLayout>
+    );
+  }
 
   if (path === "/portal/finance" || path.startsWith("/portal/finance/")) {
     return (
