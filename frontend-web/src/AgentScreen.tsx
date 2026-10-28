@@ -406,11 +406,12 @@ function CardList({
 function CreateCardForm({
   disabled,
   onCreate,
+  onCancel,
 }: {
   disabled: boolean;
   onCreate: (title: string, description: string) => void;
+  onCancel: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
 
@@ -424,25 +425,12 @@ function CreateCardForm({
     onCreate(cleanTitle, cleanDescription);
     setTitle("");
     setDescription("");
-    setOpen(false);
+    onCancel();
   };
-
-  if (!open) {
-    return (
-      <button
-        className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-        disabled={disabled}
-        onClick={() => setOpen(true)}
-        type="button"
-      >
-        New Card
-      </button>
-    );
-  }
 
   return (
     <form
-      className="rounded-md border border-slate-200 bg-white p-4 shadow-sm"
+      className="w-full rounded-md border border-slate-200 bg-white p-4 shadow-sm"
       onSubmit={submit}
     >
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -451,7 +439,7 @@ function CreateCardForm({
         </h2>
         <button
           className="text-sm font-bold text-slate-500 hover:text-slate-900"
-          onClick={() => setOpen(false)}
+          onClick={onCancel}
           type="button"
         >
           Cancel
@@ -647,10 +635,6 @@ function DetailHeader({ card }: { card: AgentCardDetail }) {
           <div>Created {formatDateTime(card.created_at)}</div>
           <div>Updated {formatDateTime(card.updated_at)}</div>
         </div>
-      </div>
-
-      <div className="mt-4">
-        <CopyableBlock label="Original Request" text={card.description} />
       </div>
 
       {card.blocked_reason && (
@@ -911,6 +895,18 @@ function CardDetail({
 
       <DetailHeader card={card} />
 
+      <Section count={card.messages.length} title="Conversation">
+        <div className="space-y-3">
+          {card.messages.length === 0 ? (
+            <EmptyPanel>No messages have been recorded yet.</EmptyPanel>
+          ) : (
+            card.messages.map((message) => (
+              <MessageCard key={message.id} message={message} />
+            ))
+          )}
+        </div>
+      </Section>
+
       <ActionPanel
         actionInProgress={actionInProgress}
         card={card}
@@ -928,18 +924,6 @@ function CardDetail({
       {card.deployment_recovery && (
         <DeploymentRecoveryCard recovery={card.deployment_recovery} />
       )}
-
-      <Section count={card.messages.length} title="Conversation">
-        <div className="space-y-3">
-          {card.messages.length === 0 ? (
-            <EmptyPanel>No messages have been recorded yet.</EmptyPanel>
-          ) : (
-            card.messages.map((message) => (
-              <MessageCard key={message.id} message={message} />
-            ))
-          )}
-        </div>
-      </Section>
 
       <Section count={card.runs.length} title="Run History">
         <div className="space-y-3">
@@ -986,6 +970,7 @@ export default function AgentScreen() {
   const [includeClosed, setIncludeClosed] = useState(false);
   const [isLoadingCards, setIsLoadingCards] = useState(true);
   const [isLoadingCard, setIsLoadingCard] = useState(false);
+  const [isCreateFormOpen, setIsCreateFormOpen] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<AgentAction | "create" | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -1141,10 +1126,16 @@ export default function AgentScreen() {
             Monitor RemiHub Agent cards, review output, and perform approved lifecycle actions.
           </p>
         </div>
-        <CreateCardForm
-          disabled={actionInProgress !== null}
-          onCreate={createCard}
-        />
+        {!isCreateFormOpen && (
+          <button
+            className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            disabled={actionInProgress !== null}
+            onClick={() => setIsCreateFormOpen(true)}
+            type="button"
+          >
+            New Card
+          </button>
+        )}
       </div>
 
       {errorMessage && (
@@ -1157,7 +1148,7 @@ export default function AgentScreen() {
       )}
 
       <div className="grid gap-5 lg:grid-cols-[minmax(20rem,24rem)_1fr]">
-        <aside className="space-y-4">
+        <aside className={isCreateFormOpen ? "order-2 space-y-4 lg:order-none" : "space-y-4"}>
           <section className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
@@ -1193,7 +1184,14 @@ export default function AgentScreen() {
           )}
         </aside>
 
-        <section>
+        <section className={isCreateFormOpen ? "order-1 min-w-0 space-y-5 lg:order-none" : "min-w-0 space-y-5"}>
+          {isCreateFormOpen && (
+            <CreateCardForm
+              disabled={actionInProgress !== null}
+              onCancel={() => setIsCreateFormOpen(false)}
+              onCreate={createCard}
+            />
+          )}
           {selectedCard ? (
             <CardDetail
               actionInProgress={actionInProgress}
@@ -1211,9 +1209,9 @@ export default function AgentScreen() {
             <div className="rounded-md border border-slate-200 bg-white p-6 text-sm font-semibold text-slate-500 shadow-sm">
               Loading {selectedSummary.title}...
             </div>
-          ) : (
+          ) : !isCreateFormOpen ? (
             <EmptyPanel>Select an Agent card to inspect its details.</EmptyPanel>
-          )}
+          ) : null}
         </section>
       </div>
     </main>
