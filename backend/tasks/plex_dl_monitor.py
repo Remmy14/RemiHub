@@ -17,6 +17,7 @@ from plexapi.server import PlexServer
 sys.path.append('M:/Q_Drive/Projects/RemiHub/')
 from backend.config import load_application_config
 from backend.core.runtime_paths import ensure_log_directory
+from backend.services import plex_service
 
 # ----------------------
 # Configure Logging
@@ -32,6 +33,28 @@ logger.addHandler(log_handler)
 
 # Configure paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent  # /opt/remihub
+
+
+class MoveFailure(OSError):
+    """A move failed; leave its source in staging for a later retry."""
+
+
+class TrackingFailure(RuntimeError):
+    """Persistence is unavailable; do not move an untracked file."""
+
+
+def _record(source, state, **kwargs):
+    try:
+        return plex_service.record_file_state(source, state, **kwargs)
+    except Exception as exc:
+        raise TrackingFailure(str(exc)) from exc
+
+
+def _record_failure(source, exc):
+    try:
+        plex_service.record_file_state(source, 'failed', error=str(exc))
+    except Exception:
+        logger.exception('Unable to record processing failure for %s', source)
 
 
 def get_new_downloads(src, dest, library):
@@ -60,7 +83,7 @@ def get_new_downloads(src, dest, library):
         elif os.path.isdir(os.path.join(download_dir, file)):
             # We are in a folder, process that folder first
             sub_dir = f'{download_dir}/{file}/'
-            new_files = get_new_downloads(src=sub_dir, dest=dest, library=library)
+            new_files = get_new_downloads(src=sub_dir, dest=dest, library=library) or new_files
             # Next, check if it's empty and delete it
             lingerers = os.listdir(sub_dir)
             if len(lingerers) == 0:
@@ -77,16 +100,31 @@ def get_new_downloads(src, dest, library):
         logger.info(f"Migrating {library}: {file}")
         src_path = os.path.join(f'{download_dir}/{file}')
         try:
+            size = os.path.getsize(src_path)
+            prior = _record(src_path, 'queued_for_plex', source_size=size)
+            if prior['completed']:
+                continue
+            _record(src_path, 'processing', source_size=size)
             if library == 'TV':
-                process_tv(item_path=src_path, dest=dest)
-                new_files = True
+                moved = process_tv(item_path=src_path, dest=dest)
+                new_files = bool(moved) or new_files
             elif library == 'Movies':
-                process_movie(item_path=src_path, dest=dest)
-                new_files = True
+                moved = process_movie(item_path=src_path, dest=dest)
+                new_files = bool(moved) or new_files
             else:
                 logger.error(f'Illegal library: {library}')
+                raise ValueError(f'Illegal library: {library}')
+            if not moved:
+                raise ValueError('Media naming did not produce a destination')
+            _record(src_path, 'completed', destination=moved)
+        except TrackingFailure as e:
+            logger.error('Processing tracking failed for %s: %s', src_path, e)
+        except MoveFailure as e:
+            logger.error('Move failed for %s: %s', src_path, e)
+            _record_failure(src_path, e)
         except Exception as e:
             logger.error(f'Error Processing Item: {e}')
+            _record_failure(src_path, e)
             quarantine_item(src_path)
 
     # Return whether or not we had files to move
@@ -106,7 +144,7 @@ def process_movie(item_path, dest):
 
     name = new_item.split(year)[0].replace('.', ' ').strip()
     new_name = f'{name.title()} ({year}).{extension}'
-    move_file(source=item_path, dest=dest, new_name=new_name, library='Movies')
+    return move_file(source=item_path, dest=dest, new_name=new_name, library='Movies')
 
 def process_tv(item_path, dest):
     # We need to get the series name
@@ -183,7 +221,7 @@ def process_tv(item_path, dest):
     else:
         new_name = f'{series} - S{season:02d}E{episode:02d}{ep_name}.{extension}'
 
-    move_file(
+    return move_file(
         source=item_path,
         dest=dest,
         new_name=new_name,
@@ -228,10 +266,17 @@ def move_file(source, dest, new_name, library, series=None, season=None):
     # Append our pre-calculated new name to the destination directory
     dest = f'{dest}/{new_name}'
     logger.info(f'Moving {source} ==> {dest}')
+    if os.path.exists(dest):
+        raise MoveFailure(f'Destination already exists: {dest}')
+    size = os.path.getsize(source)
+    _record(source, 'processing', destination=dest, source_size=size)
     try:
         shutil.move(source, dest)
     except Exception as e:
-        logger.error(f"Error moving {new_name}:\n{e}")
+        raise MoveFailure(f'Unable to move {source} to {dest}: {e}') from e
+    if not os.path.isfile(dest) or os.path.getsize(dest) != size or os.path.exists(source):
+        raise MoveFailure(f'Destination could not be verified: {dest}')
+    return dest
 
 
 def main():
@@ -255,7 +300,13 @@ def main():
     tv = plex.library.section('TV Shows')
     movies = plex.library.section('Movies')
 
+    plex_service.recover_processing_files()
+
     while True:
+        try:
+            plex_service.refresh_link_inventory()
+        except Exception:
+            logger.exception('Unable to refresh JD2 link inventory')
         for library in libraries:
             src_dir = f"{download_dir}/{library}"
             new_files = get_new_downloads(src=src_dir, dest=media_root, library=library)

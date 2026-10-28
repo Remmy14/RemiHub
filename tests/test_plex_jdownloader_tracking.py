@@ -1,5 +1,7 @@
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 import uuid
 from datetime import datetime
@@ -14,6 +16,14 @@ from backend.services import jdownloader_api_service as jd2, plex_service
 
 
 class JDownloaderClientTests(unittest.TestCase):
+    def test_extraction_calls_use_local_contract(self):
+        with patch.object(jd2, "_call", side_effect=[[], []]) as call:
+            self.assertEqual(jd2.get_extraction_queue(), [])
+            self.assertEqual(jd2.get_archive_info([11], [22]), [])
+        self.assertEqual(call.call_args_list[0].args, ("extraction/getQueue",))
+        self.assertEqual(call.call_args_list[1].args,
+                         ("extraction/getArchiveInfo", [11], [22]))
+
     def test_submission_uses_local_json_api_and_returns_job_id(self):
         response = Mock()
         response.status_code = 200
@@ -118,6 +128,25 @@ class SubmissionTests(unittest.TestCase):
 
 
 class MonitoringTests(unittest.TestCase):
+    def setUp(self):
+        self.tracking_patch = patch.object(
+            plex_service, "read_tracking",
+            return_value={"links": [], "processed": [], "event": None},
+        )
+        self.sync_patch = patch.object(plex_service, "sync_link_inventory")
+        self.packages_patch = patch.object(plex_service.jd2, "query_packages", return_value=[])
+        self.lifecycle_patch = patch.object(plex_service, "record_request_lifecycle")
+        self.tracking_patch.start()
+        self.sync_patch.start()
+        self.packages_patch.start()
+        self.lifecycle_patch.start()
+
+    def tearDown(self):
+        self.lifecycle_patch.stop()
+        self.packages_patch.stop()
+        self.sync_patch.stop()
+        self.tracking_patch.stop()
+
     def row(self, job_id=42, outcome="succeeded"):
         return {"id": uuid.uuid4(), "name": "Show", "category": "TV",
                 "requested_at": datetime(2026, 10, 28), "jd2_job_id": job_id,
@@ -158,7 +187,7 @@ class MonitoringTests(unittest.TestCase):
             [{"uuid": 7, "jobUUID": 42, "packageUUID": 11, "name": "show.mkv"}]
             if source == "linkgrabberv2" else []
         )
-        self.assertEqual(plex_service.get_downloads()["data"][0]["state"], "linkgrabber")
+        self.assertEqual(plex_service.get_downloads()["data"][0]["state"], "discovering")
         query.side_effect = lambda source, *_: (
             [] if source == "linkgrabberv2" else
             [{"uuid": 8, "jobUUID": 42, "packageUUID": 99, "name": "show.mkv",
@@ -208,15 +237,147 @@ class MonitoringTests(unittest.TestCase):
     def test_legacy_row_is_readable_without_jd_query(self, query, read):
         read.return_value = [self.row(None, None)]
         item = plex_service.get_downloads()["data"][0]
-        self.assertEqual(item["state"], "legacy")
+        self.assertEqual(item["state"], "submitted")
+        self.assertTrue(item["legacy"])
         query.assert_not_called()
+
+    def test_durable_completion_survives_jd_outage(self):
+        row = self.row()
+        with patch.object(plex_service, "_read_requests", return_value=[row]):
+            with patch.object(plex_service.jd2, "query_links",
+                              side_effect=jd2.JDownloaderError("offline")):
+                with patch.object(plex_service, "read_tracking", return_value={
+                    "links": [{"kind": "media", "finished": True}],
+                    "processed": [{"state": "completed", "link_id": 1,
+                                   "destination_path": "/plex/one.mkv",
+                                   "completed_at": datetime(2026, 10, 28), "error": None}],
+                    "event": {"state": "completed"},
+                }):
+                    item = plex_service.get_downloads()["data"][0]
+        self.assertEqual(item["state"], "completed")
+        self.assertEqual(item["completed_file_count"], 1)
+
+    def test_archive_remains_unresolved_without_output_manifest(self):
+        row = self.row()
+        item = plex_service._summary(row, [{"finished": True, "total_bytes": 10,
+            "bytes_downloaded": 10, "download_speed": 0, "eta": 0,
+            "extraction_status": None}], tracking={
+                "links": [{"kind": "archive", "finished": True, "extraction_status": None}],
+                "processed": [], "event": None})
+        self.assertEqual(item["state"], "waiting_for_extraction")
+        self.assertIsNone(item["file_count"])
+        self.assertFalse(item["cleanup_eligible"])
+
+    def test_lifecycle_summary_transitions(self):
+        row = self.row()
+        def summary(files=(), links=(), processed=(), event=None, unavailable=False):
+            return plex_service._summary(row, list(files), unavailable=unavailable,
+                tracking={"links": list(links), "processed": [
+                    {"completed_at": None, "error": None, "destination_path": None,
+                     "link_id": None, **item} for item in processed], "event": event})["state"]
+
+        queued = {"source": "downloads", "finished": False, "download_speed": 0,
+                  "total_bytes": 10, "bytes_downloaded": 0, "eta": 10,
+                  "extraction_status": None}
+        finished = {**queued, "finished": True, "bytes_downloaded": 10}
+        self.assertEqual(summary(), "discovering")
+        self.assertEqual(summary([queued]), "queued")
+        self.assertEqual(summary([{**queued, "download_speed": 2}]), "downloading")
+        self.assertEqual(summary([finished]), "download_complete")
+        self.assertEqual(summary([finished], processed=[{"state": "queued_for_plex"}]),
+                         "queued_for_plex")
+        self.assertEqual(summary([finished], processed=[{"state": "processing"}]), "processing")
+        self.assertEqual(summary([finished], processed=[{"state": "failed"}]), "failed")
+        self.assertEqual(summary([finished], event={"state": "completed"}), "completed")
+        self.assertEqual(summary(unavailable=True), "unavailable")
+        self.assertEqual(summary([finished], links=[{"kind": "archive", "finished": True,
+            "extraction_status": "running"}]), "extracting")
+
+    def test_exact_package_path_must_stay_inside_category_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "TV"
+            root.mkdir()
+            with patch.dict(plex_service.CATEGORY_PATHS, {"TV": str(root)}):
+                row = {"category": "TV"}
+                self.assertEqual(plex_service._source_path(row, {
+                    "name": "episode.mkv", "save_to": str(root / "Package")}),
+                    str(root / "Package" / "episode.mkv"))
+                self.assertIsNone(plex_service._source_path(row, {
+                    "name": "../episode.mkv", "save_to": str(root)}))
+                self.assertIsNone(plex_service._source_path(row, {
+                    "name": "episode.mkv", "save_to": str(Path(directory) / "Other")}))
+
+    def test_multifile_completion_requires_every_link(self):
+        from unittest.mock import MagicMock
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (True,)
+        cursor.fetchall.side_effect = [
+            [("media", True, "/stage/one.mkv", 1),
+             ("media", True, "/stage/two.mkv", 2)],
+            [("/stage/one.mkv", 1, "completed")],
+        ]
+        with patch.object(plex_service, "_append_request_event") as event:
+            plex_service._maybe_complete(cursor, "request")
+        event.assert_not_called()
+        cursor.fetchall.side_effect = [
+            [("media", True, "/stage/one.mkv", 1),
+             ("media", True, "/stage/two.mkv", 2)],
+            [("/stage/one.mkv", 1, "completed"),
+             ("/stage/two.mkv", 2, "completed")],
+        ]
+        with patch.object(plex_service, "_append_request_event") as event:
+            plex_service._maybe_complete(cursor, "request")
+        event.assert_called_once_with(cursor, "request", "completed")
+
+    def test_cleanup_is_disabled_without_mutating_jd2(self):
+        from contextlib import contextmanager
+        from unittest.mock import MagicMock
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (uuid.uuid4(),)
+
+        @contextmanager
+        def transaction():
+            yield cursor
+
+        with patch.object(plex_service, "_transaction", transaction):
+            with patch.object(jd2, "_call") as call:
+                with self.assertRaisesRegex(RuntimeError, "disabled"):
+                    plex_service.cleanup_download(str(uuid.uuid4()))
+        call.assert_not_called()
+
+    def test_restart_recovery_requires_destination_and_original_size(self):
+        from contextlib import contextmanager
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "missing.mkv"
+            destination = Path(directory) / "placed.mkv"
+            destination.write_bytes(b"media")
+            cursor = MagicMock()
+            cursor.fetchall.return_value = [(str(source), str(destination), 5)]
+
+            @contextmanager
+            def transaction():
+                yield cursor
+
+            with patch.object(plex_service, "_transaction", transaction):
+                with patch.object(plex_service, "record_file_state") as record:
+                    plex_service.recover_processing_files()
+            record.assert_called_once_with(str(source), "completed",
+                                           destination=str(destination))
+            cursor.fetchall.return_value = [(str(source), str(destination), 6)]
+            with patch.object(plex_service, "_transaction", transaction):
+                with patch.object(plex_service, "record_file_state") as record:
+                    plex_service.recover_processing_files()
+            record.assert_called_once_with(str(source), "failed",
+                error="Source missing and destination could not be verified")
 
 
 class EndpointCompatibilityTests(unittest.TestCase):
     def test_download_endpoints_require_authentication(self):
         app = FastAPI()
         app.include_router(plex.router, dependencies=[Depends(get_current_principal)])
-        paths = ("/plex/downloads", "/plex/downloads/{request_id}")
+        paths = ("/plex/downloads", "/plex/downloads/{request_id}",
+                 "/plex/downloads/{request_id}/cleanup")
         for route in app.routes:
             if getattr(route, "path", None) in paths:
                 dependencies = [dep.call for dep in route.dependant.dependencies]

@@ -15,6 +15,27 @@ from backend.database.migration_runner import (
 )
 
 
+HISTORICAL_MIGRATIONS = [
+    ("0001", "auth_foundation"),
+    ("0002", "remove_uv_alert_prototype"),
+    ("0003", "agent_workflow_foundation"),
+    ("0004", "agent_worker_leases"),
+    ("0005", "agent_repository_scope"),
+    ("0006", "weightlifting_foundation"),
+    ("0007", "service_health_current_snapshot"),
+    ("0008", "mead_foundation"),
+    ("0009", "fitness_foundation"),
+    ("0010", "fitness_planning_v2"),
+    ("0011", "fitness_garmin_running_results"),
+    ("0012", "fitness_repeat_training_week"),
+    ("0013", "fitness_cycling_discipline"),
+    ("0014", "vehicles_foundation"),
+    ("0015", "fitness_weight_tracking"),
+    ("0016", "finance_manual_accounts"),
+    ("0017", "plex_jdownloader_tracking"),
+]
+
+
 class MigrationDiscoveryTests(unittest.TestCase):
     def test_plex_jdownloader_tracking_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0017_plex_jdownloader_tracking.up.sql"
@@ -36,54 +57,30 @@ class MigrationDiscoveryTests(unittest.TestCase):
 
     def test_repository_migration_is_discoverable(self):
         migrations = discover_migrations(MIGRATIONS_DIR)
-
         self.assertEqual(
-            [(migration.version, migration.name) for migration in migrations],
-            [
-                ("0001", "auth_foundation"),
-                ("0002", "remove_uv_alert_prototype"),
-                ("0003", "agent_workflow_foundation"),
-                ("0004", "agent_worker_leases"),
-                ("0005", "agent_repository_scope"),
-                ("0006", "weightlifting_foundation"),
-                ("0007", "service_health_current_snapshot"),
-                ("0008", "mead_foundation"),
-                ("0009", "fitness_foundation"),
-                ("0010", "fitness_planning_v2"),
-                ("0011", "fitness_garmin_running_results"),
-                ("0012", "fitness_repeat_training_week"),
-                ("0013", "fitness_cycling_discipline"),
-                ("0014", "vehicles_foundation"),
-                ("0015", "fitness_weight_tracking"),
-                ("0016", "finance_manual_accounts"),
-                ("0017", "plex_jdownloader_tracking"),
-            ],
+            [(migration.version, migration.name) for migration in migrations[:len(HISTORICAL_MIGRATIONS)]],
+            HISTORICAL_MIGRATIONS,
         )
+        self.assertGreater(len(migrations), len(HISTORICAL_MIGRATIONS))
+        latest = migrations[-1]
+        self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
+        self.assertIsNotNone(latest.down_path)
+        GitBackendDeploymentManager._validate_migration_sql(latest.up_path, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(latest.down_path, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(latest.up_path, latest.down_path)
 
     def test_repository_candidate_history_contains_current_complete_identity(self):
         history = _expected_migration_history(MIGRATIONS_DIR)
 
         self.assertEqual(
-            [(item["version"], item["name"]) for item in history],
-            [
-                ("0001", "auth_foundation"),
-                ("0002", "remove_uv_alert_prototype"),
-                ("0003", "agent_workflow_foundation"),
-                ("0004", "agent_worker_leases"),
-                ("0005", "agent_repository_scope"),
-                ("0006", "weightlifting_foundation"),
-                ("0007", "service_health_current_snapshot"),
-                ("0008", "mead_foundation"),
-                ("0009", "fitness_foundation"),
-                ("0010", "fitness_planning_v2"),
-                ("0011", "fitness_garmin_running_results"),
-                ("0012", "fitness_repeat_training_week"),
-                ("0013", "fitness_cycling_discipline"),
-                ("0014", "vehicles_foundation"),
-                ("0015", "fitness_weight_tracking"),
-                ("0016", "finance_manual_accounts"),
-                ("0017", "plex_jdownloader_tracking"),
-            ],
+            [(item["version"], item["name"]) for item in history[:len(HISTORICAL_MIGRATIONS)]],
+            HISTORICAL_MIGRATIONS,
+        )
+        migrations = discover_migrations(MIGRATIONS_DIR)
+        self.assertEqual(
+            [(item["version"], item["name"], item["checksum"]) for item in history],
+            [(migration.version, migration.name, sha256_file(migration.up_path))
+             for migration in migrations],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))
 

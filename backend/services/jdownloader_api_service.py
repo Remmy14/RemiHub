@@ -91,6 +91,7 @@ def query_links(list_name: str, job_ids: list[int], start_at: int = 0, max_resul
         "status": True,
         "finished": True,
         "extractionStatus": True,
+        "packageUUID": True,
     })
     if not isinstance(data, list):
         raise JDownloaderError("JDownloader link query returned invalid data")
@@ -102,12 +103,33 @@ def query_packages(package_ids: list[int], start_at: int = 0, max_results: int =
         raise ValueError("JDownloader query exceeds bounds")
     data = _call("downloadsV2/queryPackages", {
         "packageUUIDs": package_ids, "startAt": start_at, "maxResults": max_results,
+        "uuid": True,
         "status": True, "bytesLoaded": True, "bytesTotal": True,
         "extractionStatus": True,
+        "saveTo": True,
     })
     if not isinstance(data, list):
         raise JDownloaderError("JDownloader package query returned invalid data")
     return data
+
+
+def get_extraction_queue():
+    data = _call("extraction/getQueue")
+    if not isinstance(data, list):
+        raise JDownloaderError("JDownloader extraction queue returned invalid data")
+    return data
+
+
+def get_archive_info(link_ids: list[int], package_ids: list[int]):
+    data = _call("extraction/getArchiveInfo", link_ids, package_ids)
+    if not isinstance(data, list):
+        raise JDownloaderError("JDownloader archive information returned invalid data")
+    return data
+
+
+def remove_links_only(link_ids: list[int]):
+    """Reserved for a separately verified JD2 operation; never called by this card."""
+    raise JDownloaderError("JD2 link-only removal semantics have not been verified")
 
 
 def get_current_state():

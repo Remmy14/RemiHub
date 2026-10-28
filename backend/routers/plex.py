@@ -50,3 +50,12 @@ def get_download(request_id: uuid.UUID):
         raise HTTPException(status_code=404, detail="Download request not found")
     return {"success": True, "data": result["data"][0], "jd2_available": result["jd2_available"]}
 
+
+@router.post("/downloads/{request_id}/cleanup", dependencies=[Depends(require_current_principal)])
+def cleanup_download(request_id: uuid.UUID):
+    try:
+        return plex_service.cleanup_download(str(request_id))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
