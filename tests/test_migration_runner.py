@@ -16,6 +16,13 @@ from backend.database.migration_runner import (
 
 
 class MigrationDiscoveryTests(unittest.TestCase):
+    def test_plex_jdownloader_tracking_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0017_plex_jdownloader_tracking.up.sql"
+        down = MIGRATIONS_DIR / "0017_plex_jdownloader_tracking.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
     def test_manual_finance_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0016_finance_manual_accounts.up.sql"
         down = MIGRATIONS_DIR / "0016_finance_manual_accounts.down.sql"
@@ -49,6 +56,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0014", "vehicles_foundation"),
                 ("0015", "fitness_weight_tracking"),
                 ("0016", "finance_manual_accounts"),
+                ("0017", "plex_jdownloader_tracking"),
             ],
         )
 
@@ -74,6 +82,7 @@ class MigrationDiscoveryTests(unittest.TestCase):
                 ("0014", "vehicles_foundation"),
                 ("0015", "fitness_weight_tracking"),
                 ("0016", "finance_manual_accounts"),
+                ("0017", "plex_jdownloader_tracking"),
             ],
         )
         self.assertTrue(all(len(item["checksum"]) == 64 for item in history))

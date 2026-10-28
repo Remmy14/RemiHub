@@ -8,6 +8,8 @@ import os
 import pwd
 import subprocess
 
+from backend.services import jdownloader_api_service as jd2
+
 from backend.models.health_models import (
     HealthComponent,
     HealthComponentGroup,
@@ -333,14 +335,14 @@ PATH_DEFINITIONS = (
         "download-temp-path",
         "Download Temp Path",
         HealthComponentGroup.MEDIA,
-        "/srv/remihub/Temp",
+        "/mnt/plex-pool/Temp",
         HealthComponentKind.PATH,
     ),
     PathDefinition(
         "jdownloader-watch-path",
         "JDownloader FolderWatch",
         HealthComponentGroup.MEDIA,
-        "/srv/remihub/Temp/JDownloaderWatch",
+        "/mnt/plex-pool/Temp/JDownloaderWatch",
         HealthComponentKind.PATH,
     ),
 )
@@ -372,7 +374,7 @@ JDOWNLOADER_PATHS = (
         "jdownloader-folderwatch-path",
         "JDownloader FolderWatch",
         HealthComponentGroup.MEDIA,
-        "/srv/remihub/Temp/JDownloaderWatch",
+        "/mnt/plex-pool/Temp/JDownloaderWatch",
         HealthComponentKind.PATH,
     ),
 )
@@ -1121,7 +1123,7 @@ def _jdownloader_user_runtime(username: str = JDOWNLOADER_USER) -> JDownloaderUs
         unit_file=home / ".config/systemd/user/jdownloader.service",
         enabled_link=(
             home
-            / ".config/systemd/user/graphical-session.target.wants/"
+            / ".config/systemd/user/default.target.wants/"
             / "jdownloader.service"
         ),
     )
@@ -1156,7 +1158,7 @@ def _jdownloader_session_unavailable(
         status=HealthStatus.DEGRADED,
         message=(
             f"{display_name} user session/systemd manager is not active; "
-            "JDownloader is unavailable until the graphical session is started"
+            "JDownloader is unavailable until the user systemd manager is started"
         ),
         path=str(runtime.unit_file),
         expected="active_user_session_systemd_manager",
@@ -1228,10 +1230,18 @@ def inspect_jdownloader_user_service() -> HealthDependencyCheck:
         if not runtime.enabled_link.exists():
             return _jdownloader_user_service_check(
                 status=HealthStatus.DEGRADED,
-                message="Alex user service is installed but not enabled for graphical session",
+                message="Alex user service is installed but not enabled for default.target",
                 path=str(runtime.unit_file),
                 expected="enabled_user_systemd_unit",
                 observed="installed_not_enabled",
+            )
+        if not (Path("/var/lib/systemd/linger") / runtime.username).exists():
+            return _jdownloader_user_service_check(
+                status=HealthStatus.DEGRADED,
+                message="Alex user lingering is not enabled",
+                path=str(runtime.unit_file),
+                expected="user_lingering_enabled",
+                observed="lingering_disabled",
             )
         if os.geteuid() != runtime.uid:
             return _jdownloader_user_service_check(
@@ -1400,16 +1410,35 @@ def inspect_jdownloader_process() -> HealthDependencyCheck:
     )
 
 
+def inspect_jdownloader_api() -> HealthDependencyCheck:
+    try:
+        jd2.get_version()
+    except jd2.JDownloaderError:
+        return HealthDependencyCheck(
+            id="jdownloader-local-api", name="JDownloader Local API",
+            kind=HealthComponentKind.PROCESS, status=HealthStatus.DEGRADED,
+            message="JDownloader localhost API is unavailable",
+            expected="api_reachable", observed="unavailable",
+        )
+    return HealthDependencyCheck(
+        id="jdownloader-local-api", name="JDownloader Local API",
+        kind=HealthComponentKind.PROCESS, status=HealthStatus.HEALTHY,
+        message="JDownloader localhost API is reachable",
+        expected="api_reachable", observed="reachable",
+    )
+
+
 def evaluate_jdownloader_component(checked_at: datetime) -> HealthComponent:
     checks = [_path_check(definition) for definition in JDOWNLOADER_PATHS]
     checks.append(inspect_jdownloader_user_service())
     checks.append(inspect_jdownloader_process())
+    checks.append(inspect_jdownloader_api())
 
     status = _combine_status([check.status for check in checks])
     if status == HealthStatus.HEALTHY:
-        message = "JDownloader runtime and required FolderWatch dependencies are healthy"
+        message = "JDownloader runtime, paths, and local API are healthy"
     elif HealthStatus.UNHEALTHY in {check.status for check in checks}:
-        message = "JDownloader required file or FolderWatch dependency is unhealthy"
+        message = "JDownloader required path or runtime dependency is unhealthy"
     elif HealthStatus.DEGRADED in {check.status for check in checks}:
         message = "JDownloader is installed but runtime signal is degraded"
     else:

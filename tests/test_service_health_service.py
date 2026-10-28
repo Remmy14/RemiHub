@@ -451,6 +451,18 @@ class ServiceHealthSystemdSemanticsTests(unittest.TestCase):
 
 
 class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
+    def setUp(self):
+        api_patch = patch(
+            "backend.services.service_health_service.inspect_jdownloader_api",
+            return_value=health.HealthDependencyCheck(
+                id="jdownloader-local-api", name="JDownloader Local API",
+                kind=HealthComponentKind.PROCESS, status=HealthStatus.HEALTHY,
+                message="reachable",
+            ),
+        )
+        api_patch.start()
+        self.addCleanup(api_patch.stop)
+
     def jdownloader_runtime(self, *, uid: int = 4242) -> health.JDownloaderUserRuntime:
         home = "/home/alex"
         runtime_dir = f"/run/user/{uid}"
@@ -463,7 +475,7 @@ class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
             unit_file=health.Path(home) / ".config/systemd/user/jdownloader.service",
             enabled_link=(
                 health.Path(home)
-                / ".config/systemd/user/graphical-session.target.wants/"
+                / ".config/systemd/user/default.target.wants/"
                 / "jdownloader.service"
             ),
         )
@@ -830,7 +842,7 @@ class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
         check = health.inspect_jdownloader_user_service()
 
         self.assertEqual(check.status, HealthStatus.DEGRADED)
-        self.assertIn("graphical session is started", check.message)
+        self.assertIn("user systemd manager is started", check.message)
         self.assertEqual(check.observed, "runtime_dir_unavailable")
         run.assert_not_called()
 
@@ -857,7 +869,7 @@ class ServiceHealthPathAndJDownloaderTests(unittest.TestCase):
         check = health.inspect_jdownloader_user_service()
 
         self.assertEqual(check.status, HealthStatus.DEGRADED)
-        self.assertIn("graphical session is started", check.message)
+        self.assertIn("user systemd manager is started", check.message)
         self.assertEqual(check.observed, "user_bus_unavailable")
         run.assert_not_called()
 
