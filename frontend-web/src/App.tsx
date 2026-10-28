@@ -41,7 +41,7 @@ const modules: ModuleEntry[] = [
     status: "Authenticated",
   },
   {
-    name: "Downloads",
+    name: "Plex Monitor",
     description: "Track downloads from submission through Plex processing.",
     href: "/portal/downloads",
     status: "Authenticated",
