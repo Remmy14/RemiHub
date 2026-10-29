@@ -283,6 +283,15 @@ def _safe_reimplementation_failure(card: dict, latest_run: dict | None) -> bool:
     if "rollback was incomplete" in error.lower():
         return False
 
+    # Allow an exact pre-candidate baseline mismatch to return
+    # to implementation. The checks above exclude production
+    # handoffs and incomplete rollbacks.
+    if error == (
+        "AgentDeploymentError: Deployment target advanced before "
+        "candidate creation"
+    ):
+        return True
+
     return any(marker in error for marker in (
         "Unable to apply the approved implementation patch",
         "Deployment candidate changed files do not match approval evidence",
