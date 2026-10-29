@@ -885,6 +885,22 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 
 
+def _snapshot_value(value) -> Decimal:
+    """Parse a required balance without turning missing or bad data into zero."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("missing or invalid balance")
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid balance") from exc
+    if not amount.is_finite():
+        raise ValueError("non-finite balance")
+    try:
+        return _money(amount)
+    except InvalidOperation as exc:
+        raise ValueError("balance cannot be represented as money") from exc
+
+
 def get_snapshot_month(target_date: date | None = None) -> date:
     target_date = target_date or date.today()
     return target_date.replace(day=1)
@@ -895,7 +911,7 @@ def _snapshot_totals(items: list[dict]) -> tuple[Decimal, Decimal, Decimal]:
     total_liabilities = Decimal("0")
 
     for item in items:
-        value = _to_decimal(item["value"])
+        value = _snapshot_value(item["value"])
         category = (item.get("asset_category") or "").lower()
 
         if category == "liability":
@@ -912,22 +928,35 @@ def _snapshot_totals(items: list[dict]) -> tuple[Decimal, Decimal, Decimal]:
     )
 
 
-def _get_existing_snapshot_id(snapshot_month: date) -> str | None:
-    conn = get_db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id
-                FROM finance_snapshots
-                WHERE snapshot_month = %s
-                """,
-                (snapshot_month,),
-            )
-            row = cur.fetchone()
-            return row[0] if row else None
-    finally:
-        put_db_conn(conn)
+def _locked_snapshot(cur, snapshot_month: date) -> tuple | None:
+    # Lock the month even if its row does not yet exist. Every writer uses the
+    # same transaction-level lock before inspecting or changing that month.
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        ("finance_snapshots", snapshot_month.isoformat()),
+    )
+    cur.execute(
+        "SELECT id, status FROM finance_snapshots WHERE snapshot_month = %s FOR UPDATE",
+        (snapshot_month,),
+    )
+    return cur.fetchone()
+
+
+def _snapshot_decision(row: tuple | None, *, force: bool, complete: bool,
+                       snapshot_month: date, errors: list[str]) -> dict | None:
+    existing_id = row[0] if row else None
+    if row and row[1] == "success" and not force:
+        return {"success": True, "skipped": True, "snapshot_id": existing_id,
+                "snapshot_month": snapshot_month.isoformat(),
+                "message": "Successful snapshot already exists for this month."}
+    if not complete:
+        return {"success": False, "skipped": False, "preserved": bool(row),
+                "status": "blocked_incomplete", "snapshot_id": existing_id,
+                "snapshot_month": snapshot_month.isoformat(),
+                "message": ("Incomplete collection rejected; existing snapshot preserved."
+                            if row else "Incomplete collection rejected; no snapshot created."),
+                "errors": errors}
+    return None
 
 
 def _get_configured_plaid_accounts() -> list[dict]:
@@ -1129,11 +1158,12 @@ def collect_plaid_snapshot_items() -> tuple[list[dict], list[str]]:
 def collect_manual_snapshot_items(
     *,
     excluded_valuation_keys: set[str] | None = None,
+    assets: list[dict] | None = None,
 ) -> list[dict]:
     excluded_valuation_keys = excluded_valuation_keys or set()
     items = []
 
-    for asset in get_manual_assets(included_only=True):
+    for asset in (assets if assets is not None else get_manual_assets(included_only=True)):
         valuation_key = asset.get("valuation_key")
 
         if valuation_key and valuation_key in excluded_valuation_keys:
@@ -1152,7 +1182,7 @@ def collect_manual_snapshot_items(
                 "label": asset["label"],
                 "institution_label": None,
                 "asset_category": asset["asset_category"],
-                "value": _money(_to_decimal(asset["current_value"])),
+                "value": _snapshot_value(asset.get("current_value")),
                 "include_in_net_worth": True,
                 "confidence": "manual",
                 "raw_payload": {
@@ -1185,7 +1215,7 @@ def collect_stubbed_valuation_items() -> list[dict]:
                 "label": value["label"],
                 "institution_label": None,
                 "asset_category": value.get("asset_category", "home"),
-                "value": _money(_to_decimal(value["value"])),
+                "value": value.get("value"),
                 "include_in_net_worth": True,
                 "confidence": value.get("confidence", "estimate"),
                 "raw_payload": value.get("raw_payload", {}),
@@ -1203,7 +1233,7 @@ def collect_stubbed_valuation_items() -> list[dict]:
                 "label": value["label"],
                 "institution_label": None,
                 "asset_category": value.get("asset_category", "vehicle"),
-                "value": _money(_to_decimal(value["value"])),
+                "value": value.get("value"),
                 "include_in_net_worth": True,
                 "confidence": value.get("confidence", "estimate"),
                 "raw_payload": value.get("raw_payload", {}),
@@ -1211,6 +1241,63 @@ def collect_stubbed_valuation_items() -> list[dict]:
         )
 
     return items
+
+
+def _configured_valuation_keys() -> set[str]:
+    """Keys for live sources that are expected to supply a value or fallback."""
+    sources = (("zillow_url", "home_primary"),
+               ("vehicle_kia_url", "vehicle_telluride"),
+               ("vehicle_ram_url", "vehicle_ram"))
+    return {key for setting, key in sources if finance_config.get(setting)}
+
+
+def _complete_snapshot_items(plaid_items: list[dict],
+                             valuation_items: list[dict]) -> list[dict]:
+    required_plaid = {account["source_account_id"] for account in
+                      _get_configured_plaid_accounts() if account["include_in_net_worth"]}
+    actual_plaid = [item.get("source_account_id") for item in plaid_items]
+    if len(actual_plaid) != len(set(actual_plaid)) or set(actual_plaid) != required_plaid:
+        raise ValueError("included Plaid accounts are missing or duplicated")
+
+    assets = get_manual_assets(included_only=True)
+    asset_ids = [str(asset["id"]) for asset in assets]
+    if len(asset_ids) != len(set(asset_ids)):
+        raise ValueError("included manual accounts are duplicated")
+    keyed_assets = [asset["valuation_key"] for asset in assets if asset.get("valuation_key")]
+    if len(keyed_assets) != len(set(keyed_assets)):
+        raise ValueError("manual valuation fallbacks are duplicated")
+    fallback_keys = set(keyed_assets)
+    valid_valuations = []
+    seen_keys = set()
+    for item in valuation_items:
+        key = item.get("valuation_key")
+        if not key or key in seen_keys:
+            raise ValueError("valuation source has a missing or duplicate key")
+        seen_keys.add(key)
+        try:
+            item["value"] = _snapshot_value(item.get("value"))
+        except ValueError:
+            # A bad live value may use a configured manual fallback, but may
+            # never contribute a zero-valued item by accident.
+            if key not in fallback_keys:
+                raise ValueError(f"valuation {key} is invalid and has no manual fallback")
+            continue
+        valid_valuations.append(item)
+
+    live_keys = {item["valuation_key"] for item in valid_valuations}
+    manual_items = collect_manual_snapshot_items(
+        excluded_valuation_keys=live_keys, assets=assets)
+    if {item["source_account_id"] for item in manual_items} != set(asset_ids) - {
+        str(asset["id"]) for asset in assets if asset.get("valuation_key") in live_keys
+    }:
+        raise ValueError("included manual accounts are missing")
+    covered_keys = live_keys | {item.get("valuation_key") for item in manual_items}
+    missing = _configured_valuation_keys() - covered_keys
+    if missing:
+        raise ValueError(f"configured valuations have no valid value or manual fallback: {sorted(missing)}")
+    for item in plaid_items + manual_items:
+        item["value"] = _snapshot_value(item.get("value"))
+    return plaid_items + manual_items + valid_valuations
 
 
 def create_monthly_finance_snapshot(
@@ -1221,49 +1308,40 @@ def create_monthly_finance_snapshot(
     """
     Create one monthly finance snapshot.
 
-    If force=False and a snapshot already exists for the month, this skips.
-    If force=True, it replaces that month's snapshot and snapshot items.
+    Successful months are skipped unless explicitly forced. Partial months
+    may be upgraded after a complete collection.
     """
     snapshot_month = get_snapshot_month(target_date)
-    existing_snapshot_id = _get_existing_snapshot_id(snapshot_month)
-
-    if existing_snapshot_id and not force:
-        return {
-            "success": True,
-            "skipped": True,
-            "snapshot_id": existing_snapshot_id,
-            "snapshot_month": snapshot_month.isoformat(),
-            "message": "Snapshot already exists for this month.",
-        }
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            row = _locked_snapshot(cur, snapshot_month)
+            decision = _snapshot_decision(row, force=force, complete=True,
+                                          snapshot_month=snapshot_month, errors=[])
+        conn.commit()
+        if decision:
+            return decision
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
 
     # Gather the items from various sources
     plaid_items, plaid_errors = collect_plaid_snapshot_items()
-    if plaid_errors:
-        return {
-            "success": False,
-            "skipped": False,
-            "status": "blocked_incomplete",
-            "snapshot_month": snapshot_month.isoformat(),
-            "snapshot_id": existing_snapshot_id,
-            "message": "Plaid account collection is incomplete; existing snapshot was preserved.",
-            "errors": plaid_errors,
-        }
-    valuation_items = collect_stubbed_valuation_items()
-
-    # Gather the keys for the manual items
-    overridden_valuation_keys = {
-        item["valuation_key"]
-        for item in valuation_items
-        if item.get("valuation_key")
-    }
-
-    manual_items = collect_manual_snapshot_items(
-        excluded_valuation_keys=overridden_valuation_keys
-    )
-
-    # Aggregate
-    snapshot_items = plaid_items + manual_items + valuation_items
-    total_assets, total_liabilities, net_worth = _snapshot_totals(snapshot_items)
+    errors = list(plaid_errors)
+    snapshot_items = []
+    if not errors:
+        try:
+            valuation_items = collect_stubbed_valuation_items()
+        except Exception as exc:
+            errors.append(f"valuation collection failed: {exc}")
+    if not errors:
+        try:
+            snapshot_items = _complete_snapshot_items(plaid_items, valuation_items)
+            total_assets, total_liabilities, net_worth = _snapshot_totals(snapshot_items)
+        except ValueError as exc:
+            errors.append(str(exc))
 
     status = "success"
     notes = None
@@ -1273,6 +1351,13 @@ def create_monthly_finance_snapshot(
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            row = _locked_snapshot(cur, snapshot_month)
+            decision = _snapshot_decision(row, force=force, complete=not errors,
+                                          snapshot_month=snapshot_month, errors=errors)
+            if decision:
+                conn.commit()
+                return decision
+            existing_snapshot_id = row[0] if row else None
             if existing_snapshot_id:
                 cur.execute(
                     """
@@ -1358,12 +1443,12 @@ def create_monthly_finance_snapshot(
         "status": status,
         "item_count": len(snapshot_items),
         "plaid_item_count": len(plaid_items),
-        "manual_item_count": len(manual_items),
-        "valuation_item_count": len(valuation_items),
+        "manual_item_count": sum(item["source"] == "manual" for item in snapshot_items),
+        "valuation_item_count": sum(item["source"] in ("zillow", "kbb") for item in snapshot_items),
         "total_assets": float(total_assets),
         "total_liabilities": float(total_liabilities),
         "net_worth": float(net_worth),
-        "errors": plaid_errors,
+        "errors": errors,
     }
 
 def send_finance_snapshot_notification(result: dict) -> None:

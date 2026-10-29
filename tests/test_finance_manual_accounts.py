@@ -300,10 +300,10 @@ class ManualSnapshotTests(unittest.TestCase):
                 "label": ACCOUNT["name"], "institution_label": None,
                 "asset_category": "retirement", "value": Decimal("13000.00"),
                 "include_in_net_worth": True, "confidence": "manual", "raw_payload": {}}
-        with patch.object(worker, "_get_existing_snapshot_id", return_value=None), \
+        with patch.object(worker, "_locked_snapshot", return_value=None), \
              patch.object(worker, "collect_plaid_snapshot_items", return_value=([], [])), \
              patch.object(worker, "collect_stubbed_valuation_items", return_value=[]), \
-             patch.object(worker, "collect_manual_snapshot_items", return_value=[item]), \
+             patch.object(worker, "_complete_snapshot_items", return_value=[item]), \
              patch.object(worker, "get_db_conn", return_value=Connection()), \
              patch.object(worker, "put_db_conn"):
             result = worker.create_monthly_finance_snapshot(target_date=date(2026, 11, 1))
