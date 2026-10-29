@@ -19,6 +19,7 @@ from plaid.api import plaid_api
 from plaid.api_client import ApiClient
 from plaid.configuration import Configuration
 from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+from plaid.model.accounts_get_request import AccountsGetRequest
 
 from cryptography.fernet import Fernet
 
@@ -929,18 +930,85 @@ def _get_existing_snapshot_id(snapshot_month: date) -> str | None:
         put_db_conn(conn)
 
 
+def _get_configured_plaid_accounts() -> list[dict]:
+    """Read account ownership and inclusion before fetching Plaid accounts."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_account_id, institution_label, name, include_in_net_worth
+                FROM finance_accounts
+                WHERE source = 'plaid'
+                """
+            )
+            return [
+                {"source_account_id": row[0], "institution_label": row[1],
+                 "name": row[2], "include_in_net_worth": row[3]}
+                for row in cur.fetchall()
+            ]
+    finally:
+        put_db_conn(conn)
+
+
+def _required_plaid_balance(account: dict) -> Decimal:
+    balances = account.get("balances")
+    if not isinstance(balances, dict) or balances.get("current") is None:
+        raise ValueError("missing balances.current")
+    current = balances["current"]
+    if isinstance(current, bool):
+        raise ValueError("invalid balances.current")
+    try:
+        value = Decimal(str(current))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("invalid balances.current") from exc
+    if not value.is_finite():
+        raise ValueError("non-finite balances.current")
+    return value
+
+
 def collect_plaid_snapshot_items() -> tuple[list[dict], list[str]]:
     """
-    Pull current Plaid balances, upsert discovered accounts, and return only
-    accounts explicitly included in net worth.
+    Pull Plaid's cached balances, verify every included account, and return
+    only accounts explicitly included in net worth.
 
     New Plaid accounts discovered here still default to excluded because
     upsert_finance_account() preserves that behavior.
     """
     snapshot_items = []
     errors = []
-
     plaid_items = get_enabled_plaid_items()
+    configured_accounts = _get_configured_plaid_accounts()
+    items_by_label = {}
+    for item in plaid_items:
+        items_by_label.setdefault(item["label"], []).append(item)
+
+    required_by_label = {}
+    configured_by_id = {}
+    item_errors = {}
+    for account in configured_accounts:
+        label = account["institution_label"]
+        account_id = account["source_account_id"]
+        if account_id in configured_by_id:
+            errors.append(f"Plaid account {account_id} has ambiguous configured ownership")
+            for owner in (configured_by_id[account_id], account):
+                for item in items_by_label.get(owner["institution_label"], []):
+                    item_errors[item["id"]] = f"ambiguous configured ownership for account {account_id}"
+        configured_by_id[account_id] = account
+        if not account["include_in_net_worth"]:
+            continue
+        required_by_label.setdefault(label, {})[account["source_account_id"]] = account
+        if not items_by_label.get(label):
+            errors.append(
+                f"Plaid account {account['source_account_id']} ({account['name']}) "
+                f"has no enabled connection for institution {label!r}"
+            )
+
+    # The account table identifies Plaid accounts by source_account_id alone.
+    # Reject ambiguous labels or IDs rather than attributing an account to a
+    # different connection and producing an incorrect net worth.
+    fetched = []
+    seen_ids = {}
 
     for item in plaid_items:
         plaid_item_db_id = item["id"]
@@ -951,20 +1019,69 @@ def collect_plaid_snapshot_items() -> tuple[list[dict], list[str]]:
             client = get_plaid_client(environment)
             access_token = decrypt_access_token(item["access_token_encrypted"])
 
-            response = client.accounts_balance_get(
-                AccountsBalanceGetRequest(access_token=access_token)
+            response = client.accounts_get(
+                AccountsGetRequest(access_token=access_token)
             )
             response_dict = response.to_dict()
+            if not isinstance(response_dict, dict) or not isinstance(response_dict.get("accounts"), list):
+                raise ValueError("unexpected accounts_get response: accounts list missing")
 
-            for account in response_dict.get("accounts", []):
-                balances = account.get("balances") or {}
+            accounts = {}
+            for account in response_dict["accounts"]:
+                if not isinstance(account, dict) or not isinstance(account.get("account_id"), str) or not account["account_id"]:
+                    raise ValueError("unexpected accounts_get response: invalid account_id")
+                account_id = account["account_id"]
+                if account_id in accounts:
+                    raise ValueError(f"duplicate Plaid account {account_id}")
+                configured = configured_by_id.get(account_id)
+                if configured and configured["institution_label"] != institution_label:
+                    raise ValueError(
+                        f"Plaid account {account_id} belongs to configured institution "
+                        f"{configured['institution_label']!r}, not {institution_label!r}"
+                    )
+                accounts[account_id] = account
+                previous_item = seen_ids.setdefault(account_id, plaid_item_db_id)
+                if previous_item != plaid_item_db_id:
+                    collision = f"Plaid account {account_id} returned by multiple connections"
+                    item_errors[previous_item] = collision
+                    item_errors[plaid_item_db_id] = collision
 
+            fetched.append((item, accounts))
+
+        except Exception as exc:
+            item_errors[plaid_item_db_id] = str(exc)
+
+    fetched_by_id = {item["id"]: accounts for item, accounts in fetched}
+    for label, required in required_by_label.items():
+        for account_id, configured in required.items():
+            item_id = seen_ids.get(account_id)
+            if item_id is None:
+                reason = f"missing included account {account_id} ({configured['name']})"
+                for item in items_by_label.get(label, []):
+                    previous = item_errors.get(item["id"])
+                    item_errors[item["id"]] = f"{previous}; {reason}" if previous else reason
+                continue
+            account = fetched_by_id.get(item_id, {}).get(account_id)
+            if account is None or item_id in item_errors:
+                continue
+            try:
+                _required_plaid_balance(account)
+            except ValueError as exc:
+                item_errors[item_id] = f"included account {account_id} ({configured['name']}): {exc}"
+
+    for item, accounts in fetched:
+        item_id = item["id"]
+        if item_id in item_errors:
+            continue
+        institution_label = item["label"]
+        try:
+            item_snapshot_items = []
+            for account_id, account in accounts.items():
                 account_type = _safe_str(account.get("type"))
                 subtype = _safe_str(account.get("subtype"))
-
                 stored_account = upsert_finance_account(
                     source="plaid",
-                    source_account_id=account["account_id"],
+                    source_account_id=account_id,
                     institution_label=institution_label,
                     name=account.get("name") or "Unknown account",
                     official_name=account.get("official_name"),
@@ -973,40 +1090,38 @@ def collect_plaid_snapshot_items() -> tuple[list[dict], list[str]]:
                     subtype=subtype,
                     asset_category=infer_asset_category(account_type, subtype),
                 )
-
                 if not stored_account["include_in_net_worth"]:
                     continue
-
-                display_label = (
-                    stored_account.get("display_name")
-                    or stored_account.get("name")
-                    or account.get("name")
-                    or "Unknown account"
-                )
-
-                snapshot_items.append(
-                    {
-                        "source": "plaid",
-                        "source_account_id": account["account_id"],
-                        "label": display_label,
-                        "institution_label": institution_label,
-                        "asset_category": stored_account["asset_category"],
-                        "value": _money(_to_decimal(balances.get("current"))),
-                        "include_in_net_worth": True,
-                        "confidence": "plaid",
-                        "raw_payload": {
-                            "account": account,
-                            "balances": balances,
-                        },
-                    }
-                )
-
-            mark_plaid_item_success(plaid_item_db_id)
-
+                if account_id not in required_by_label.get(institution_label, {}):
+                    raise ValueError(f"included account {account_id} changed during collection")
+                balance = _required_plaid_balance(account)
+                item_snapshot_items.append({
+                    "source": "plaid",
+                    "source_account_id": account_id,
+                    "label": stored_account.get("display_name") or stored_account.get("name") or account.get("name") or "Unknown account",
+                    "institution_label": institution_label,
+                    "asset_category": stored_account["asset_category"],
+                    "value": _money(balance),
+                    "include_in_net_worth": True,
+                    "confidence": "plaid",
+                    "raw_payload": {"account": account, "balances": account["balances"]},
+                })
+            expected_ids = {
+                account_id for account_id in required_by_label.get(institution_label, {})
+                if seen_ids.get(account_id) == item_id
+            }
+            if {entry["source_account_id"] for entry in item_snapshot_items} != expected_ids:
+                raise ValueError("included accounts changed during collection")
+            mark_plaid_item_success(item_id)
+            snapshot_items.extend(item_snapshot_items)
         except Exception as exc:
-            error = f"{institution_label}: {exc}"
+            item_errors[item_id] = str(exc)
+
+    for item in plaid_items:
+        if item["id"] in item_errors:
+            error = f"{item['label']} (connection {item['id']}): {item_errors[item['id']]}"
             errors.append(error)
-            mark_plaid_item_error(plaid_item_db_id, error)
+            mark_plaid_item_error(item["id"], error)
 
     return snapshot_items, errors
 
@@ -1123,6 +1238,16 @@ def create_monthly_finance_snapshot(
 
     # Gather the items from various sources
     plaid_items, plaid_errors = collect_plaid_snapshot_items()
+    if plaid_errors:
+        return {
+            "success": False,
+            "skipped": False,
+            "status": "blocked_incomplete",
+            "snapshot_month": snapshot_month.isoformat(),
+            "snapshot_id": existing_snapshot_id,
+            "message": "Plaid account collection is incomplete; existing snapshot was preserved.",
+            "errors": plaid_errors,
+        }
     valuation_items = collect_stubbed_valuation_items()
 
     # Gather the keys for the manual items
@@ -1140,8 +1265,8 @@ def create_monthly_finance_snapshot(
     snapshot_items = plaid_items + manual_items + valuation_items
     total_assets, total_liabilities, net_worth = _snapshot_totals(snapshot_items)
 
-    status = "success" if not plaid_errors else "partial_success"
-    notes = None if not plaid_errors else "\n".join(plaid_errors)
+    status = "success"
+    notes = None
 
     snapshot_id = str(uuid4())
 
@@ -1219,7 +1344,9 @@ def create_monthly_finance_snapshot(
                 )
 
         conn.commit()
-
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         put_db_conn(conn)
 
@@ -1240,6 +1367,8 @@ def create_monthly_finance_snapshot(
     }
 
 def send_finance_snapshot_notification(result: dict) -> None:
+    if not result.get("success") or result.get("skipped"):
+        return
     snapshot_month = result.get("snapshot_month")
     status = result.get("status")
     net_worth = result.get("net_worth")
@@ -1275,6 +1404,12 @@ def send_finance_snapshot_notification(result: dict) -> None:
 
 def preview_monthly_finance_snapshot_items() -> str:
     plaid_items, plaid_errors = collect_plaid_snapshot_items()
+    if plaid_errors:
+        return json.dumps({
+            "success": False,
+            "status": "blocked_incomplete",
+            "errors": plaid_errors,
+        }, indent=2)
     valuation_items = collect_stubbed_valuation_items()
 
     overridden_valuation_keys = {
@@ -1326,6 +1461,14 @@ def run_finance_worker():
                     "Finance snapshot skipped: %s",
                     result.get("message", "snapshot already exists"),
                 )
+            elif not result.get("success"):
+                logger.warning(
+                    "Finance snapshot blocked: month=%s status=%s",
+                    result.get("snapshot_month"),
+                    result.get("status"),
+                )
+                for error in result.get("errors") or []:
+                    logger.warning("Finance snapshot collection error: %s", error)
             else:
                 logger.info(
                     "Finance snapshot created: month=%s status=%s net_worth=%s items=%s",
