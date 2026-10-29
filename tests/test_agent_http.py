@@ -198,7 +198,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         schema = admin_app.openapi()
         paths = schema["paths"]
 
-        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 9)
+        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 10)
         self.assertEqual(
             paths["/agent/cards"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"],
@@ -209,6 +209,20 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             ["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/AgentCardResponse",
         )
+        recovery = paths[
+            "/agent/cards/{card_id}/return-to-implementation"
+        ]["post"]
+        self.assertEqual(
+            recovery["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+            "#/components/schemas/AgentCardResponse",
+        )
+        self.assertEqual(
+            recovery["responses"]["409"]["content"]["application/json"]
+            ["schema"]["$ref"],
+            "#/components/schemas/AgentErrorResponse",
+        )
+
         retry = paths["/agent/cards/{card_id}/retry"]["post"]
         self.assertEqual(
             retry["responses"]["409"]["content"]["application/json"]
