@@ -40,6 +40,7 @@ from backend.routers import (
         mead,
         spotify,
         vehicles,
+        blue_jackets,
     )
 from backend.tasks import (
         swimming_pool_monitor,
@@ -53,6 +54,7 @@ from backend.tasks import (
         finance_worker,
         kids_investing_worker,
         mead_task_worker,
+        blue_jackets_worker,
     )
 
 TEST_MODE = False
@@ -96,6 +98,7 @@ async def lifespan(app: FastAPI):
             finance_worker.run_finance_worker,
             kids_investing_worker.run_kids_investing_worker,
             mead_task_worker.run_mead_task_worker,
+            blue_jackets_worker.run_blue_jackets_worker,
         ]
 
         # 0 - Kick off the Threads
@@ -145,6 +148,7 @@ protected_routers = [
     weightlifting.router,
     spotify.router,
     vehicles.router,
+    blue_jackets.router,
 ]
 
 for router in protected_routers:
