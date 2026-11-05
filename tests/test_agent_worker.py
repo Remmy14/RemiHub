@@ -289,7 +289,7 @@ class FakeAgentExecutorTests(unittest.TestCase):
         )
         self.assertEqual(
             executor.execute(claimed_run(phase=RunPhase.IMPLEMENTATION)).card_status,
-            CardStatus.REVIEW_READY,
+            CardStatus.REVIEW_QUEUED,
         )
         self.assertEqual(
             executor.execute(claimed_run(phase=RunPhase.DEPLOYMENT)).card_status,

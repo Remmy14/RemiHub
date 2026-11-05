@@ -142,7 +142,7 @@ class AgentQueue(Protocol):
 class FakeAgentExecutor:
     """Deterministic executor for QA queue validation only."""
 
-    allowed_phases = frozenset(RunPhase)
+    allowed_phases = frozenset({RunPhase.PLANNING, RunPhase.IMPLEMENTATION, RunPhase.DEPLOYMENT})
     allowed_repository_scopes = frozenset(RepositoryScope)
 
     def execute(self, claim: ClaimedRun) -> ExecutionResult:
@@ -163,9 +163,12 @@ class FakeAgentExecutor:
                     "Fake implementation executor completed. No repository files "
                     "were modified."
                 ),
-                card_status=CardStatus.REVIEW_READY,
+                card_status=CardStatus.REVIEW_QUEUED,
                 metadata={"executor": "fake", "phase": claim.phase.value},
             )
+
+        if claim.phase is RunPhase.REVIEW:
+            raise AgentWorkerConfigurationError("Fake executor cannot pass independent review")
 
         return ExecutionResult(
             message=(

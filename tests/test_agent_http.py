@@ -198,7 +198,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         schema = admin_app.openapi()
         paths = schema["paths"]
 
-        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 10)
+        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 11)
         self.assertEqual(
             paths["/agent/cards"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"],
@@ -208,6 +208,15 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             paths["/agent/cards/{card_id}"]["get"]["responses"]["200"]
             ["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/AgentCardResponse",
+        )
+        revision = paths["/agent/cards/{card_id}/request-revision"]["post"]
+        self.assertEqual(
+            revision["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AgentReviewRevisionRequest",
+        )
+        self.assertEqual(
+            revision["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AgentErrorResponse",
         )
         recovery = paths[
             "/agent/cards/{card_id}/return-to-implementation"
@@ -236,3 +245,32 @@ class AgentHttpBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HumanReviewHttpTests(unittest.TestCase):
+    def payload(self):
+        return {"review_run_id": "58debd09-e31c-4b5f-9f19-d9dff4bf3f71",
+                "candidate_digest": "a" * 64, "notes": "Fix required issue, defer cosmetic change",
+                "decisions": [{"finding_index": 0, "decision": "fix"},
+                              {"finding_index": 1, "decision": "defer_ignore"}]}
+
+    @patch("backend.routers.agent.agent_service.request_review_revision")
+    def test_authenticated_actor_and_exact_request(self, request_revision):
+        request_revision.return_value = card_detail(status="implementation_queued")
+        payload = self.payload()
+        response = admin_client.post(f"/agent/cards/{CARD_ID}/request-revision", json=payload)
+        self.assertEqual(response.status_code, 200)
+        request_revision.assert_called_once_with(card_id=CARD_ID, requested_by=USER_ID, **payload)
+
+    @patch("backend.routers.agent.agent_service.request_review_revision")
+    def test_authentication_validation_and_conflict(self, request_revision):
+        path = f"/agent/cards/{CARD_ID}/request-revision"
+        with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": "transition"}, clear=True):
+            self.assertEqual(strict_client.post(path, json=self.payload()).status_code, 401)
+        request_revision.assert_not_called()
+        for delta in ({"notes": " "}, {"actor_user_id": USER_ID}, {"decisions": []},
+                      {"candidate_digest": "stale"}):
+            self.assertEqual(admin_client.post(path, json={**self.payload(), **delta}).status_code, 422)
+        request_revision.assert_not_called()
+        request_revision.side_effect = AgentConflictError("Stale third review")
+        self.assertEqual(admin_client.post(path, json=self.payload()).status_code, 409)

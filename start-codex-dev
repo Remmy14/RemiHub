@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+[ "$#" -eq 0 ] || { echo "This launcher accepts no arguments." >&2; exit 2; }
+cd /home/alex/remihub-infra-dev
+umask 077
+export CODEX_HOME=/home/alex/remihub-infra-codex-home
+mkdir -p "$CODEX_HOME"
+exec /opt/remihub-agent/runtime/venv/lib/python3.12/site-packages/codex_cli_bin/bin/codex --sandbox workspace-write --ask-for-approval on-request -c sandbox_workspace_write.network_access=false

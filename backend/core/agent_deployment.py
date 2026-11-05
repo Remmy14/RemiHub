@@ -1367,7 +1367,8 @@ class PrivilegedDeploymentRuntime:
                 f"Deployment service is not active: {status_output or 'unknown'}"
             )
         last_error: Exception | None = None
-        for attempt in range(self.health_attempts):
+        deadline = time.monotonic() + 60.0
+        while True:
             try:
                 request = urllib.request.Request(
                     self.health_url,
@@ -1399,8 +1400,10 @@ class PrivilegedDeploymentRuntime:
                 urllib.error.URLError,
             ) as exc:
                 last_error = exc
-                if attempt + 1 < self.health_attempts:
-                    time.sleep(self.health_delay_seconds)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(2.0, remaining))
         raise AgentDeploymentError(
             f"Deployment health verification failed: {last_error}"
         )
@@ -1573,6 +1576,7 @@ class GitBackendDeploymentManager:
             "frontend-web/postcss.config.cjs",
             "frontend-web/tailwind.config.js",
             "frontend-web/README.md",
+            "frontend-web/FINANCE.md",
             "frontend-web/.gitignore",
         }
     )
@@ -2491,6 +2495,25 @@ class GitBackendDeploymentManager:
             )
         self._reject_special_git_modes(approved_patch)
         patch_sha256 = hashlib.sha256(approved_patch).hexdigest()
+        from backend.core.codex_review import candidate_digest, parse_verdict
+        review = metadata.get("independent_review", {})
+        try:
+            digest = candidate_digest(metadata, run_id=source.implementation_run_id, revision=claim.card_revision)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AgentDeploymentError("Independent review candidate identity is missing") from exc
+        if (metadata.get("candidate_digest") != digest or workspace.get("patch_sha256") != patch_sha256
+            or review.get("verdict") != "pass" or review.get("candidate_digest") != digest
+            or review.get("implementation_run_id") != source.implementation_run_id
+            or review.get("card_revision") != claim.card_revision
+            or not review.get("thread_id") or not review.get("turn_id")
+            or not review.get("validation_evidence")):
+            raise AgentDeploymentError("Deployment requires a passing independent review of this exact candidate")
+
+        try:
+            parse_verdict(json.dumps({k: review.get(k) for k in ("verdict", "summary", "findings")}))
+        except (TypeError, ValueError) as exc:
+            raise AgentDeploymentError("Deployment requires a passing independent review of this exact candidate") from exc
+
         expected_tree = self._worktree_tree(expected_worktree, changed_files)
 
         return ApprovedImplementation(
@@ -2607,6 +2630,8 @@ class GitBackendDeploymentManager:
             self._require_clean(candidate_path)
             self._run_git(
                 candidate_path,
+                "-c",
+                "core.whitespace=-blank-at-eof",
                 "apply",
                 "--index",
                 "--binary",
@@ -2777,7 +2802,44 @@ class GitBackendDeploymentManager:
         )
 
     @staticmethod
-    def _validate_migration_sql(path: Path, *, direction: str) -> None:
+    def _strip_safe_check_constraint_replacements(
+        sql: str,
+    ) -> tuple[str, set[tuple[str, str]]]:
+        """Remove narrowly reversible CHECK replacements from destructive scanning.
+
+        Only this exact shape is exempted:
+
+            ALTER TABLE <table>
+                DROP CONSTRAINT <name>;
+            ALTER TABLE <same table>
+                ADD CONSTRAINT <same name>
+                CHECK (...);
+
+        The migration-pair validator separately requires the down migration to
+        contain the reciprocal replacement for every exempted up replacement.
+        """
+        identifier = r"[a-z_][a-z0-9_$]*(?:\.[a-z_][a-z0-9_$]*)?"
+        constraint_name = r"[a-z_][a-z0-9_$]*"
+        pattern = re.compile(
+            rf"\bALTER\s+TABLE\s+({identifier})\s+"
+            rf"DROP\s+CONSTRAINT\s+({constraint_name})\s*;\s*"
+            rf"ALTER\s+TABLE\s+\1\s+"
+            rf"ADD\s+CONSTRAINT\s+\2\s+CHECK\s*\(",
+            flags=re.IGNORECASE,
+        )
+
+        replacements: set[tuple[str, str]] = set()
+
+        def replace(match: re.Match[str]) -> str:
+            replacements.add(
+                (match.group(1).lower(), match.group(2).lower())
+            )
+            return " "
+
+        return pattern.sub(replace, sql), replacements
+
+    @classmethod
+    def _validate_migration_sql(cls, path: Path, *, direction: str) -> None:
         if path.is_symlink() or not path.is_file():
             raise AgentDeploymentError("Migration must be a regular file")
         if path.stat().st_size > 500_000:
@@ -2817,6 +2879,9 @@ class GitBackendDeploymentManager:
                 )
 
         if direction == "up":
+            destructive_scan_sql, _ = (
+                cls._strip_safe_check_constraint_replacements(normalized)
+            )
             destructive_patterns = (
                 r"\bDROP\s+(?:TABLE|SCHEMA|TYPE|INDEX|SEQUENCE|VIEW|MATERIALIZED\s+VIEW)\b",
                 r"\bTRUNCATE\b",
@@ -2826,7 +2891,11 @@ class GitBackendDeploymentManager:
                 r"\bALTER\s+TABLE\b[\s\S]*?\bALTER\s+COLUMN\b[\s\S]*?\bDROP\s+(?:DEFAULT|NOT\s+NULL)\b",
             )
             for pattern in destructive_patterns:
-                if re.search(pattern, normalized, flags=re.IGNORECASE):
+                if re.search(
+                    pattern,
+                    destructive_scan_sql,
+                    flags=re.IGNORECASE,
+                ):
                     raise AgentDeploymentError(
                         "Destructive or irreversible up migrations are blocked"
                     )
@@ -2835,6 +2904,25 @@ class GitBackendDeploymentManager:
     def _validate_migration_pair(cls, up_path: Path, down_path: Path) -> None:
         up_sql = cls._normalized_migration_sql(up_path)
         down_sql = cls._normalized_migration_sql(down_path)
+
+        _, up_check_replacements = (
+            cls._strip_safe_check_constraint_replacements(up_sql)
+        )
+        _, down_check_replacements = (
+            cls._strip_safe_check_constraint_replacements(down_sql)
+        )
+        missing_check_reversals = (
+            up_check_replacements - down_check_replacements
+        )
+        if missing_check_reversals:
+            table_name, constraint_name = sorted(
+                missing_check_reversals
+            )[0]
+            raise AgentDeploymentError(
+                "Up CHECK constraint replacement must be reversed "
+                "by its down migration: "
+                f"{table_name}.{constraint_name}"
+            )
         if re.search(r"\bCASCADE\b", down_sql, flags=re.IGNORECASE):
             raise AgentDeploymentError(
                 "Automatic down migrations may not use CASCADE"
@@ -2947,7 +3035,9 @@ class GitBackendDeploymentManager:
                 )
             allowed = False
             frontend_file = False
-            if len(pure_path.parts) >= 2 and pure_path.parts[0] == "backend":
+            if relative == "requirements.txt":
+                allowed = True
+            elif len(pure_path.parts) >= 2 and pure_path.parts[0] == "backend":
                 allowed = pure_path.suffix == ".py"
                 if pure_path.parts[:3] == (
                     "backend",
@@ -2966,7 +3056,7 @@ class GitBackendDeploymentManager:
                 allowed = self._frontend_path_allowed(relative, pure_path)
             if not allowed:
                 raise AgentDeploymentError(
-                    "Backend deployment permits only backend Python, tests, docs, "
+                    "Backend deployment permits only requirements.txt, backend Python, tests, docs, "
                     "paired SQL migration files, and reviewed frontend-web source files"
                 )
 

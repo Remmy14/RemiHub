@@ -136,7 +136,8 @@ def _failure_metadata(existing: object) -> dict:
     pipeline = metadata.get("deployment_pipeline")
     if isinstance(pipeline, dict):
         return {"deployment_pipeline": pipeline}
-    return {}
+    return {k: metadata[k] for k in ("review_cycle", "review_attempt", "review_findings",
+                                     "human_review_handoffs", "review_source") if k in metadata}
 
 
 def _deployment_source_from_row(row: dict) -> DeploymentSource | None:
@@ -210,6 +211,12 @@ def _validate_candidate(row: dict) -> tuple[RunPhase, CardStatus, CardStatus]:
             f"{expected.value}"
         )
 
+    if phase is RunPhase.REVIEW:
+        source = _normalized_metadata(row.get("result_metadata")).get("review_source", {})
+        if (str(row.get("review_cycle")) != source.get("review_cycle")
+            or row.get("review_attempt") != source.get("review_attempt")
+            or type(row.get("review_attempt")) is not int or not 1 <= row["review_attempt"] <= 3):
+            raise AgentQueueStateError("Review claim has inconsistent durable attempt identity")
     if phase is RunPhase.DEPLOYMENT:
         if _deployment_source_from_row(row) is None:
             raise AgentQueueStateError(
@@ -303,6 +310,8 @@ def claim_next_run(
                        runs.card_revision,
                        runs.attempt_count,
                        runs.result_metadata,
+                       runs.review_cycle,
+                       runs.review_attempt,
                        runs.worker_id AS previous_worker_id,
                        runs.lease_expires_at AS previous_lease_expires_at,
                        cards.status AS card_status,
@@ -316,8 +325,10 @@ def claim_next_run(
                        cards.codex_thread_id,
                        deployment_approval.id AS deployment_approval_id,
                        implementation_run.id AS implementation_run_id,
-                       implementation_run.result_metadata
-                           AS implementation_result_metadata
+                       CASE WHEN independent_review.id IS NOT NULL THEN
+                           implementation_run.result_metadata || jsonb_build_object(
+                               'independent_review', independent_review.result_metadata -> 'independent_review')
+                       ELSE implementation_run.result_metadata END AS implementation_result_metadata
                 FROM agent.runs AS runs
                 JOIN agent.cards AS cards
                   ON cards.id = runs.card_id
@@ -350,6 +361,17 @@ def claim_next_run(
                  AND implementation_run.phase = 'implementation'
                  AND implementation_run.status = 'succeeded'
                  AND implementation_run.card_revision = runs.card_revision
+                LEFT JOIN LATERAL (
+                    SELECT review_run.id, review_run.result_metadata
+                    FROM agent.runs AS review_run
+                    WHERE review_run.card_id = runs.card_id
+                      AND review_run.card_revision = runs.card_revision
+                      AND review_run.phase = 'review' AND review_run.status = 'succeeded'
+                      AND review_run.result_metadata #>> '{{independent_review,verdict}}' = 'pass'
+                      AND review_run.result_metadata #>> '{{independent_review,implementation_run_id}}' = implementation_run.id::text
+                      AND review_run.result_metadata #>> '{{independent_review,candidate_digest}}' = implementation_run.result_metadata ->> 'candidate_digest'
+                    ORDER BY review_run.created_at DESC, review_run.id DESC LIMIT 1
+                ) AS independent_review ON runs.phase = 'deployment'
                 WHERE runs.phase = ANY(%s)
                   {scope_predicate}
                   {deployment_environment_predicate}
@@ -499,7 +521,11 @@ def _lock_owned_run(cur, claim: ClaimedRun, *, statuses: tuple[str, ...]) -> dic
                runs.phase,
                runs.status AS run_status,
                cards.status AS card_status,
-               cards.repository_scope
+               cards.repository_scope,
+               cards.revision,
+               runs.card_revision,
+               runs.review_cycle,
+               runs.review_attempt
         FROM agent.runs AS runs
         JOIN agent.cards AS cards
           ON cards.id = runs.card_id
@@ -526,8 +552,16 @@ def _lock_owned_run(cur, claim: ClaimedRun, *, statuses: tuple[str, ...]) -> dic
             f"Lease lost for agent run {claim.id} owned by {claim.worker_id}"
         )
 
+    if row.get("revision", claim.card_revision) != claim.card_revision or row.get("card_revision", claim.card_revision) != claim.card_revision:
+        raise AgentLeaseLostError("Card revision changed while run was active")
+
     if row["phase"] != claim.phase.value:
         raise AgentQueueStateError(f"Run phase changed for {claim.id}")
+    if claim.phase is RunPhase.REVIEW:
+        source = claim.result_metadata.get("review_source", {})
+        if (str(row.get("review_cycle")) != source.get("review_cycle")
+            or row.get("review_attempt") != source.get("review_attempt")):
+            raise AgentLeaseLostError("Review attempt identity changed while run was active")
 
     return row
 
@@ -824,6 +858,14 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         raise ValueError("Agent completion message must be at most 20000 characters")
 
     metadata_payload = _merge_metadata(claim.result_metadata, result.metadata)
+    # Human authority comes only from the API-created queue record, never executor output.
+    metadata_payload.pop("human_review_handoffs", None)
+    if claim.phase is RunPhase.IMPLEMENTATION:
+        metadata_payload["human_review_handoffs"] = claim.result_metadata.get("human_review_handoffs", [])
+        metadata_payload["review_cycle"] = claim.result_metadata.get("review_cycle", claim.id)
+        metadata_payload["review_attempt"] = claim.result_metadata.get("review_attempt", 1)
+    elif claim.phase is RunPhase.REVIEW:
+        metadata_payload["review_source"] = claim.result_metadata["review_source"]
     deployment_pipeline = metadata_payload.get("deployment_pipeline")
     qa_handoff = (
         claim.phase is RunPhase.DEPLOYMENT
@@ -858,6 +900,30 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
             ) from exc
         metadata_payload["repository_scope"] = completed_scope.value
 
+    if claim.phase is RunPhase.IMPLEMENTATION:
+        from backend.core.codex_review import verify_candidate
+        verify_candidate(metadata_payload, run_id=claim.id, revision=claim.card_revision, live=True)
+    elif claim.phase is RunPhase.REVIEW:
+        from backend.core.codex_review import review_target
+        evidence = metadata_payload.get("independent_review", {})
+        source = claim.result_metadata["review_source"]
+        expected = {
+            "review_cycle": source["review_cycle"], "review_attempt": source["review_attempt"],
+            "implementation_run_id": source["implementation_run_id"],
+            "card_revision": claim.card_revision,
+            "candidate_digest": source["implementation_metadata"]["candidate_digest"],
+        }
+        if any(evidence.get(k) != v for k, v in expected.items()):
+            raise AgentQueueStateError("Independent review result identity mismatch")
+        if review_target(evidence.get("verdict"), source["review_attempt"]) is not target_status:
+            raise AgentQueueStateError("Independent review result status mismatch")
+        if target_status is CardStatus.REVIEW_READY:
+            from backend.core.codex_review import parse_verdict, verify_candidate
+            parse_verdict(json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}))
+            if not evidence.get("thread_id") or not evidence.get("turn_id") or not evidence.get("validation_evidence"):
+                raise AgentQueueStateError("Independent review pass evidence is missing")
+            verify_candidate(source["implementation_metadata"], run_id=source["implementation_run_id"],
+                             revision=claim.card_revision, live=True)
     metadata = json.dumps(metadata_payload, sort_keys=True)
 
     conn = get_db_conn()
@@ -916,6 +982,9 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                 if completed_scope is RepositoryScope.ANDROID:
                     card_assignments.append("base_branch = %s")
                     card_values.append("master")
+            if target_status is CardStatus.BLOCKED:
+                card_assignments = ["status = %s", "resume_status = %s", "blocked_reason = %s", "blocked_until = 'infinity'::timestamptz"]
+                card_values = [target_status.value, CardStatus.REVIEW_QUEUED.value, "Independent review requires human attention"]
             card_values.append(claim.card_id)
             cur.execute(
                 f"""
@@ -925,6 +994,8 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
                 """,
                 tuple(card_values),
             )
+            if claim.phase in {RunPhase.IMPLEMENTATION, RunPhase.REVIEW}:
+                _review_handoff(cur, claim, metadata_payload, target_status, message_id)
             event_payload = {
                 "attempt_count": claim.attempt_count,
                 "result_message_id": message_id,
@@ -1241,3 +1312,43 @@ class DatabaseAgentQueue:
 
     def fail_run(self, claim: ClaimedRun, *, error_message: str) -> None:
         fail_run(claim, error_message=error_message)
+
+
+def _review_handoff(cur, claim, metadata, target_status, message_id):
+    """Called only inside the owned-run completion transaction, after releasing its active slot."""
+    if claim.phase is RunPhase.IMPLEMENTATION:
+        cycle = metadata["review_cycle"]
+        attempt = metadata["review_attempt"]
+        from backend.core.codex_review import review_target
+        review_target("blocked", attempt)
+        source = {"review_cycle": cycle, "review_attempt": attempt,
+                  "implementation_run_id": claim.id, "implementation_metadata": metadata,
+                  "human_review_handoffs": claim.result_metadata.get("human_review_handoffs", [])}
+        next_metadata = {"review_source": source}
+        next_phase = RunPhase.REVIEW
+    else:
+        evidence = metadata["independent_review"]
+        _insert_event(cur, card_id=claim.card_id, event_type="review.verdict",
+                      actor_type="worker", actor_user_id=None, payload=evidence)
+        if target_status is not CardStatus.IMPLEMENTATION_QUEUED:
+            return
+        cycle = evidence["review_cycle"]
+        attempt = evidence["review_attempt"] + 1
+        next_metadata = {"review_cycle": cycle, "review_attempt": attempt,
+                         "review_findings": [f for f in evidence["findings"] if f.get("kind", "required") == "required"],
+                         "human_review_handoffs": claim.result_metadata.get("review_source", {}).get("human_review_handoffs", [])}
+        next_phase = RunPhase.IMPLEMENTATION
+    # Preserve the authorizing principal; the reviewer never inserts an approval.
+    cur.execute("SELECT requested_by FROM agent.runs WHERE id = %s", (claim.id,))
+    requested_by = _row_to_dict(cur, cur.fetchone())["requested_by"]
+    run_id = str(uuid4())
+    cur.execute("""INSERT INTO agent.runs
+        (id, card_id, phase, status, card_revision, requested_by, input_message_id,
+         result_metadata, review_cycle, review_attempt)
+        VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s::jsonb, %s, %s)""",
+        (run_id, claim.card_id, next_phase.value, claim.card_revision, requested_by,
+         message_id, json.dumps(next_metadata, sort_keys=True), cycle, attempt))
+    _insert_event(cur, card_id=claim.card_id, event_type="review.queued" if next_phase is RunPhase.REVIEW else "review.correction_queued",
+                  actor_type="worker", actor_user_id=None,
+                  payload={"run_id": run_id, "review_cycle": cycle, "review_attempt": attempt,
+                           "implementation_revision": claim.card_revision})

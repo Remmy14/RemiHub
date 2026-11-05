@@ -8,6 +8,7 @@ from backend.models.agent_models import (
     AgentCardListResponse,
     AgentCardResponse,
     AgentDecisionRequest,
+    AgentReviewRevisionRequest,
     AgentErrorResponse,
     AgentGitHubSyncRetryRequest,
     AgentMessageCreate,
@@ -302,4 +303,18 @@ def close_card(
     except Exception as exc:
         _raise_http_error(exc)
 
+    return {"success": True, "data": card}
+
+
+@router.post("/cards/{card_id}/request-revision", response_model=AgentCardResponse,
+             responses=CARD_ERROR_RESPONSES)
+def request_review_revision(card_id: UUID, request: AgentReviewRevisionRequest,
+                            principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        card = agent_service.request_review_revision(
+            card_id=str(card_id), requested_by=principal.id,
+            review_run_id=str(request.review_run_id), candidate_digest=request.candidate_digest,
+            notes=request.notes, decisions=[d.model_dump() for d in request.decisions])
+    except Exception as exc:
+        _raise_http_error(exc)
     return {"success": True, "data": card}

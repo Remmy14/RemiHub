@@ -16,6 +16,7 @@ from backend.core.agent_worker import (
 from backend.core.agent_workspace import ImplementationWorkspace, WorkspaceSnapshot
 from backend.core.codex_implementation import (
     IMPLEMENTATION_OUTPUT_SCHEMA,
+    IMPLEMENTATION_DEVELOPER_INSTRUCTIONS,
     CodexImplementationExecutor,
     CodexImplementationRemoteCompactNotFound,
     CodexImplementationTemporaryFailure,
@@ -47,6 +48,7 @@ class RecordingWorkspaceManager:
             patch_path=root / "run.patch",
             patch_size_bytes=123,
         )
+        self.snapshot.patch_path.write_bytes(b"synthetic patch")
         self.lock_calls = []
         self.capture_calls = []
 
@@ -138,7 +140,7 @@ class CodexImplementationExecutorTests(unittest.TestCase):
 
         result = self.executor(gateway).execute(self.claim)
 
-        self.assertEqual(result.card_status, CardStatus.REVIEW_READY)
+        self.assertEqual(result.card_status, CardStatus.REVIEW_QUEUED)
         self.assertIn("Implemented the approved change", result.message)
         self.assertIn("backend/example.py", result.message)
         self.assertEqual(result.metadata["sandbox"], "workspace-write")
@@ -156,6 +158,25 @@ class CodexImplementationExecutorTests(unittest.TestCase):
             self.manager.workspace.path,
         )
 
+
+    def test_no_file_changes_never_succeeds(self):
+        self.manager.snapshot = replace(self.manager.snapshot, changed_files=())
+        gateway = RecordingGateway()
+        with self.assertRaisesRegex(RuntimeError, "made no file changes"):
+            self.executor(gateway).execute(self.claim)
+        self.assertEqual(gateway.calls[0]["thread_id"], "thr_existing")
+        self.store.rollover_codex_thread_id.assert_not_called()
+
+    def test_planning_and_implementation_share_permanent_instructions(self):
+        from backend.core.codex_planning import PLANNING_DEVELOPER_INSTRUCTIONS
+        self.assertEqual(
+            IMPLEMENTATION_DEVELOPER_INSTRUCTIONS,
+            PLANNING_DEVELOPER_INSTRUCTIONS,
+        )
+        self.assertIn(
+            "This is an IMPLEMENTATION turn",
+            _implementation_prompt(self.claim, self.manager.workspace),
+        )
 
     def test_retry_prompt_uses_latest_user_guidance(self):
         retry_guidance = (
@@ -258,7 +279,7 @@ class CodexImplementationExecutorTests(unittest.TestCase):
 
         result = self.executor(gateway).execute(self.claim)
 
-        self.assertEqual(result.card_status, CardStatus.REVIEW_READY)
+        self.assertEqual(result.card_status, CardStatus.REVIEW_QUEUED)
         self.assertEqual(gateway.calls[0]["thread_id"], "thr_existing")
         self.assertIsNone(gateway.calls[1]["thread_id"])
         self.assertIn("may already have modified files", gateway.calls[1]["prompt"])

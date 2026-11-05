@@ -144,6 +144,8 @@ class ManualAccountHttpTests(unittest.TestCase):
 
     def test_admin_crud_contract(self):
         self.app.dependency_overrides[require_current_principal] = lambda: ADMIN
+        # The app also registers the protected-router dependency.
+        self.app.dependency_overrides[get_current_principal] = lambda: ADMIN
         try:
             service = self.finance.manual_service
             with patch.object(service, "list_accounts", return_value=[ACCOUNT]) as listing, \
@@ -171,6 +173,8 @@ class ManualAccountHttpTests(unittest.TestCase):
 
     def test_admin_errors(self):
         self.app.dependency_overrides[require_current_principal] = lambda: ADMIN
+        # The app also registers the protected-router dependency.
+        self.app.dependency_overrides[get_current_principal] = lambda: ADMIN
         try:
             service = self.finance.manual_service
             for error, expected in ((service.AccountNotFound("missing"), 404),
@@ -189,6 +193,8 @@ class ManualAccountHttpTests(unittest.TestCase):
                 self.assertEqual(self.client.get("/finance/manual-accounts").status_code, 401)
                 self.assertEqual(self.client.post("/finance/manual-accounts", json=CREATE).status_code, 401)
                 self.app.dependency_overrides[require_current_principal] = lambda: MEMBER
+                # The app also registers the protected-router dependency.
+                self.app.dependency_overrides[get_current_principal] = lambda: MEMBER
                 try:
                     self.assertEqual(self.client.get("/finance/manual-accounts").status_code, 403)
                 finally:
@@ -234,6 +240,8 @@ class ManualAccountHttpTests(unittest.TestCase):
                             self.assertEqual(response.status_code, 401)
                     for principal, role in ((MEMBER, "member"), (ADMIN, "admin")):
                         self.app.dependency_overrides[require_current_principal] = lambda principal=principal: principal
+                        # The app also registers the protected-router dependency.
+                        self.app.dependency_overrides[get_current_principal] = lambda principal=principal: principal
                         try:
                             for method, path, body in routes:
                                 with self.subTest(mode=mode, role=role, path=path):

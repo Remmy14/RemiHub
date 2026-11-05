@@ -4,6 +4,7 @@ export const AgentActions = {
   ADD_FOLLOW_UP: "add_follow_up",
   APPROVE_IMPLEMENTATION: "approve_implementation",
   APPROVE_DEPLOYMENT: "approve_deployment",
+  REQUEST_REVISION: "request_revision",
   RETRY: "retry",
   RETURN_TO_IMPLEMENTATION: "return_to_implementation",
   RETRY_GITHUB_SYNC: "retry_github_sync",
@@ -87,6 +88,7 @@ export type AgentRun = {
   error_message: string | null;
   result_message_id: string | null;
   result_metadata: Record<string, unknown>;
+  independent_review?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 };
@@ -188,10 +190,42 @@ export async function addAgentFollowUp(
   return response.data;
 }
 
+export type ReviewRevision = {
+  review_run_id: string;
+  candidate_digest: string;
+  decisions: { finding_index: number; decision: "fix" | "defer_ignore" }[];
+};
+
+// Build decisions only for the exact latest exhausted review displayed by the form.
+export function reviewRevisionForCard(
+  card: AgentCardDetail,
+  decisions: Record<number, "fix" | "defer_ignore">,
+  notes: string,
+): ReviewRevision | null {
+  const run = card.runs.find((item) => item.id === card.latest_run?.id);
+  const review = run?.independent_review;
+  const findings = review?.findings;
+  if (!card.allowed_actions.includes(AgentActions.REQUEST_REVISION) || card.status !== "blocked" ||
+      !run || run.phase !== "review" || run.status !== "succeeded" || run.card_revision !== card.revision ||
+      review?.verdict !== "changes_requested" || review.review_attempt !== 3 ||
+      typeof review.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(review.candidate_digest) ||
+      !Array.isArray(findings) || !findings.length || !notes.trim() ||
+      Object.keys(decisions).length !== findings.length ||
+      !findings.every((_, index) => decisions[index] === "fix" || decisions[index] === "defer_ignore")) {
+    return null;
+  }
+  return {
+    review_run_id: run.id,
+    candidate_digest: review.candidate_digest,
+    decisions: findings.map((_, finding_index) => ({ finding_index, decision: decisions[finding_index] })),
+  };
+}
+
 export async function performAgentAction(
   card: AgentCardDetail,
   action: AgentAction,
   notes?: string | null,
+  revision?: ReviewRevision,
 ): Promise<AgentCardDetail> {
   const correctionInstructions = notes?.trim() ?? "";
   const returningToImplementation =
@@ -203,9 +237,14 @@ export async function performAgentAction(
     );
   }
 
+  if (action === AgentActions.REQUEST_REVISION && (!revision || !correctionInstructions)) {
+    throw new Error("Review decisions and operator notes are required.");
+  }
   const commonOptions = {
     method: "POST",
-    body: returningToImplementation
+    body: action === AgentActions.REQUEST_REVISION
+      ? JSON.stringify({ ...revision, notes: correctionInstructions })
+      : returningToImplementation
       ? JSON.stringify({ content: correctionInstructions })
       : decisionBody(notes),
   };
@@ -216,6 +255,8 @@ export async function performAgentAction(
         return `/agent/cards/${card.id}/approve-implementation`;
       case AgentActions.APPROVE_DEPLOYMENT:
         return `/agent/cards/${card.id}/approve-deployment`;
+      case AgentActions.REQUEST_REVISION:
+        return `/agent/cards/${card.id}/request-revision`;
       case AgentActions.RETRY:
         return `/agent/cards/${card.id}/retry`;
       case AgentActions.RETURN_TO_IMPLEMENTATION:

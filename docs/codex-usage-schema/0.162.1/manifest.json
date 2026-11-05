@@ -1,0 +1,20 @@
+{
+  "codex_version": "0.162.1",
+  "generated_with_experimental": false,
+  "offline": true,
+  "account_requests_made": false,
+  "schemas": {
+    "GetAccountRateLimitsResponse.json": {
+      "installed_generated_path": "v2/GetAccountRateLimitsResponse.json",
+      "sha256": "cb9655e68130116f634ed9353e45b336492e6069a6628f424d1cd52e54eda0e0"
+    },
+    "NullableGetAccountRateLimitsParams.json": {
+      "installed_generated_path": "v2/NullableGetAccountRateLimitsParams.json",
+      "sha256": "072f813ca1c696831a7f2fbd934feaa8cad228a6b3d44a4be8877547c796341b"
+    },
+    "AccountRateLimitsUpdatedNotification.json": {
+      "installed_generated_path": "v2/AccountRateLimitsUpdatedNotification.json",
+      "sha256": "37326ef0364007be0c8f92bf5cd228941b513f87266edd566d694409b5aa5b8b"
+    }
+  }
+}

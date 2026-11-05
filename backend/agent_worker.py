@@ -486,6 +486,21 @@ def build_executor(
             retry_after_seconds=settings.codex_retry_seconds,
         )
 
+    if settings.executor_name == "codex-review":
+        from backend.core.codex_review import CodexReviewExecutor
+        from backend.core.codex_review_bounded import development_gateway, PINNED_MODEL
+        # Exact reviewer-only CLI and private ChatGPT control home.
+        # Fresh no-tools qualification runs before each authenticated turn.
+        wrapper = os.environ.get("REMIHUB_REVIEW_CODEX_BIN")
+        home = os.environ.get("REMIHUB_REVIEW_CODEX_HOME")
+        if not wrapper or not home or not settings.artifact_root or not settings.repository_scope or settings.codex_model != PINNED_MODEL:
+            raise AgentWorkerConfigurationError(
+                "codex-review requires pinned CLI/model, dedicated REMIHUB_REVIEW_CODEX_HOME, artifact root and explicit repository scope")
+        return CodexReviewExecutor(
+            artifact_root=settings.artifact_root,
+            repository_scope=RepositoryScope(settings.repository_scope),
+            gateway=development_gateway(codex_bin=wrapper, control_home=home), model=settings.codex_model)
+
     if settings.executor_name == "codex-implementation":
         if queue is None:
             raise AgentWorkerConfigurationError(

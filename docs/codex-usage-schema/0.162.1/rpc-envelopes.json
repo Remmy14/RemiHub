@@ -1,0 +1,52 @@
+{
+  "account/rateLimits/read": {
+    "properties": {
+      "id": {
+        "$ref": "#/definitions/RequestId"
+      },
+      "method": {
+        "enum": [
+          "account/rateLimits/read"
+        ],
+        "title": "Account/rateLimits/readRequestMethod",
+        "type": "string"
+      },
+      "params": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/GetAccountRateLimitsParams"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "id",
+      "method"
+    ],
+    "title": "Account/rateLimits/readRequest",
+    "type": "object"
+  },
+  "account/rateLimits/updated": {
+    "properties": {
+      "method": {
+        "enum": [
+          "account/rateLimits/updated"
+        ],
+        "title": "Account/rateLimits/updatedNotificationMethod",
+        "type": "string"
+      },
+      "params": {
+        "$ref": "#/definitions/AccountRateLimitsUpdatedNotification"
+      }
+    },
+    "required": [
+      "method",
+      "params"
+    ],
+    "title": "Account/rateLimits/updatedNotification",
+    "type": "object"
+  }
+}

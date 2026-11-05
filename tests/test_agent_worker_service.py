@@ -874,21 +874,19 @@ class RunCompletionTests(unittest.TestCase):
         )
         claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
 
-        complete_run(
-            claim,
+        with patch("backend.core.codex_review.verify_candidate"), patch.object(agent_worker_service_module, "_review_handoff") as handoff:
+            complete_run(
+                claim,
             ExecutionResult(
                 message="Done",
-                card_status=CardStatus.REVIEW_READY,
+                card_status=CardStatus.REVIEW_QUEUED,
                 metadata={"workspace": {"changed_files": ["backend/example.py"]}},
             ),
         )
 
-        insert_notification.assert_called_once()
-        notification = insert_notification.call_args.args[0]
-        self.assertEqual(notification.title, "Implementation is ready for review")
-        self.assertEqual(notification.data["phase"], "implementation")
-        self.assertEqual(notification.data["status"], "review_ready")
-        self.assertEqual(notification.data["action"], "approve_deployment")
+        insert_notification.assert_not_called()
+        handoff.assert_called_once()
+        self.assertEqual(handoff.call_args.args[3], CardStatus.REVIEW_QUEUED)
 
     @patch("backend.services.agent_worker_service.insert_notification")
     @patch("backend.services.agent_worker_service._insert_event")

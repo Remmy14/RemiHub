@@ -8,6 +8,7 @@ import {
   getAgentCard,
   listAgentCards,
   performAgentAction,
+  reviewRevisionForCard,
 } from "./api/agentApi";
 import type {
   AgentAction,
@@ -19,6 +20,7 @@ import type {
   AgentLatestRun,
   AgentMessage,
   AgentRun,
+  ReviewRevision,
 } from "./api/agentApi";
 
 const POLL_INTERVAL_MILLIS = 5000;
@@ -27,6 +29,8 @@ const activeStatuses = new Set([
   "planning_queued",
   "planning",
   "implementation_queued",
+  "review_queued",
+  "reviewing",
   "implementing",
   "deployment_queued",
   "deploying",
@@ -75,6 +79,8 @@ function actionLabel(action: AgentAction): string {
       return "Approve Implementation";
     case AgentActions.APPROVE_DEPLOYMENT:
       return "Approve Deployment";
+    case AgentActions.REQUEST_REVISION:
+      return "Request Revision";
     case AgentActions.RETRY:
       return "Retry Failed Run";
     case AgentActions.RETURN_TO_IMPLEMENTATION:
@@ -488,13 +494,20 @@ function ActionPanel({
 }: {
   card: AgentCardDetail;
   actionInProgress: AgentAction | "create" | null;
-  onAction: (action: AgentAction, notes?: string | null) => void;
+  onAction: (action: AgentAction, notes?: string | null, revision?: ReviewRevision) => void;
 }) {
   const actions = card.allowed_actions.filter(
     (action) => action !== AgentActions.ADD_FOLLOW_UP,
   );
   const [pendingAction, setPendingAction] = useState<AgentAction | null>(null);
   const [notes, setNotes] = useState("");
+  const [decisions, setDecisions] = useState<Record<number, "fix" | "defer_ignore">>({});
+  const latestReview = card.runs.find((run) => run.id === card.latest_run?.id);
+  const evidence = latestReview?.independent_review;
+  const findings = Array.isArray(evidence?.findings) ? evidence.findings : [];
+  const requestingRevision = pendingAction === AgentActions.REQUEST_REVISION;
+  const revisionRequest = reviewRevisionForCard(card, decisions, notes);
+  const revisionReady = revisionRequest !== null;
 
   if (actions.length === 0) {
     return null;
@@ -512,7 +525,8 @@ function ActionPanel({
       return;
     }
 
-    onAction(pendingAction, notes);
+    if (requestingRevision && !revisionReady) return;
+    onAction(pendingAction, notes, requestingRevision ? revisionRequest! : undefined);
     setNotes("");
     setPendingAction(null);
   };
@@ -532,7 +546,7 @@ function ActionPanel({
             }`}
             disabled={actionInProgress !== null}
             key={action}
-            onClick={() => setPendingAction(action)}
+            onClick={() => { setPendingAction(action); setDecisions({}); setNotes(""); }}
             type="button"
           >
             {actionInProgress === action ? "Submitting..." : actionLabel(action)}
@@ -550,6 +564,21 @@ function ActionPanel({
               ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
               : "Review the current card state before confirming this lifecycle action."}
           </p>
+          {requestingRevision && <div className="mt-3 space-y-3">
+            <p>Choose a decision for every finding. Operator notes are required. A fresh bounded review cycle will follow; deployment still requires a passing review and approval.</p>
+            {findings.map((raw, index) => {
+              const finding = raw as Record<string, unknown>;
+              return <label className="block" key={`${latestReview?.id}-${index}`}>
+                <span className="block whitespace-pre-wrap">{String(finding.kind ?? "required")}: {String(finding.path ?? "")} — {String(finding.description ?? "")}<br />{String(finding.correction ?? "")}</span>
+                <select aria-label={`Decision for finding ${index + 1}`} value={decisions[index] ?? ""}
+                  onChange={(event) => setDecisions({ ...decisions, [index]: event.target.value as "fix" | "defer_ignore" })}>
+                  <option value="" disabled>Choose a decision</option>
+                  <option value="fix">Fix</option>
+                  <option value="defer_ignore">Defer / Ignore</option>
+                </select>
+              </label>;
+            })}
+          </div>}
           <textarea
             className="mt-3 min-h-24 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
             maxLength={
@@ -561,7 +590,7 @@ function ActionPanel({
             placeholder={
               pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
                 ? "Required: describe the fix the implementer should make"
-                : "Notes (optional)"
+                : requestingRevision ? "Required: operator instructions and scope decisions" : "Notes (optional)"
             }
             value={notes}
           />
@@ -578,6 +607,7 @@ function ActionPanel({
               className="rounded-md bg-slate-950 px-3 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
               disabled={
                 actionInProgress !== null ||
+                (requestingRevision && !revisionReady) ||
                 (
                   pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION &&
                   !notes.trim()
@@ -777,6 +807,29 @@ function MessageCard({ message }: { message: AgentMessage }) {
   );
 }
 
+function IndependentReviewProgress({ run }: { run: AgentRun }) {
+  const review = run.independent_review;
+  if (!review) {
+    return <p className="mt-3 text-sm">Independent review: {humanize(run.status)}</p>;
+  }
+  const findings = Array.isArray(review.findings) ? review.findings : [];
+  return (
+    <div className="mt-3 space-y-3 rounded-md border border-blue-100 bg-blue-50 p-3">
+      <h4 className="font-bold">Independent review: attempt {String(review.review_attempt ?? "-")} of 3</h4>
+      <p className="text-sm font-semibold">{humanize(String(review.verdict ?? run.status))}</p>
+      {typeof review.summary === "string" && <p className="whitespace-pre-wrap text-sm">{review.summary}</p>}
+      {findings.map((value, index) => {
+        if (!value || typeof value !== "object") return null;
+        const finding = value as Record<string, unknown>;
+        return <CopyableBlock key={index}
+          label={`${finding.kind === "advisory" ? "Advisory suggestion" : "Required correction"} — ${String(finding.severity ?? "Finding")}: ${String(finding.path ?? "")}`}
+          text={`${String(finding.description ?? "")}\nCorrection: ${String(finding.correction ?? "")}`} />;
+      })}
+      {review.verdict === "pass" && <p className="text-sm">Human deployment approval is still required.</p>}
+    </div>
+  );
+}
+
 function RunCard({ run }: { run: AgentRun }) {
   const metadata = metadataSummary(run.result_metadata);
 
@@ -809,6 +862,7 @@ function RunCard({ run }: { run: AgentRun }) {
           <CopyableBlock label="Run Error" text={run.error_message} tone="error" />
         </div>
       )}
+      {run.phase === "review" && <IndependentReviewProgress run={run} />}
       {metadata && (
         <div className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-600">
           {metadata}
@@ -888,7 +942,7 @@ function CardDetail({
   actionInProgress: AgentAction | "create" | null;
   card: AgentCardDetail;
   isLoading: boolean;
-  onAction: (action: AgentAction, notes?: string | null) => void;
+  onAction: (action: AgentAction, notes?: string | null, revision?: ReviewRevision) => void;
   onBack: () => void;
   onRefresh: () => void;
   onSendFollowUp: (content: string) => void;
@@ -934,6 +988,7 @@ function CardDetail({
       </Section>
 
       <ActionPanel
+        key={`${card.id}-${card.revision}-${card.latest_run?.id}`}
         actionInProgress={actionInProgress}
         card={card}
         onAction={onAction}
@@ -1118,7 +1173,7 @@ export default function AgentScreen() {
     }
   };
 
-  const runAction = async (action: AgentAction, notes?: string | null) => {
+  const runAction = async (action: AgentAction, notes?: string | null, revision?: ReviewRevision) => {
     if (!selectedCard) {
       return;
     }
@@ -1130,7 +1185,7 @@ export default function AgentScreen() {
     setActionInProgress(action);
     setErrorMessage(null);
     try {
-      const card = await performAgentAction(selectedCard, action, notes);
+      const card = await performAgentAction(selectedCard, action, notes, revision);
       setSelectedCard(card);
       setSelectedCardId(card.id);
       await loadCards(true);

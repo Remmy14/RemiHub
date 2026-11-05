@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from backend.core.agent_deployment import GitBackendDeploymentManager
+from backend.core.agent_deployment import GitBackendDeploymentManager, AgentDeploymentError
 from backend.core.agent_deployment import _expected_migration_history
 from backend.database.migration_runner import (
     MIGRATIONS_DIR,
@@ -65,9 +65,18 @@ class MigrationDiscoveryTests(unittest.TestCase):
         latest = migrations[-1]
         self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
         self.assertIsNotNone(latest.down_path)
-        GitBackendDeploymentManager._validate_migration_sql(latest.up_path, direction="up")
-        GitBackendDeploymentManager._validate_migration_sql(latest.down_path, direction="down")
-        GitBackendDeploymentManager._validate_migration_pair(latest.up_path, latest.down_path)
+        # 0020 replaces workflow constraints and grants worker capabilities. It
+        # requires RemiHub's separately approved schema rollout, never the app's
+        # restricted automatic migration executor.
+        self.assertEqual(latest.version, "0020")
+        with self.assertRaises(AgentDeploymentError):
+            GitBackendDeploymentManager._validate_migration_sql(latest.up_path, direction="up")
+        with self.assertRaises(AgentDeploymentError):
+            GitBackendDeploymentManager._validate_migration_sql(latest.down_path, direction="down")
+        # The conservative pair checker also rejects the schema-qualified index
+        # drop. Operator-managed SQL remains outside automatic rollback.
+        with self.assertRaises(AgentDeploymentError):
+            GitBackendDeploymentManager._validate_migration_pair(latest.up_path, latest.down_path)
 
     def test_repository_candidate_history_contains_current_complete_identity(self):
         history = _expected_migration_history(MIGRATIONS_DIR)

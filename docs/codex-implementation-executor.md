@@ -5,7 +5,13 @@ dual-repository planning bootstrap milestone it remains backend-only. It can
 claim only `implementation` runs after an explicit implementation approval or a
 review follow-up for a backend-scoped card. It resumes the card's existing
 planning thread, writes only in a card-specific backend worktree, and stops at
-`review_ready`. It cannot claim planning or deployment work.
+`review_ready`. It cannot claim planning or deployment work. Planning and
+implementation use the SAME phase-neutral developer instructions and the same
+thread ID, with phase-specific prompts and distinct sandbox permissions.
+Codex may ignore developer-instruction overrides on resumed legacy threads that
+were started with permanent planning-only instructions; those old threads need
+a separately validated same-thread recovery. Implementations with zero changed
+files fail instead of reporting `review_ready`.
 
 ## Approval and thread boundary
 

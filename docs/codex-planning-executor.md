@@ -7,7 +7,11 @@ or deployment runs.
 
 ## Thread lifecycle
 
-The first planning run starts a persistent Codex thread. The worker saves the
+The first planning run starts a persistent Codex thread with phase-neutral
+developer instructions; phase-specific read-only restrictions are enforced by
+the current planning prompt and read-only sandbox. On approved implementation,
+this SAME thread may proceed with workspace-write permissions without relying
+on Codex to replace its historical developer instructions. The worker saves the
 thread ID to `agent.cards.codex_thread_id` while it still owns the run lease and
 before it starts the turn. Later user follow-ups resume that same thread and
 send the latest user message. Closing completed work and creating a new card

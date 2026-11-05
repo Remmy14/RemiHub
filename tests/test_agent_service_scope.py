@@ -19,6 +19,11 @@ def card(repository_scope: str) -> dict:
 
 
 class AgentServiceRepositoryScopeTests(unittest.TestCase):
+    def setUp(self):
+        trigger = patch("backend.services.agent_service.trigger_deployment_worker")
+        trigger.start()
+        self.addCleanup(trigger.stop)
+
     def test_card_serialization_selects_repository_scope(self):
         self.assertIn("repository_scope", CARD_COLUMNS)
 

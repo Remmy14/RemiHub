@@ -836,6 +836,17 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                 "worktree_path": str(workspace.path),
             },
         }
+        from backend.core.codex_review import candidate_digest
+        import hashlib
+        metadata["repository_scope"] = "backend"
+        metadata["workspace"]["patch_sha256"] = hashlib.sha256(snapshot.patch_path.read_bytes()).hexdigest()
+        metadata["candidate_digest"] = candidate_digest(metadata, run_id=self.implementation_claim.id, revision=1)
+        metadata["independent_review"] = {
+            "verdict": "pass", "candidate_digest": metadata["candidate_digest"],
+            "implementation_run_id": self.implementation_claim.id, "card_revision": 1,
+            "thread_id": "synthetic-review-thread", "turn_id": "synthetic-review-turn",
+            "validation_evidence": metadata["tests"], "findings": [], "summary": "Synthetic review",
+        }
         return replace(
             claimed_run(phase=RunPhase.DEPLOYMENT),
             id="7ce86bc5-59db-4c98-ac77-bd6038098e17",
@@ -848,6 +859,39 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                 implementation_result_metadata=metadata,
             ),
         )
+
+    def test_deployment_rejects_missing_or_stale_independent_review(self):
+        claim = self._prepare_deployment({"backend/example.py": "value = 2\n"})
+        source = claim.deployment_source
+        manager = self._manager()
+        for evidence in (None, {"verdict": "pass"},
+                         {**source.implementation_result_metadata["independent_review"], "candidate_digest": "0" * 64}):
+            with self.subTest(evidence=evidence):
+                metadata = dict(source.implementation_result_metadata)
+                metadata["independent_review"] = evidence or {}
+                with self.assertRaisesRegex(AgentDeploymentError, "passing independent review"):
+                    manager._validate_approved_implementation(
+                        claim, replace(source, implementation_result_metadata=metadata))
+        approved = manager._validate_approved_implementation(claim, source)
+        self.assertEqual(approved.implementation_run_id, source.implementation_run_id)
+
+    def test_advisory_suggestions_pass_but_required_corrections_block_deployment(self):
+        claim = self._prepare_deployment({"backend/example.py": "value = 2\n"})
+        source = claim.deployment_source
+        manager = self._manager()
+        metadata = dict(source.implementation_result_metadata)
+        finding = {"kind": "advisory", "severity": "low", "path": "backend/example.py",
+                   "description": "Optional naming improvement", "correction": "Consider renaming"}
+        metadata["independent_review"] = {**metadata["independent_review"], "findings": [finding]}
+        advisory_source = replace(source, implementation_result_metadata=metadata)
+        manager._validate_approved_implementation(claim, advisory_source)
+        for kind in ("required", None):
+            changed = dict(finding)
+            if kind is None: changed.pop("kind")
+            else: changed["kind"] = kind
+            metadata["independent_review"] = {**metadata["independent_review"], "findings": [changed]}
+            with self.assertRaisesRegex(AgentDeploymentError, "passing independent review"):
+                manager._validate_approved_implementation(claim, replace(source, implementation_result_metadata=metadata))
 
     def _qa_succeeded_claim(self, claim):
         expected = self._expected_history(
@@ -1302,10 +1346,33 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentDeploymentError, "mutate application data"):
             self._manager().deploy(claim)
 
-    def test_requirements_file_is_blocked(self):
-        claim = self._prepare_deployment({"requirements.txt": "evil==1\n"})
-        with self.assertRaisesRegex(AgentDeploymentError, "permits only"):
-            self._manager().deploy(claim)
+    def test_installed_policy_preserves_requirements_file_allowance(self):
+        claim = self._prepare_deployment({"requirements.txt": "example-package==1.0\n"})
+        candidate = self._manager().deploy(claim)
+        self.assertIsNotNone(candidate.candidate_commit)
+
+    def test_installed_policy_preserves_finance_document_allowance(self):
+        claim = self._prepare_deployment({"frontend-web/FINANCE.md": "# Finance documentation\n"})
+        candidate = self._manager(frontend_builder=FakeFrontendBuilder()).deploy(claim)
+        self.assertIsNotNone(candidate.candidate_commit)
+
+    def test_check_replacement_requires_reciprocal_down(self):
+        with tempfile.TemporaryDirectory() as directory:
+            up, down = Path(directory) / "up.sql", Path(directory) / "down.sql"
+            up.write_text("ALTER TABLE widgets DROP CONSTRAINT widgets_kind; "
+                          "ALTER TABLE widgets ADD CONSTRAINT widgets_kind CHECK (kind IN ('a','b'));")
+            down.write_text("ALTER TABLE widgets DROP CONSTRAINT widgets_kind; "
+                            "ALTER TABLE widgets ADD CONSTRAINT widgets_kind CHECK (kind IN ('a'));")
+            GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+            GitBackendDeploymentManager._validate_migration_pair(up, down)
+            down.write_text("SELECT 1;")
+            with self.assertRaisesRegex(AgentDeploymentError, "CHECK constraint replacement"):
+                GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_review_migration_remains_outside_automatic_policy(self):
+        migration = Path(__file__).resolve().parents[1] / "backend/database/migrations/0020_independent_review.up.sql"
+        with self.assertRaisesRegex(AgentDeploymentError, "privileged"):
+            GitBackendDeploymentManager._validate_migration_sql(migration, direction="up")
 
     def test_control_plane_file_is_blocked(self):
         claim = self._prepare_deployment(

@@ -52,23 +52,32 @@ PLANNING_OUTPUT_SCHEMA = {
 }
 
 
-PLANNING_DEVELOPER_INSTRUCTIONS = """
-You are the planning agent for RemiHub. Work only in the planning phase.
-Inspect the current repository before proposing changes. In dual-repository
-planning workspaces, inspect the `backend/` checkout and the `android/`
-checkout when needed to classify and coordinate the work. Do not create, edit,
-delete, rename, or format files. Do not run commands that change repository,
-database, service, package, network, or operating-system state. Never access
-production secrets or deployment credentials. RemiHub owns builds, migrations,
-service restarts, signing, publication, releases, and deployment.
+# Permanent instructions must remain valid in every phase: Codex may ignore
+# developer_instructions replacements when resuming a persistent thread.
+CARD_THREAD_DEVELOPER_INSTRUCTIONS = """
+You are RemiHub's continuous Codex agent for one Agent Card. The card progresses
+through planning, implementation, and review in the SAME persistent thread.
+Always follow the current approved phase and its actual sandbox permissions.
+Planning does not itself approve implementation; RemiHub must explicitly approve.
 
-Produce a concrete, repository-informed plan with affected components, data or
-API changes, model/client coordination, validation, rollback considerations,
-and any questions that truly block implementation. Set ready_for_implementation
-to false when user input is still required; otherwise set it to true. Set
-repository_scope to exactly one of backend, android, or backend_and_android.
-Follow the relevant repository AGENTS.md files.
+In PLANNING turns, inspect the necessary repositories and propose a concrete,
+repository-informed plan. Do not change files or run state-changing commands.
+Planning runs in a read-only sandbox.
+
+In IMPLEMENTATION and REVIEW turns, only after explicit RemiHub approval, you
+may change files INSIDE the assigned worktree using the workspace-write sandbox.
+Inspect the code and prior plan, preserve unrelated changes, and run focused
+tests if permitted. Never edit outside the assigned worktree, change Git
+metadata, commit, fetch, pull, push, merge, or rebase.
+
+In ALL phases, do not use the network, install packages, apply migrations,
+access production databases or secrets, sign Android builds, restart services,
+deploy, or roll back. RemiHub owns deployment after separate approval. Follow
+the relevant AGENTS.md guidance for the CURRENT phase. Earlier planning
+restrictions do not permanently prohibit an approved implementation phase.
 """.strip()
+
+PLANNING_DEVELOPER_INSTRUCTIONS = CARD_THREAD_DEVELOPER_INSTRUCTIONS
 
 
 @dataclass(frozen=True)
@@ -367,13 +376,14 @@ def _planning_prompt(claim: ClaimedRun) -> str:
 Current user message:
 {request}
 
-Inspect the repository or repositories as needed, but remain read-only. If a
-dual-repository planning workspace is configured, the backend checkout is
-labeled `backend/` and the Android checkout is labeled `android/`. Explicitly
-evaluate backend API/model changes, Android client changes, and coordination
-between them before choosing repository_scope. Respond using the required
-structured planning schema. This is card revision {claim.card_revision} and
-run {claim.id}.
+This is a PLANNING turn, not an implementation approval. Do not create, edit,
+delete, rename, or format files or run state-changing commands. If a dual
+repository workspace is configured, its checkouts are `backend/` and `android/`.
+Inspect affected repositories; evaluate API/model and Android coordination;
+provide affected components, validation, rollback, and any blocking questions.
+Choose repository_scope, set ready_for_implementation accurately, and return
+the required structured planning schema. This is card revision
+{claim.card_revision} and run {claim.id}.
 """.strip()
 
 
@@ -394,9 +404,9 @@ Current user message:
 Recent card discussion:
 {_recent_rollover_context(claim)}
 
-Inspect the repository or repositories as needed and continue planning from the
-existing card state. Remain read-only and respond using the required structured
-planning schema.
+This remains a PLANNING turn. Do not change files or run state-changing
+commands. Continue planning, identify blockers, resolve repository_scope,
+and return the required structured planning schema.
 """.strip()
 
 

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase, RunStatus
 
@@ -29,6 +29,20 @@ class AgentDecisionRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class AgentFindingDecision(AgentRequestModel):
+    model_config = ConfigDict(extra="forbid")
+    finding_index: int = Field(ge=0, le=49, strict=True)
+    decision: Literal["fix", "defer_ignore"]
+
+
+class AgentReviewRevisionRequest(AgentRequestModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    review_run_id: UUID
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    notes: str = Field(min_length=1, max_length=2000)
+    decisions: list[AgentFindingDecision] = Field(min_length=1, max_length=50)
+
+
 class AgentGitHubSyncRetryRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
@@ -37,6 +51,7 @@ class AgentCardAction(str, Enum):
     ADD_FOLLOW_UP = "add_follow_up"
     APPROVE_IMPLEMENTATION = "approve_implementation"
     APPROVE_DEPLOYMENT = "approve_deployment"
+    REQUEST_REVISION = "request_revision"
     RETRY = "retry"
     RETURN_TO_IMPLEMENTATION = "return_to_implementation"
     RETRY_GITHUB_SYNC = "retry_github_sync"
@@ -124,6 +139,18 @@ class AgentRun(BaseModel):
     result_metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+
+
+    @computed_field
+    @property
+    def independent_review(self) -> dict[str, Any] | None:
+        if self.phase is not RunPhase.REVIEW:
+            return None
+        evidence = self.result_metadata.get("independent_review")
+        if isinstance(evidence, dict):
+            return evidence
+        source = self.result_metadata.get("review_source", {})
+        return {k: source.get(k) for k in ("review_cycle", "review_attempt", "implementation_run_id")}
 
 
 class AgentApproval(BaseModel):

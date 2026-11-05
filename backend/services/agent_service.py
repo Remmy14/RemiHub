@@ -327,6 +327,9 @@ def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]
         if _safe_reimplementation_failure(card, latest_run):
             actions.append("return_to_implementation")
 
+    if _exhausted_review(card, latest_run):
+        actions.append("request_revision")
+
     recovery = card.get("deployment_recovery")
     if (
         status is CardStatus.BLOCKED
@@ -547,9 +550,12 @@ def _insert_run(
             status,
             card_revision,
             input_message_id,
-            requested_by
+            requested_by,
+            review_cycle,
+            review_attempt,
+            result_metadata
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
         """,
         (
             run_id,
@@ -559,6 +565,9 @@ def _insert_run(
             card_revision,
             input_message_id,
             requested_by,
+            run_id if phase is RunPhase.IMPLEMENTATION else None,
+            1 if phase is RunPhase.IMPLEMENTATION else None,
+            json.dumps({"review_cycle": run_id, "review_attempt": 1}) if phase is RunPhase.IMPLEMENTATION else "{}",
         ),
     )
     return run_id
@@ -684,10 +693,9 @@ def _deployment_implementation_result(
         """,
         (card_id, card_revision),
     )
-    return _validate_deployment_implementation_result(
-        _row_to_dict(cur, cur.fetchone()),
-        repository_scope=repository_scope,
-    )
+    result = _validate_deployment_implementation_result(
+        _row_to_dict(cur, cur.fetchone()), repository_scope=repository_scope)
+    return _require_passing_independent_review(cur, result, card_id=card_id, card_revision=card_revision)
 
 
 def _deployment_implementation_result_by_id(
@@ -711,10 +719,9 @@ def _deployment_implementation_result_by_id(
         """,
         (implementation_run_id, card_id, card_revision),
     )
-    return _validate_deployment_implementation_result(
-        _row_to_dict(cur, cur.fetchone()),
-        repository_scope=repository_scope,
-    )
+    result = _validate_deployment_implementation_result(
+        _row_to_dict(cur, cur.fetchone()), repository_scope=repository_scope)
+    return _require_passing_independent_review(cur, result, card_id=card_id, card_revision=card_revision)
 
 
 def _deployment_retry_binding(
@@ -1480,6 +1487,8 @@ def retry_card(
                 )
 
             phase = RunPhase(failed_run["phase"])
+            if phase is RunPhase.REVIEW:
+                raise AgentStateConflictError("Review executor failure requires human attention; retry cannot reset the review budget")
             target_status = queued_card_status_for_phase(phase)
             _require_transition(card["status"], target_status)
 
@@ -1553,6 +1562,12 @@ def retry_card(
                     )
                 ),
             )
+            if phase is RunPhase.IMPLEMENTATION:
+                cur.execute("""UPDATE agent.runs AS retry
+                    SET result_metadata = prior.result_metadata,
+                        review_cycle = prior.review_cycle, review_attempt = prior.review_attempt
+                    FROM agent.runs AS prior WHERE retry.id = %s AND prior.id = %s""",
+                    (run_id, failed_run["id"]))
             _update_card_status(
                 cur,
                 card_id=card_id,
@@ -1868,6 +1883,132 @@ def close_card(
                 },
             )
 
+        result = _card_detail(conn, card_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def _require_passing_independent_review(cur, result, *, card_id, card_revision):
+    from backend.core.codex_review import candidate_digest, verify_candidate, parse_verdict
+    metadata = result["result_metadata"]
+    try:
+        digest = candidate_digest(metadata, run_id=result["id"], revision=card_revision)
+        if digest != metadata.get("candidate_digest"):
+            raise ValueError("Candidate identity changed")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AgentStateConflictError("Deployment requires independent review of the exact candidate") from exc
+    cur.execute("""SELECT id, result_metadata FROM agent.runs
+        WHERE card_id = %s AND card_revision = %s AND phase = 'review'
+          AND status = 'succeeded'
+          AND result_metadata #>> '{independent_review,verdict}' = 'pass'
+          AND result_metadata #>> '{independent_review,implementation_run_id}' = %s
+          AND result_metadata #>> '{independent_review,candidate_digest}' = %s
+        ORDER BY created_at DESC, id DESC LIMIT 1""",
+        (card_id, card_revision, str(result["id"]), digest))
+    reviewed = _row_to_dict(cur, cur.fetchone())
+    evidence = reviewed.get("result_metadata", {}).get("independent_review", {}) if reviewed else {}
+    if (evidence.get("verdict") != "pass" or evidence.get("candidate_digest") != digest
+        or evidence.get("implementation_run_id") != str(result["id"])
+        or evidence.get("card_revision") != card_revision
+        or not evidence.get("thread_id") or not evidence.get("turn_id")
+        or not evidence.get("validation_evidence")):
+        raise AgentStateConflictError("Deployment requires passing independent review for this revision and digest")
+    try:
+        parse_verdict(json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}))
+        verify_candidate(metadata, run_id=result["id"], revision=card_revision, live=True)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise AgentStateConflictError("Candidate changed or is unavailable after independent review") from exc
+    # Include only database-backed verdict evidence in the deployment source.
+    result = {**result, "result_metadata": {**metadata, "independent_review": evidence}}
+    return result
+
+
+def _exhausted_review(card, run):
+    evidence = _run_metadata(run).get("independent_review", {}) if run else {}
+    return (isinstance(evidence, dict) and card.get("status") == "blocked" and card.get("resume_status") == "review_queued"
+            and card.get("repository_scope") in {"backend", "android"}
+            and run is not None and run.get("phase") == "review"
+            and run.get("status") == "succeeded" and run.get("card_revision") == card.get("revision")
+            and evidence.get("verdict") == "changes_requested" and evidence.get("review_attempt") == 3)
+
+
+def _review_decisions(evidence, decisions):
+    from backend.core.codex_review import parse_verdict
+    parse_verdict(json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}))
+    if (not isinstance(decisions, list) or len(decisions) != len(evidence["findings"])
+        or any(not isinstance(d, dict) or set(d) != {"finding_index", "decision"}
+               or type(d["finding_index"]) is not int
+               or d["decision"] not in {"fix", "defer_ignore"} for d in decisions)
+        or sorted(d["finding_index"] for d in decisions) != list(range(len(evidence["findings"])))):
+        raise ValueError("Choose fix or defer/ignore for every exact finding")
+    return [{**d, "finding": evidence["findings"][d["finding_index"]]} for d in decisions]
+
+
+def request_review_revision(*, card_id, requested_by, review_run_id, candidate_digest, notes, decisions):
+    """Serialized on the card lock. Retries after success conflict; no duplicate cycle."""
+    from backend.core.codex_review import verify_candidate
+    notes = _required_text(notes, field="notes", maximum=2000)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+            cur.execute("""SELECT * FROM agent.runs WHERE card_id = %s
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""", (card_id,))
+            review = _row_to_dict(cur, cur.fetchone())
+            if not _exhausted_review(card, review) or str(review["id"]) != review_run_id:
+                raise AgentStateConflictError("Request Revision requires the exact latest exhausted third review")
+            metadata = _run_metadata(review)
+            evidence = metadata["independent_review"]
+            source = metadata.get("review_source", {})
+            if (evidence.get("candidate_digest") != candidate_digest
+                or evidence.get("implementation_run_id") != source.get("implementation_run_id")
+                or evidence.get("review_cycle") != str(review.get("review_cycle"))
+                or review.get("review_attempt") != 3 or source.get("review_attempt") != 3
+                or source.get("review_cycle") != evidence.get("review_cycle")
+                or evidence.get("card_revision") != card["revision"]):
+                raise AgentStateConflictError("Review candidate identity changed")
+            bound_decisions = _review_decisions(evidence, decisions)
+            cur.execute("""SELECT * FROM agent.runs WHERE card_id = %s AND card_revision = %s
+                AND phase = 'implementation' AND status = 'succeeded'
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""", (card_id, card["revision"]))
+            implementation = _row_to_dict(cur, cur.fetchone())
+            if implementation is None or str(implementation["id"]) != evidence["implementation_run_id"]:
+                raise AgentStateConflictError("Review is not bound to the latest candidate")
+            implementation_metadata = _run_metadata(implementation)
+            if (implementation_metadata.get("candidate_digest") != candidate_digest
+                or implementation_metadata.get("repository_scope") != card["repository_scope"]
+                or source.get("implementation_metadata", {}).get("candidate_digest") != candidate_digest):
+                raise AgentStateConflictError("Candidate digest changed")
+            try:
+                verify_candidate(implementation_metadata, run_id=str(implementation["id"]), revision=card["revision"], live=True)
+            except Exception as exc:
+                raise AgentStateConflictError("Candidate changed or is unavailable") from exc
+            revision = card["revision"] + 1
+            handoff = {"actor_user_id": str(requested_by), "review_run_id": review_run_id,
+                       "prior_revision": card["revision"], "review_cycle": evidence["review_cycle"],
+                       "review_attempt": 3, "implementation_run_id": evidence["implementation_run_id"],
+                       "candidate_digest": candidate_digest, "notes": notes, "decisions": bound_decisions}
+            history = implementation_metadata.get("human_review_handoffs", []) + [handoff]
+            message_id = _insert_message(cur, card_id=card_id, author_type="user", content=notes,
+                                         created_by=requested_by, client_message_id=None)
+            _insert_approval(cur, card_id=card_id, approval_type="implementation", card_revision=revision,
+                             decided_by=requested_by, notes=notes)
+            run_id = _insert_run(cur, card_id=card_id, phase=RunPhase.IMPLEMENTATION,
+                                 card_revision=revision, requested_by=requested_by, input_message_id=message_id)
+            next_metadata = {"review_cycle": run_id, "review_attempt": 1,
+                             "human_review_handoffs": history,
+                             "review_findings": [d["finding"] for d in bound_decisions if d["decision"] == "fix"]}
+            cur.execute("UPDATE agent.runs SET result_metadata = %s::jsonb WHERE id = %s",
+                        (json.dumps(next_metadata), run_id))
+            _require_transition(card["status"], CardStatus.IMPLEMENTATION_QUEUED)
+            _update_card_status(cur, card_id=card_id, status=CardStatus.IMPLEMENTATION_QUEUED, revision=revision)
+            _insert_event(cur, card_id=card_id, event_type="review.human_revision_requested", actor_type="user",
+                          actor_user_id=requested_by, payload={**handoff, "revision": revision, "run_id": run_id})
         result = _card_detail(conn, card_id)
         conn.commit()
         return result

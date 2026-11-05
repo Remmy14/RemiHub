@@ -18,6 +18,8 @@ from backend.core.codex_planning import (
     CodexTemporaryFailure,
     OpenAICodexPlanningGateway,
     PLANNING_OUTPUT_SCHEMA,
+    PLANNING_DEVELOPER_INSTRUCTIONS,
+    _planning_prompt,
     _is_remote_compact_not_found,
     _parse_planning_response,
 )
@@ -68,6 +70,13 @@ class RecordingGateway:
 
 
 class CodexPlanningExecutorTests(unittest.TestCase):
+    def test_same_thread_developer_instructions_do_not_prohibit_implementation(self):
+        instructions = PLANNING_DEVELOPER_INSTRUCTIONS.lower()
+        self.assertIn("planning turns", instructions)
+        self.assertIn("implementation and review turns", instructions)
+        self.assertNotIn("work only in the planning phase", instructions)
+        self.assertIn("PLANNING turn", _planning_prompt(claimed_run()))
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
