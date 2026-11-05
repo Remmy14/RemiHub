@@ -387,6 +387,8 @@ class _UnusedBackendComponent:
 class GitAndroidDeploymentManager(GitBackendDeploymentManager):
     """Materialize one reviewed Android patch and publish a protected APK release."""
 
+    BACKEND_QA_PARITY_REQUIRED = False
+
     PROTECTED_ANDROID_PATHS = frozenset(
         {
             "gradlew",

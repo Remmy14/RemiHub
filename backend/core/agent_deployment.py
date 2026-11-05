@@ -1543,6 +1543,8 @@ class PrivilegedBackendGitHubSynchronizer:
 class GitBackendDeploymentManager:
     """Validate, test, migrate, promote, verify, and roll back one backend candidate."""
 
+    BACKEND_QA_PARITY_REQUIRED = True
+
     MAX_PATCH_BYTES = 5_000_000
     MAX_CHANGED_FILES = 100
     PROTECTED_BACKEND_PATHS = frozenset(
@@ -1680,11 +1682,11 @@ class GitBackendDeploymentManager:
                 f"{self.environment} deployment target branch must be "
                 f"{expected_target_branch}"
             )
-        if self.environment == "production" and self.qa_history_reader is None:
+        if self.environment == "production" and self.BACKEND_QA_PARITY_REQUIRED and self.qa_history_reader is None:
             raise AgentWorkerConfigurationError(
                 "Production backend deployment requires QA migration parity reader"
             )
-        if self.environment == "production":
+        if self.environment == "production" and self.BACKEND_QA_PARITY_REQUIRED:
             if qa_candidate_repository is None:
                 raise AgentWorkerConfigurationError(
                     "Production backend deployment requires QA candidate repository"
