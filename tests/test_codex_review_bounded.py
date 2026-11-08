@@ -134,11 +134,8 @@ class DossierTests(unittest.TestCase):
     def test_qualification_provider_rejects_credentials_and_nonempty_tools(self):
         # Protocol validation is also tested without a listening socket; a host
         # qualify run additionally uses the real SDK and actual app-server.
-        path = Path(__file__).resolve().parents[1] / 'validation/reviewer-qualification/bounded.py'
-        spec = importlib.util.spec_from_file_location('bounded_qualification', path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        provider = object.__new__(module.SyntheticProvider)
+        from backend.core.codex_review_qualification import SyntheticProvider
+        provider = object.__new__(SyntheticProvider)
         provider.requests = [{'tools': [{'name': 'shell'}]}]
         provider.failures = []
         with self.assertRaisesRegex(RuntimeError, 'Nonempty'):
@@ -150,3 +147,63 @@ class DossierTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+import unittest as _rh_unittest
+
+
+class TestBoundedMixedValidationEvidence(_rh_unittest.TestCase):
+
+    def render(self, evidence):
+        import base64
+        import json
+        import tempfile
+        from pathlib import Path
+        from backend.core.codex_review_bounded import dossier
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("value = 1\n")
+
+            prompt = json.dumps({
+                "raw_diff_b64": base64.b64encode(b"diff").decode(),
+                "validation": evidence,
+            })
+
+            return json.loads(dossier(root, prompt))
+
+    def test_mixed_validation_preserved(self):
+        evidence = [
+            {"status": "passed", "command": "unit-tests",
+             "details": "14 passed"},
+            {"status": "passed", "command": "compileall",
+             "details": "Passed"},
+            {"status": "passed", "command": "git diff --check",
+             "details": "Passed"},
+            {"status": "failed", "command": "full-suite",
+             "details": "Interrupted; result unknown"},
+        ]
+
+        result = self.render(evidence)
+        self.assertEqual(result["context"]["validation"], evidence)
+
+    def test_not_run_preserved(self):
+        evidence = [
+            {"status": "passed"},
+            {"status": "not_run"},
+        ]
+
+        result = self.render(evidence)
+        self.assertEqual(result["context"]["validation"], evidence)
+
+    def test_invalid_evidence_blocks(self):
+        for evidence in (
+            [],
+            [{"status": "failed"}],
+            [{"status": "not_run"}],
+            [{"status": "invalid"}],
+            [{"status": "passed"}, {"status": "invalid"}],
+        ):
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(ValueError):
+                    self.render(evidence)
