@@ -33,6 +33,27 @@ from backend.core.codex_planning import CARD_THREAD_DEVELOPER_INSTRUCTIONS
 logger = logging.getLogger("remihub.agent_worker")
 
 
+def _require_backend_source_parity() -> None:
+    try:
+        result = subprocess.run(
+            ["/usr/local/libexec/remihub-agent-backend-parity-guard"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkerConfigurationError(
+            "Backend source parity guard unavailable"
+        ) from exc
+
+    if result.returncode != 0:
+        raise AgentWorkerConfigurationError(
+            "Backend source baseline mismatch; synchronization required: "
+            + (result.stderr.strip()[-600:] or "parity guard failed")
+        )
+
+
 IMPLEMENTATION_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -348,6 +369,11 @@ class CodexImplementationExecutor:
             raise AgentWorkerConfigurationError(
                 "Implementation requires the persistent planning Codex thread"
             )
+        if (
+            self.repository_scope is RepositoryScope.BACKEND
+            and os.environ.get("REMIHUB_AGENT_EXECUTOR") == "codex-implementation"
+        ):
+            _require_backend_source_parity()
 
         with self.workspace_manager.locked_workspace(
             claim,
