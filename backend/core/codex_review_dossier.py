@@ -4,6 +4,7 @@ Selection is deterministic: complete changed pre/post images, ancestor instructi
 referenced sibling sources, and tests named for changed modules. All other paths are explicit
 omissions. Context adequacy remains a mandatory reviewer decision.
 """
+import ast
 import base64
 import hashlib
 import json
@@ -91,6 +92,50 @@ def source_selection(repository, root, base):
             p = PurePosixPath(other)
             if (p.parent == parent and p.stem in references) or p.name == 'test_' + PurePosixPath(name).stem + '.py':
                 supporting.add(other)
+    # Include API routers importing changed backend modules and their
+    # directly imported response contracts from the frozen candidate.
+    changed_modules = {
+        name[:-3].replace('/', '.') for name in changed
+        if name.startswith('backend/') and name.endswith('.py')
+    }
+    if changed_modules:
+        from backend.core.codex_review_bounded import MAX_BYTES
+        for other in sorted(after):
+            if not (
+                other.startswith('backend/routers/')
+                and other.endswith('.py')
+            ):
+                continue
+            if after[other]['size'] > MAX_BYTES:
+                continue
+            content, _ = read_source(root, other)
+            try:
+                router_tree = ast.parse(content.decode('utf-8'))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            imports = set()
+            for node in ast.walk(router_tree):
+                if isinstance(node, ast.Import):
+                    imports.update(a.name for a in node.names)
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and node.level == 0
+                ):
+                    imports.add(node.module)
+                    imports.update(
+                        f'{node.module}.{a.name}' for a in node.names
+                    )
+            if imports.isdisjoint(changed_modules):
+                continue
+            supporting.add(other)
+            for module in imports:
+                if module.startswith(
+                    ('backend.models.', 'backend.schemas.')
+                ):
+                    candidate = module.replace('.', '/') + '.py'
+                    if candidate in after:
+                        supporting.add(candidate)
     supporting -= set(changed)
     # Never silently trim supporting candidates to fit the limit.
     from backend.core.codex_review_bounded import MAX_FILES, MAX_BYTES
@@ -127,7 +172,7 @@ def source_selection(repository, root, base):
         append(name, 'candidate', 'supporting', *read_source(root, name))
     omitted = [{'path': n, **after[n]} for n in sorted(after.keys() - set(changed) - supporting)]
     return {'base_manifest_sha256': hashlib.sha256(json.dumps(base, sort_keys=True).encode()).hexdigest(),
-            'policy': 'changed-pre-post+ancestor-instructions+referenced-siblings+named-tests-v1',
+            'policy': 'changed-pre-post+ancestor-instructions+referenced-siblings+named-tests+importing-routers-v2',
             'changed_paths': changed, 'sources': sources, 'omitted': omitted,
             'deleted_paths': sorted(set(changed) - after.keys()),
             'coverage': 'partial; reviewer must block if omitted context is necessary'}

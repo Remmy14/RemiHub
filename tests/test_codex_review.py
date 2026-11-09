@@ -134,6 +134,54 @@ class SyntheticCandidate(unittest.TestCase):
             self.assertEqual(self.executor.execute(self.claim).card_status, CardStatus.BLOCKED)
         self.gateway.run_turn.assert_not_called()
 
+    def test_mixed_validation_reaches_independent_reviewer(self):
+        self.metadata["tests"] = [
+            {"command": "python -m unittest tests.test_example",
+             "status": "passed", "details": "Relevant tests passed"},
+            {"command": "python -m unittest discover -s tests -q",
+             "status": "failed", "details": "Full suite interrupted"},
+        ]
+        self.metadata["candidate_digest"] = candidate_digest(
+            self.metadata, run_id=self.run_id, revision=1
+        )
+
+        result = self.executor.execute(self.claim)
+
+        self.assertEqual(result.card_status, CardStatus.REVIEW_READY)
+        self.gateway.run_turn.assert_called_once()
+
+    def test_mixed_validation_can_request_corrections(self):
+        self.metadata["tests"] = [
+            {"command": "python -m unittest tests.test_example",
+             "status": "passed", "details": "Relevant tests passed"},
+            {"command": "python -m unittest discover -s tests -q",
+             "status": "failed", "details": "Full suite interrupted"},
+        ]
+        self.metadata["candidate_digest"] = candidate_digest(
+            self.metadata, run_id=self.run_id, revision=1
+        )
+
+        self.gateway.run_turn.side_effect = None
+        self.gateway.run_turn.return_value = {
+            "response": json.dumps({
+                "verdict": "changes_requested",
+                "summary": "Additional validation required",
+                "findings": [{
+                    "severity": "medium",
+                    "path": "example.py",
+                    "description": "Required coverage is missing",
+                    "correction": "Run the relevant missing tests",
+                    "kind": "required",
+                }],
+            }),
+            "thread_id": "reviewer-thread",
+            "turn_id": "reviewer-turn",
+        }
+
+        result = self.executor.execute(self.claim)
+
+        self.assertEqual(result.card_status, CardStatus.IMPLEMENTATION_QUEUED)
+
     def test_export_attributes_cannot_hide_or_rewrite_reviewed_files(self):
         (self.repo / '.gitattributes').write_text('hidden.txt export-ignore\nsubstitution.txt export-subst\n')
         (self.repo / 'hidden.txt').write_text('must remain visible\n')

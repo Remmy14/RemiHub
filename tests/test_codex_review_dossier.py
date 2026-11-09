@@ -100,6 +100,40 @@ class RealDossierTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'model'):
             Runtime('/usr/bin/true', 'fallback')
 
+
+    def test_changed_service_includes_router_and_contract(self):
+        files = {
+            'backend/services/example_service.py':
+                'def summary(): return 1\n',
+            'backend/routers/example.py':
+                'from backend.services import example_service as service\n'
+                'from backend.models.example_model import Response\n',
+            'backend/models/example_model.py':
+                'class Response: pass\n',
+            'backend/routers/unrelated.py':
+                'from backend.services import unrelated_service\n',
+        }
+        for name, content in files.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        self.git('add', '.')
+        self.git('commit', '-qm', 'add API fixture')
+        self.base = self.git('rev-parse', 'HEAD').decode().strip()
+
+        service = self.repo / 'backend/services/example_service.py'
+        service.write_text('def summary(): return 2\n')
+
+        value, _ = self.selected()
+        supporting = {
+            entry['path'] for entry in value['sources']
+            if entry['role'] == 'supporting'
+        }
+        self.assertIn('backend/routers/example.py', supporting)
+        self.assertIn('backend/models/example_model.py', supporting)
+        self.assertNotIn('backend/routers/unrelated.py', supporting)
+        self.assertTrue(value['coverage'].startswith('partial;'))
+
     def test_executor_real_selection_interface(self):
         from tests.test_codex_review import SyntheticCandidate
         fixture = SyntheticCandidate('test_first_pass_is_ready_but_requires_human_approval')

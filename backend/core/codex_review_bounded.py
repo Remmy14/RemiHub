@@ -50,8 +50,17 @@ def dossier(repository_path: Path, prompt: str) -> str:
     context = json.loads(prompt)
     raw = base64.b64decode(context.pop("raw_diff_b64"), validate=True)
     tests = context.get("validation")
-    if not isinstance(tests, list) or not tests or any(not isinstance(t, dict) or t.get("status") != "passed" for t in tests):
-        raise ValueError("Complete passing validation evidence required")
+    if (
+        not isinstance(tests, list)
+        or not tests
+        or any(
+            not isinstance(t, dict)
+            or t.get("status") not in {"passed", "failed", "not_run"}
+            for t in tests
+        )
+        or not any(t["status"] == "passed" for t in tests)
+    ):
+        raise ValueError("Usable validation evidence required")
     root = Path(repository_path)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Invalid frozen tree")

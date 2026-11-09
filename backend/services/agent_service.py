@@ -1470,7 +1470,8 @@ def retry_card(
 
             cur.execute(
                 """
-                SELECT id, phase, card_revision, input_message_id
+                SELECT id, phase, card_revision, input_message_id,
+                       review_cycle, review_attempt, result_metadata
                 FROM agent.runs
                 WHERE card_id = %s
                   AND status = 'failed'
@@ -1488,7 +1489,88 @@ def retry_card(
 
             phase = RunPhase(failed_run["phase"])
             if phase is RunPhase.REVIEW:
-                raise AgentStateConflictError("Review executor failure requires human attention; retry cannot reset the review budget")
+                from backend.core.codex_review import verify_candidate
+
+                cur.execute(
+                    """
+                    SELECT id FROM agent.runs
+                    WHERE card_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1 FOR UPDATE
+                    """,
+                    (card_id,),
+                )
+                latest_run = _row_to_dict(cur, cur.fetchone())
+                if latest_run is None or str(latest_run["id"]) != str(failed_run["id"]):
+                    raise AgentStateConflictError(
+                        "Review retry rejected: a newer run exists"
+                    )
+
+                metadata = _run_metadata(failed_run)
+                review_source = metadata.get("review_source")
+                cycle = failed_run.get("review_cycle")
+                attempt = failed_run.get("review_attempt")
+
+                if (
+                    card["repository_scope"] not in {"backend", "android"}
+                    or failed_run["card_revision"] != card["revision"]
+                    or not isinstance(review_source, dict)
+                    or not isinstance(cycle, (str, UUID))
+                    or type(attempt) is not int
+                    or not 1 <= attempt <= 3
+                    or str(cycle) != review_source.get("review_cycle")
+                    or attempt != review_source.get("review_attempt")
+                    or not isinstance(
+                        review_source.get("implementation_metadata"), dict
+                    )
+                ):
+                    raise AgentStateConflictError(
+                        "Review retry requires valid original review identity"
+                    )
+
+                implementation_id = review_source.get("implementation_run_id")
+                implementation_metadata = review_source["implementation_metadata"]
+
+                cur.execute(
+                    """
+                    SELECT id, result_metadata FROM agent.runs
+                    WHERE card_id = %s
+                      AND phase = 'implementation'
+                      AND status = 'succeeded'
+                      AND card_revision = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1 FOR UPDATE
+                    """,
+                    (card_id, card["revision"]),
+                )
+                implementation = _row_to_dict(cur, cur.fetchone())
+
+                if (
+                    implementation is None
+                    or str(implementation["id"]) != str(implementation_id)
+                    or implementation["result_metadata"] != implementation_metadata
+                    or implementation_metadata.get("repository_scope")
+                       != card["repository_scope"]
+                    or not isinstance(
+                        implementation_metadata.get("candidate_digest"), str
+                    )
+                ):
+                    raise AgentStateConflictError(
+                        "Review retry is not bound to the latest successful implementation"
+                    )
+
+                try:
+                    verify_candidate(
+                        implementation_metadata,
+                        run_id=str(implementation_id),
+                        revision=card["revision"],
+                        live=True,
+                    )
+                except Exception as exc:
+                    raise AgentStateConflictError(
+                        "Review candidate changed or is unavailable"
+                    ) from exc
+
             target_status = queued_card_status_for_phase(phase)
             _require_transition(card["status"], target_status)
 
@@ -1546,22 +1628,92 @@ def retry_card(
                     client_message_id=None,
                 )
 
-            run_id = _insert_run(
-                cur,
-                card_id=card_id,
-                phase=phase,
-                card_revision=failed_run["card_revision"],
-                requested_by=requested_by,
-                input_message_id=(
-                    retry_message_id
-                    if retry_message_id is not None
-                    else (
-                        failed_run["input_message_id"]
-                        if phase is RunPhase.PLANNING
-                        else None
+            if phase is RunPhase.REVIEW:
+                # A review attempt is unique per card revision.
+                # Requeue the existing execution rather than inserting
+                # a duplicate logical review attempt.
+                cur.execute(
+                    """
+                    SELECT attempt_count, error_message, finished_at,
+                           worker_id, result_message_id
+                    FROM agent.runs
+                    WHERE id = %s AND status = 'failed'
+                    FOR UPDATE
+                    """,
+                    (failed_run["id"],),
+                )
+                previous_execution = _row_to_dict(cur, cur.fetchone())
+                if previous_execution is None:
+                    raise AgentStateConflictError(
+                        "Review retry requires an existing failed execution"
                     )
-                ),
-            )
+
+                if previous_execution["attempt_count"] >= 3:
+                    raise AgentStateConflictError(
+                        "Review retry rejected: worker execution limit reached"
+                    )
+
+                run_id = str(failed_run["id"])
+
+                _insert_event(
+                    cur,
+                    card_id=card_id,
+                    event_type="run.review_retry_requested",
+                    actor_type="user",
+                    actor_user_id=requested_by,
+                    payload={
+                        "run_id": run_id,
+                        "review_cycle": str(cycle),
+                        "review_attempt": attempt,
+                        "previous_attempt_count": previous_execution["attempt_count"],
+                        "previous_error": previous_execution["error_message"],
+                        "previous_finished_at": (
+                            str(previous_execution["finished_at"])
+                            if previous_execution["finished_at"] else None
+                        ),
+                        "previous_worker_id": previous_execution["worker_id"],
+                        "previous_result_message_id": (
+                            str(previous_execution["result_message_id"])
+                            if previous_execution["result_message_id"] else None
+                        ),
+                    },
+                )
+
+                cur.execute(
+                    """
+                    UPDATE agent.runs
+                    SET status = 'queued',
+                        worker_id = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        last_heartbeat_at = NULL,
+                        available_at = CURRENT_TIMESTAMP,
+                        blocked_reason = NULL
+                    WHERE id = %s AND status = 'failed'
+                    """,
+                    (run_id,),
+                )
+                if cur.rowcount != 1:
+                    raise AgentStateConflictError(
+                        "Review retry could not requeue failed execution"
+                    )
+            else:
+                run_id = _insert_run(
+                    cur,
+                    card_id=card_id,
+                    phase=phase,
+                    card_revision=failed_run["card_revision"],
+                    requested_by=requested_by,
+                    input_message_id=(
+                        retry_message_id
+                        if retry_message_id is not None
+                        else (
+                            failed_run["input_message_id"]
+                            if phase is RunPhase.PLANNING
+                            else None
+                        )
+                    ),
+                )
             if phase is RunPhase.IMPLEMENTATION:
                 cur.execute("""UPDATE agent.runs AS retry
                     SET result_metadata = prior.result_metadata,

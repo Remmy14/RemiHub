@@ -155,6 +155,7 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
         {
             CardStatus.PLANNING_QUEUED,
             CardStatus.IMPLEMENTATION_QUEUED,
+            CardStatus.REVIEW_QUEUED,
             CardStatus.DEPLOYMENT_QUEUED,
             CardStatus.CANCELLED,
             CardStatus.CLOSED,
