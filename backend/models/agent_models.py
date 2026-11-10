@@ -41,6 +41,14 @@ class AgentInfrastructureReviewRetryRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class AgentEvidenceReviewRetryRequest(AgentRequestModel):
+    """Admin-requested repeat review of the same candidate with pinned Android evidence."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    android_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    notes: str = Field(min_length=1, max_length=2000)
+
+
 class AgentReviewRevisionRequest(AgentRequestModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     review_run_id: UUID

@@ -1487,6 +1487,219 @@ def return_to_implementation(
         put_db_conn(conn)
 
 
+
+# This narrowly defined recovery is NOT the ordinary review retry. It is for the
+# documented backend-v10 finding that lacked Android model/parser source, and
+# must not reopen reviews identifying implementation defects or other blockers.
+_ANDROID_CLIENT_EVIDENCE_FINDING_PATH = (
+    "Android client stats response model/parser (not supplied)"
+)
+_ANDROID_CLIENT_EVIDENCE_REPOSITORY = Path(
+    "/opt/remihub-agent/planning/android"
+)
+
+
+def _retryable_android_client_evidence_review(card: dict, run: dict | None) -> bool:
+    if (
+        card.get("status") != CardStatus.BLOCKED.value
+        or card.get("resume_status") != CardStatus.REVIEW_QUEUED.value
+        or card.get("repository_scope") != RepositoryScope.BACKEND.value
+        or not isinstance(run, dict)
+        or run.get("phase") != RunPhase.REVIEW.value
+        or run.get("status") != RunStatus.SUCCEEDED.value
+        or run.get("card_revision") != card.get("revision")
+        or type(run.get("attempt_count")) is not int
+        or run["attempt_count"] != 2  # exactly one execution remains
+        or run.get("review_attempt") != 1
+    ):
+        return False
+    metadata = _run_metadata(run)
+    evidence = metadata.get("independent_review")
+    source = metadata.get("review_source")
+    if not isinstance(evidence, dict) or not isinstance(source, dict):
+        return False
+    findings = evidence.get("findings")
+    return (
+        evidence.get("verdict") == "blocked"
+        and evidence.get("failure_type") is None
+        and evidence.get("review_attempt") == 1
+        and evidence.get("card_revision") == card.get("revision")
+        and evidence.get("review_cycle") == str(run.get("review_cycle"))
+        and source.get("review_cycle") == evidence.get("review_cycle")
+        and source.get("review_attempt") == 1
+        and source.get("implementation_run_id") == evidence.get("implementation_run_id")
+        and bool(evidence.get("thread_id") and evidence.get("turn_id"))
+        and evidence.get("boundary") == "qualified-no-tools"
+        and isinstance(findings, list) and len(findings) == 1
+        and isinstance(findings[0], dict)
+        and findings[0].get("kind") == "required"
+        and findings[0].get("path") == _ANDROID_CLIENT_EVIDENCE_FINDING_PATH
+        and "Android source and trusted compatibility-test evidence are absent"
+            in findings[0].get("description", "")
+        and "Supply the relevant Android response model and parsing code"
+            in findings[0].get("correction", "")
+        and "evidence_correction" not in source
+    )
+
+
+def _verify_android_context_commit(expected_commit: str) -> None:
+    """Reject stale/unknown evidence before queuing; reviewer rechecks at execution."""
+    import subprocess
+
+    if (
+        not isinstance(expected_commit, str)
+        or len(expected_commit) != 40
+        or any(character not in "0123456789abcdef" for character in expected_commit)
+    ):
+        raise ValueError("Android evidence commit must be a full 40-character Git SHA")
+    repository = _ANDROID_CLIENT_EVIDENCE_REPOSITORY
+    if not repository.is_dir() or not (repository / ".git").exists():
+        raise AgentStateConflictError("Committed Android evidence repository unavailable")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-c", "safe.directory=" + str(repository),
+             "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+             "-C", str(repository), "rev-parse", "--verify", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=15,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AgentStateConflictError("Android evidence revision could not be verified") from exc
+    if result.stdout.strip() != expected_commit:
+        raise AgentStateConflictError("Android evidence commit is not the verified repository HEAD")
+
+
+def retry_review_with_android_evidence(
+    *, card_id: str, review_run_id: str, candidate_digest: str,
+    android_commit: str, requested_by: str, notes: str,
+) -> dict:
+    """One bounded evidence-only re-review; same run/ordinal/digest, no approval."""
+    from backend.core.codex_review import verify_candidate
+
+    notes = _required_text(notes, field="notes", maximum=2000)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+            cur.execute("""SELECT * FROM agent.runs WHERE card_id = %s
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""", (card_id,))
+            review = _row_to_dict(cur, cur.fetchone())
+            if (not _retryable_android_client_evidence_review(card, review)
+                    or str(review["id"]) != str(review_run_id)):
+                raise AgentStateConflictError(
+                    "Evidence retry requires the latest Android-compatibility-only blocked review"
+                )
+            metadata = _run_metadata(review)
+            source = metadata["review_source"]
+            evidence = metadata["independent_review"]
+            if (
+                source.get("review_cycle") != str(review["review_cycle"])
+                or source.get("review_attempt") != review["review_attempt"]
+                or evidence.get("review_cycle") != source["review_cycle"]
+                or evidence.get("review_attempt") != source["review_attempt"]
+                or evidence.get("card_revision") != card["revision"]
+                or not isinstance(source.get("implementation_metadata"), dict)
+                or source["implementation_metadata"].get("candidate_digest") != candidate_digest
+                or evidence.get("candidate_digest") != candidate_digest
+            ):
+                raise AgentStateConflictError("Review candidate identity mismatch")
+
+            cur.execute("""SELECT id, result_metadata FROM agent.runs
+                WHERE card_id = %s AND phase = 'implementation'
+                  AND status = 'succeeded' AND card_revision = %s
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+                (card_id, card["revision"]))
+            implementation = _row_to_dict(cur, cur.fetchone())
+            implementation_metadata = source["implementation_metadata"]
+            if (
+                implementation is None
+                or str(implementation["id"]) != str(source["implementation_run_id"])
+                or implementation["result_metadata"] != implementation_metadata
+                or implementation_metadata.get("repository_scope") != "backend"
+            ):
+                raise AgentStateConflictError("Evidence retry is not bound to latest implementation")
+            try:
+                verify_candidate(implementation_metadata,
+                                 run_id=str(implementation["id"]),
+                                 revision=card["revision"], live=True)
+            except Exception as exc:
+                raise AgentStateConflictError("Candidate changed or is unavailable") from exc
+
+            # No second evidence-correction retry for the same review run.
+            cur.execute("""SELECT 1 FROM agent.events
+                WHERE card_id = %s AND event_type = 'review.evidence_retry_requested'
+                  AND payload->>'run_id' = %s LIMIT 1""", (card_id, str(review["id"])))
+            if cur.fetchone() is not None:
+                raise AgentStateConflictError("Evidence correction already attempted for this review")
+
+            _verify_android_context_commit(android_commit)
+            _require_transition(card["status"], CardStatus.REVIEW_QUEUED)
+            pin = {
+                "kind": "android_client_parser",
+                "repository_scope": "android",
+                "commit": android_commit,
+                "requested_by": str(requested_by),
+            }
+            _insert_event(
+                cur, card_id=card_id,
+                event_type="review.evidence_retry_requested", actor_type="user",
+                actor_user_id=requested_by,
+                payload={
+                    "run_id": str(review["id"]),
+                    "implementation_run_id": str(implementation["id"]),
+                    "candidate_digest": candidate_digest,
+                    "review_cycle": source["review_cycle"],
+                    "review_attempt": source["review_attempt"],
+                    "evidence_correction": pin,
+                    "requested_notes": notes,
+                    "previous_review": evidence,
+                    "previous_execution": {
+                        "run_id": str(review["id"]),
+                        "status": review["status"],
+                        "attempt_count": review["attempt_count"],
+                        "worker_id": review.get("worker_id"),
+                        "started_at": str(review.get("started_at")),
+                        "finished_at": str(review.get("finished_at")),
+                        "blocked_reason": review.get("blocked_reason"),
+                        "error_message": review.get("error_message"),
+                        "result_message_id": review.get("result_message_id"),
+                        "result_metadata": metadata,
+                    },
+                },
+            )
+            next_source = {**source, "evidence_correction": pin}
+            cur.execute("""UPDATE agent.runs SET
+                    status = 'queued', worker_id = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, last_heartbeat_at = NULL,
+                    started_at = NULL, finished_at = NULL,
+                    available_at = CURRENT_TIMESTAMP, blocked_reason = NULL,
+                    error_message = NULL, result_message_id = NULL,
+                    result_metadata = %s::jsonb
+                WHERE id = %s AND status = 'succeeded' AND attempt_count = 2""",
+                (json.dumps({"review_source": next_source}, sort_keys=True), review["id"]))
+            if cur.rowcount != 1:
+                raise AgentStateConflictError("Review evidence retry lost original execution")
+            _update_card_status(cur, card_id=card_id, status=CardStatus.REVIEW_QUEUED)
+        result = _card_detail(conn, card_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def retry_infrastructure_review(
     *, card_id: str, review_run_id: str, candidate_digest: str,
     requested_by: str, notes: str | None = None,

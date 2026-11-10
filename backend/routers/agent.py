@@ -10,6 +10,7 @@ from backend.models.agent_models import (
     AgentDecisionRequest,
     AgentReviewRevisionRequest,
     AgentInfrastructureReviewRetryRequest,
+    AgentEvidenceReviewRetryRequest,
     AgentErrorResponse,
     AgentGitHubSyncRetryRequest,
     AgentMessageCreate,
@@ -255,6 +256,31 @@ def retry_infrastructure_review(
             card_id=str(card_id), review_run_id=str(review_run_id),
             candidate_digest=request.candidate_digest,
             requested_by=principal.id, notes=request.notes,
+        )
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": card}
+
+
+@router.post(
+    "/cards/{card_id}/reviews/{review_run_id}/retry-evidence",
+    response_model=AgentCardResponse,
+    responses=CARD_ERROR_RESPONSES,
+)
+def retry_review_with_android_evidence(
+    card_id: UUID,
+    review_run_id: UUID,
+    request: AgentEvidenceReviewRetryRequest,
+    principal: AuthenticatedPrincipal = Depends(require_admin_principal),
+):
+    try:
+        card = agent_service.retry_review_with_android_evidence(
+            card_id=str(card_id),
+            review_run_id=str(review_run_id),
+            candidate_digest=request.candidate_digest,
+            android_commit=request.android_commit,
+            requested_by=principal.id,
+            notes=request.notes,
         )
     except Exception as exc:
         _raise_http_error(exc)

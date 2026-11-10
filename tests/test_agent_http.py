@@ -211,6 +211,34 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422)
         retry_review.assert_not_called()
 
+    @patch("backend.routers.agent.agent_service.retry_review_with_android_evidence")
+    def test_evidence_retry_requires_admin_exact_digest_and_commit(self, retry_evidence):
+        run = "6f640dfb-db73-4aa8-aaa1-5d9aae13eb72"
+        url = f"/agent/cards/{CARD_ID}/reviews/{run}/retry-evidence"
+        payload = {"candidate_digest": "a" * 64,
+                   "android_commit": "907083d48e4614d981ef5476795a378771d8f7c4",
+                   "notes": "Re-review with committed Android response parser"}
+        retry_evidence.return_value = card_detail(status="review_queued")
+        response = admin_client.post(url, json=payload)
+        self.assertEqual(response.status_code, 200)
+        retry_evidence.assert_called_once_with(
+            card_id=CARD_ID, review_run_id=run,
+            candidate_digest=payload["candidate_digest"],
+            android_commit=payload["android_commit"],
+            requested_by=USER_ID, notes=payload["notes"])
+        retry_evidence.reset_mock()
+        for delta in ({"android_commit": "not-a-commit"},
+                      {"candidate_digest": "tampered"},
+                      {"notes": ""},
+                      {"extra": "not-allowed"}):
+            self.assertEqual(admin_client.post(url, json={**payload, **delta}).status_code, 422)
+        retry_evidence.assert_not_called()
+        with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": "transition"}, clear=True):
+            self.assertEqual(strict_client.post(url, json=payload).status_code, 401)
+        retry_evidence.assert_not_called()
+        retry_evidence.side_effect = AgentConflictError("Review not eligible")
+        self.assertEqual(admin_client.post(url, json=payload).status_code, 409)
+
     def test_blank_card_description_is_rejected(self):
         response = admin_client.post(
             "/agent/cards",
@@ -223,7 +251,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         schema = admin_app.openapi()
         paths = schema["paths"]
 
-        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 12)
+        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 13)
         self.assertEqual(
             paths["/agent/cards"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"],
