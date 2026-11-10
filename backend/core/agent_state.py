@@ -141,6 +141,7 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
     ),
     CardStatus.BLOCKED: frozenset(
         {
+            CardStatus.REVIEW_QUEUED,
             CardStatus.IMPLEMENTATION_QUEUED,
             CardStatus.PLANNING,
             CardStatus.IMPLEMENTING,

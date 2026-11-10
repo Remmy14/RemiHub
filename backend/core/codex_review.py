@@ -41,13 +41,17 @@ Do not request application code changes merely to repair omitted dossier context
 Never pass with unresolved required findings or insufficient evidence.
 Required corrections are concrete correctness, security, approved-scope or
 validation defects. Optional improvements and preferences are advisory suggestions:
-mark their kind advisory; they must not prevent pass. Legacy findings without
-kind are required. Pass requires zero required findings; changes_requested needs
+mark their kind advisory; they must not prevent pass. Every new finding must include kind. Pass requires zero required findings; changes_requested needs
 at least one required finding. Authenticated human scope decisions supplied in
 human_review_handoffs are authoritative scope instructions, including defer/ignore,
 within the existing safety, validation and deployment constraints. Do not re-raise
 a deferred finding merely as a preference; report new concrete safety defects.
 A pass is a review verdict only; explicit human deployment approval is required.
+For every finding choose severity exactly from critical, high, medium, low and
+kind exactly from required or advisory. Supply a path string, a nonblank
+specific description and a nonblank actionable correction; each finding field
+must be at most 2000 characters. The summary must be nonblank and at most
+4000 characters. Return at most 50 findings. Never include an empty finding.
 """
 REVIEW_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -56,8 +60,10 @@ REVIEW_SCHEMA = {
         "summary": {"type": "string"},
         "findings": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "properties": {**{k: {"type": "string"} for k in
-                           ("severity", "path", "description", "correction")},
+            "properties": {"severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                           "path": {"type": "string"},
+                           "description": {"type": "string"},
+                           "correction": {"type": "string"},
                            "kind": {"type": "string", "enum": ["required", "advisory"]}},
             "required": ["severity", "path", "description", "correction", "kind"],
         }},
@@ -126,28 +132,50 @@ def verify_candidate(metadata: dict, *, run_id: str, revision: int, live: bool =
     return patch
 
 
+class ReviewOutputValidationError(ValueError):
+    """The model's structured review output violated the declared contract.
+
+    Only the field name and condition may enter logs; never raw model text.
+    """
+
+
 def parse_verdict(response: str) -> dict:
-    value = json.loads(response)
-    if (not isinstance(value, dict) or set(value) != {"verdict", "summary", "findings"}
-        or value["verdict"] not in {"pass", "changes_requested", "blocked"}
-        or not isinstance(value["summary"], str) or not value["summary"].strip()
-        or len(value["summary"]) > 4000 or not isinstance(value["findings"], list)
-        or len(value["findings"]) > 50):
-        raise ValueError("Malformed independent review verdict")
-    for finding in value["findings"]:
+    try:
+        value = json.loads(response)
+    except (ValueError, TypeError) as exc:
+        raise ReviewOutputValidationError("Review output is not valid JSON") from exc
+
+    if not isinstance(value, dict) or set(value) != {"verdict", "summary", "findings"}:
+        raise ReviewOutputValidationError("Review output requires verdict, summary and findings")
+    if not isinstance(value["verdict"], str) or value["verdict"] not in {"pass", "changes_requested", "blocked"}:
+        raise ReviewOutputValidationError("Review output has invalid verdict")
+    if (not isinstance(value["summary"], str)
+        or not value["summary"].strip() or len(value["summary"]) > 4000):
+        raise ReviewOutputValidationError("Review output summary must contain 1-4000 characters")
+    if not isinstance(value["findings"], list) or len(value["findings"]) > 50:
+        raise ReviewOutputValidationError("Review output findings must be an array of at most 50")
+
+    for index, finding in enumerate(value["findings"]):
+        prefix = f"Review finding {index + 1}"
         if (not isinstance(finding, dict)
-            or set(finding) not in ({"severity", "path", "description", "correction"},
-                                    {"severity", "path", "description", "correction", "kind"})
-            or finding.get("kind", "required") not in {"required", "advisory"}
-            or any(not isinstance(v, str) or len(v) > 2000 for v in finding.values())
-            or finding["severity"] not in {"critical", "high", "medium", "low"}
-            or not finding["description"].strip() or not finding["correction"].strip()):
-            raise ValueError("Malformed independent review finding")
+            or set(finding) != {"severity", "path", "description", "correction", "kind"}):
+            raise ReviewOutputValidationError(f"{prefix} has incorrect fields")
+        if not isinstance(finding.get("kind", "required"), str) or finding.get("kind", "required") not in {"required", "advisory"}:
+            raise ReviewOutputValidationError(f"{prefix} has invalid kind")
+        if not isinstance(finding["severity"], str) or finding["severity"] not in {"critical", "high", "medium", "low"}:
+            raise ReviewOutputValidationError(f"{prefix} has invalid severity")
+        for name in ("severity", "path", "description", "correction"):
+            field = finding[name]
+            if not isinstance(field, str) or len(field) > 2000:
+                raise ReviewOutputValidationError(f"{prefix} {name} exceeds contract")
+        if not finding["description"].strip() or not finding["correction"].strip():
+            raise ReviewOutputValidationError(f"{prefix} requires description and correction")
+
     required = [f for f in value["findings"] if f.get("kind", "required") == "required"]
     if value["verdict"] == "pass" and required:
-        raise ValueError("A passing review cannot have unresolved findings")
+        raise ReviewOutputValidationError("A passing review cannot have unresolved findings")
     if value["verdict"] == "changes_requested" and not required:
-        raise ValueError("Corrections require actionable findings")
+        raise ReviewOutputValidationError("Corrections require actionable findings")
     return value
 
 
@@ -333,6 +361,7 @@ class CodexReviewExecutor:
             # Malformed, unavailable quota, timeout, missing evidence: never deployable.
             evidence = {**identity, "verdict": "blocked", "summary": f"Review failed closed: {type(exc).__name__}",
                         "findings": [], "failure_type": type(exc).__name__,
+                        "failure_code": ("review_output_invalid" if isinstance(exc, ReviewOutputValidationError) else "review_execution_failed"),
                         "thread_id": turn.get("thread_id"), "turn_id": turn.get("turn_id"),
                         "validation_evidence": metadata.get("tests")}
         return ExecutionResult(message=evidence["summary"],

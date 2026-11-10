@@ -298,6 +298,42 @@ def _safe_reimplementation_failure(card: dict, latest_run: dict | None) -> bool:
     ))
 
 
+def _retryable_failed_closed_review(card: dict, run: dict | None) -> bool:
+    """Only a known fail-closed infrastructure outcome is eligible for re-execution.
+
+    Candidate identity and contents are verified separately under the card lock.
+    Legacy evidence must be constrained enough to recover the original v10 failure
+    without opening arbitrary model-blocked or security-blocked reviews.
+    """
+    if (card.get("status") != CardStatus.BLOCKED.value
+        or card.get("resume_status") != CardStatus.REVIEW_QUEUED.value
+        or card.get("repository_scope") not in {"backend", "android"}
+        or not isinstance(run, dict)
+        or run.get("phase") != RunPhase.REVIEW.value
+        or run.get("status") != RunStatus.SUCCEEDED.value
+        or run.get("card_revision") != card.get("revision")
+        or type(run.get("attempt_count")) is not int
+        or not 1 <= run["attempt_count"] < 3):
+        return False
+    evidence = _run_metadata(run).get("independent_review")
+    if not isinstance(evidence, dict) or evidence.get("verdict") != "blocked":
+        return False
+    if evidence.get("findings") != []:
+        return False
+    # A schema-invalid response can be returned by an otherwise successful
+    # Codex turn. Its thread/turn IDs are evidence, not disqualifiers.
+    if evidence.get("failure_code") == "review_output_invalid":
+        return evidence.get("failure_type") == "ReviewOutputValidationError"
+    # Only the narrowly documented legacy v10 failure had no turn identity.
+    # Do not extend this heuristic to arbitrary older blocked reviews.
+    if evidence.get("thread_id") is not None or evidence.get("turn_id") is not None:
+        return False
+    # Legacy reviewer: exact documented v10 error format, no successful turn.
+    return (evidence.get("failure_code") is None
+            and evidence.get("failure_type") == "ValueError"
+            and evidence.get("summary") == "Review failed closed: ValueError")
+
+
 def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]:
     status = CardStatus(card["status"])
     scope = coerce_repository_scope(card["repository_scope"])
@@ -329,6 +365,9 @@ def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]
 
     if _exhausted_review(card, latest_run):
         actions.append("request_revision")
+
+    if _retryable_failed_closed_review(card, latest_run):
+        actions.append("retry_review")
 
     recovery = card.get("deployment_recovery")
     if (
@@ -1448,6 +1487,115 @@ def return_to_implementation(
         put_db_conn(conn)
 
 
+def retry_infrastructure_review(
+    *, card_id: str, review_run_id: str, candidate_digest: str,
+    requested_by: str, notes: str | None = None,
+) -> dict:
+    """Repeat the same frozen review execution; never create an extra ordinal.
+
+    Previous verdict evidence stays in review.verdict and retry-requested events,
+    and the original agent message is left intact. No approval is created.
+    """
+    from backend.core.codex_review import verify_candidate
+    notes = _optional_text(notes, field="notes", maximum=2000)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            card = _locked_card(cur, card_id)
+            cur.execute("""SELECT * FROM agent.runs WHERE card_id = %s
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""", (card_id,))
+            review = _row_to_dict(cur, cur.fetchone())
+            if (not _retryable_failed_closed_review(card, review)
+                or str(review["id"]) != str(review_run_id)):
+                raise AgentStateConflictError(
+                    "Review retry requires the exact latest infrastructure-blocked review"
+                )
+            metadata = _run_metadata(review)
+            source = metadata.get("review_source")
+            evidence = metadata["independent_review"]
+            if (not isinstance(source, dict)
+                or source.get("review_cycle") != str(review.get("review_cycle"))
+                or source.get("review_attempt") != review.get("review_attempt")
+                or evidence.get("review_cycle") != source.get("review_cycle")
+                or evidence.get("review_attempt") != source.get("review_attempt")
+                or evidence.get("card_revision") != card["revision"]
+                or source.get("implementation_run_id") != evidence.get("implementation_run_id")
+                or not isinstance(source.get("implementation_metadata"), dict)
+                or source["implementation_metadata"].get("candidate_digest") != candidate_digest
+                or evidence.get("candidate_digest") != candidate_digest):
+                raise AgentStateConflictError("Review retry candidate identity mismatch")
+
+            cur.execute("""SELECT id, result_metadata FROM agent.runs
+                WHERE card_id = %s AND phase = 'implementation'
+                  AND status = 'succeeded' AND card_revision = %s
+                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+                (card_id, card["revision"]))
+            implementation = _row_to_dict(cur, cur.fetchone())
+            implementation_metadata = source["implementation_metadata"]
+            if (implementation is None
+                or str(implementation["id"]) != str(source["implementation_run_id"])
+                or implementation["result_metadata"] != implementation_metadata
+                or implementation_metadata.get("repository_scope") != card["repository_scope"]):
+                raise AgentStateConflictError("Review retry is not bound to latest implementation")
+            try:
+                verify_candidate(implementation_metadata, run_id=str(implementation["id"]),
+                                 revision=card["revision"], live=True)
+            except Exception as exc:
+                raise AgentStateConflictError("Review candidate changed or is unavailable") from exc
+
+            _require_transition(card["status"], CardStatus.REVIEW_QUEUED)
+            _insert_event(cur, card_id=card_id,
+                          event_type="review.infrastructure_retry_requested",
+                          actor_type="user", actor_user_id=requested_by,
+                          payload={"run_id": str(review["id"]),
+                                   "implementation_run_id": str(implementation["id"]),
+                                   "candidate_digest": candidate_digest,
+                                   "review_cycle": source["review_cycle"],
+                                   "review_attempt": source["review_attempt"],
+                                   "previous_attempt_count": review["attempt_count"],
+                                   "previous_review": evidence,
+                                   "previous_result_message_id": review.get("result_message_id"),
+                                   "previous_finished_at": str(review.get("finished_at")),
+                                   # Capture the execution fields that the queued
+                                   # transition will overwrite, in the SAME DB
+                                   # transaction as the run/card update. The
+                                   # run ID is retained for the review ordinal;
+                                   # this event identifies the prior execution.
+                                   "previous_execution": {
+                                       "run_id": str(review["id"]),
+                                       "status": review["status"],
+                                       "attempt_count": review["attempt_count"],
+                                       "worker_id": review.get("worker_id"),
+                                       "started_at": str(review.get("started_at")) if review.get("started_at") is not None else None,
+                                       "finished_at": str(review.get("finished_at")) if review.get("finished_at") is not None else None,
+                                       "error_message": review.get("error_message"),
+                                       "blocked_reason": review.get("blocked_reason"),
+                                       "result_message_id": review.get("result_message_id"),
+                                       "result_metadata": metadata,
+                                   },
+                                   "requested_notes": notes})
+            cur.execute("""UPDATE agent.runs SET
+                    status = 'queued', worker_id = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, last_heartbeat_at = NULL,
+                    started_at = NULL, finished_at = NULL,
+                    available_at = CURRENT_TIMESTAMP, blocked_reason = NULL,
+                    error_message = NULL, result_message_id = NULL,
+                    result_metadata = %s::jsonb
+                WHERE id = %s AND status = 'succeeded' AND attempt_count < 3""",
+                (json.dumps({"review_source": source}, sort_keys=True), review["id"]))
+            if cur.rowcount != 1:
+                raise AgentStateConflictError("Review retry lost original execution")
+            _update_card_status(cur, card_id=card_id, status=CardStatus.REVIEW_QUEUED)
+        result = _card_detail(conn, card_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
 def retry_card(
     *,
     card_id: str,
@@ -2134,7 +2282,8 @@ def request_review_revision(*, card_id, requested_by, review_run_id, candidate_d
             implementation_metadata = _run_metadata(implementation)
             if (implementation_metadata.get("candidate_digest") != candidate_digest
                 or implementation_metadata.get("repository_scope") != card["repository_scope"]
-                or source.get("implementation_metadata", {}).get("candidate_digest") != candidate_digest):
+                or not isinstance(source.get("implementation_metadata"), dict)
+                or source["implementation_metadata"].get("candidate_digest") != candidate_digest):
                 raise AgentStateConflictError("Candidate digest changed")
             try:
                 verify_candidate(implementation_metadata, run_id=str(implementation["id"]), revision=card["revision"], live=True)

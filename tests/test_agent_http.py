@@ -186,6 +186,31 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             notes="Retry the approved candidate",
         )
 
+    @patch("backend.routers.agent.agent_service.retry_infrastructure_review")
+    def test_review_infrastructure_retry_is_admin_and_digest_bound(self, retry_review):
+        review_run_id = "6f640dfb-db73-4aa8-aaa1-5d9aae13eb72"
+        digest = "a" * 64
+        retry_review.return_value = card_detail(
+            status="review_queued", allowed_actions=["cancel"],
+        )
+        response = admin_client.post(
+            f"/agent/cards/{CARD_ID}/reviews/{review_run_id}/retry-infrastructure",
+            json={"candidate_digest": digest, "notes": "Resume failed-closed review"},
+        )
+        self.assertEqual(response.status_code, 200)
+        retry_review.assert_called_once_with(
+            card_id=CARD_ID, review_run_id=review_run_id,
+            candidate_digest=digest, requested_by=USER_ID,
+            notes="Resume failed-closed review",
+        )
+        retry_review.reset_mock()
+        invalid = admin_client.post(
+            f"/agent/cards/{CARD_ID}/reviews/{review_run_id}/retry-infrastructure",
+            json={"candidate_digest": "not-a-valid-digest"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        retry_review.assert_not_called()
+
     def test_blank_card_description_is_rejected(self):
         response = admin_client.post(
             "/agent/cards",
@@ -198,7 +223,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         schema = admin_app.openapi()
         paths = schema["paths"]
 
-        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 11)
+        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 12)
         self.assertEqual(
             paths["/agent/cards"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"],

@@ -211,11 +211,11 @@ class AgentWorker:
 
     def process_once(self) -> bool:
         class_scopes = getattr(
-            type(self.executor),
+            self.executor,
             "allowed_repository_scopes",
             None,
         )
-        if class_scopes is None:
+        if not isinstance(class_scopes, frozenset):
             claim = self.queue.claim_next_run(
                 worker_id=self.worker_id,
                 lease_seconds=self.lease_seconds,

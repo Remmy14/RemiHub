@@ -9,6 +9,7 @@ from backend.models.agent_models import (
     AgentCardResponse,
     AgentDecisionRequest,
     AgentReviewRevisionRequest,
+    AgentInfrastructureReviewRetryRequest,
     AgentErrorResponse,
     AgentGitHubSyncRetryRequest,
     AgentMessageCreate,
@@ -235,6 +236,28 @@ def retry_card(
     except Exception as exc:
         _raise_http_error(exc)
 
+    return {"success": True, "data": card}
+
+
+@router.post(
+    "/cards/{card_id}/reviews/{review_run_id}/retry-infrastructure",
+    response_model=AgentCardResponse,
+    responses=CARD_ERROR_RESPONSES,
+)
+def retry_infrastructure_review(
+    card_id: UUID,
+    review_run_id: UUID,
+    request: AgentInfrastructureReviewRetryRequest,
+    principal: AuthenticatedPrincipal = Depends(require_admin_principal),
+):
+    try:
+        card = agent_service.retry_infrastructure_review(
+            card_id=str(card_id), review_run_id=str(review_run_id),
+            candidate_digest=request.candidate_digest,
+            requested_by=principal.id, notes=request.notes,
+        )
+    except Exception as exc:
+        _raise_http_error(exc)
     return {"success": True, "data": card}
 
 

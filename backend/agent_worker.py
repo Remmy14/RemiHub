@@ -41,6 +41,34 @@ from backend.services.agent_worker_service import DatabaseAgentQueue
 logger = logging.getLogger("remihub.agent_worker")
 
 
+def _implementation_validator_command(
+    scope: RepositoryScope,
+    frontend_command: str | None,
+    backend_command: str | None,
+) -> str:
+    """Choose the trusted validator by repository scope."""
+    if scope is RepositoryScope.BACKEND:
+        if not backend_command or not backend_command.strip():
+            raise AgentWorkerConfigurationError(
+                "Backend implementation requires "
+                "REMIHUB_AGENT_BACKEND_IMPLEMENTATION_VALIDATOR"
+            )
+        return backend_command.strip()
+
+    if scope is RepositoryScope.ANDROID:
+        if not frontend_command or not frontend_command.strip():
+            raise AgentWorkerConfigurationError(
+                "Android implementation requires "
+                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATOR"
+            )
+        return frontend_command.strip()
+
+    raise AgentWorkerConfigurationError(
+        "Unsupported implementation repository scope"
+    )
+
+
+
 def _positive_int(name: str, default: int, *, minimum: int = 1) -> int:
     configured = os.environ.get(name, str(default)).strip()
     try:
@@ -554,21 +582,19 @@ def build_executor(
         workspace_manager = GitImplementationWorkspaceManager(
             **workspace_arguments
         )
-        validator = (
-            CommandImplementationValidator(
-                command=settings.implementation_validator,
-                timeout_seconds=(
-                    settings.implementation_validation_timeout_seconds
-                ),
-            )
-            if settings.implementation_validator is not None
-            else None
+        validator_command = _implementation_validator_command(
+            implementation_scope,
+            settings.implementation_validator,
+            os.environ.get(
+                "REMIHUB_AGENT_BACKEND_IMPLEMENTATION_VALIDATOR"
+            ),
         )
-        if implementation_scope is RepositoryScope.ANDROID and validator is None:
-            raise AgentWorkerConfigurationError(
-                "Android implementation requires "
-                "REMIHUB_AGENT_IMPLEMENTATION_VALIDATOR"
-            )
+        validator = CommandImplementationValidator(
+            command=validator_command,
+            timeout_seconds=(
+                settings.implementation_validation_timeout_seconds
+            ),
+        )
         executor_arguments = {
             "workspace_manager": workspace_manager,
             "workspace_store": queue,

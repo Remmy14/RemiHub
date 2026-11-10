@@ -35,6 +35,12 @@ class AgentFindingDecision(AgentRequestModel):
     decision: Literal["fix", "defer_ignore"]
 
 
+class AgentInfrastructureReviewRetryRequest(AgentRequestModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class AgentReviewRevisionRequest(AgentRequestModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     review_run_id: UUID
@@ -55,6 +61,7 @@ class AgentCardAction(str, Enum):
     RETRY = "retry"
     RETURN_TO_IMPLEMENTATION = "return_to_implementation"
     RETRY_GITHUB_SYNC = "retry_github_sync"
+    RETRY_REVIEW = "retry_review"
     CANCEL = "cancel"
     CLOSE = "close"
 

@@ -99,7 +99,7 @@ class SyntheticCandidate(unittest.TestCase):
         self.gateway.run_turn.assert_not_called()
 
     def test_fail_fix_pass_and_third_failure(self):
-        finding = {'severity': 'high', 'path': 'example.py', 'description': 'Bad value', 'correction': 'Fix value'}
+        finding = {'severity': 'high', 'path': 'example.py', 'description': 'Bad value', 'correction': 'Fix value', 'kind': 'required'}
         self.gateway.run_turn.side_effect = None
         self.gateway.run_turn.return_value = {'response': json.dumps({'verdict': 'changes_requested', 'summary': 'Fix value', 'findings': [finding]}), 'thread_id': 'r', 'turn_id': 't'}
         result = self.executor.execute(self.claim)
@@ -119,6 +119,24 @@ class SyntheticCandidate(unittest.TestCase):
                 self.gateway.run_turn.side_effect = None
                 self.gateway.run_turn.return_value = turn
                 self.assertEqual(self.executor.execute(self.claim).card_status, CardStatus.BLOCKED)
+
+    def test_malformed_schema_response_preserves_real_turn_identity(self):
+        self.gateway.run_turn.side_effect = None
+        self.gateway.run_turn.return_value = {
+            'response': json.dumps({
+                'verdict': 'changes_requested', 'summary': 'Issue',
+                'findings': [{'severity': 'not-an-enum', 'path': 'example.py',
+                              'description': 'Fix', 'correction': 'Fix it', 'kind': 'required'}],
+            }),
+            'thread_id': 'returned-thread', 'turn_id': 'returned-turn',
+        }
+        result = self.executor.execute(self.claim)
+        self.assertEqual(result.card_status, CardStatus.BLOCKED)
+        evidence = result.metadata['independent_review']
+        self.assertEqual(evidence['failure_code'], 'review_output_invalid')
+        self.assertEqual(evidence['failure_type'], 'ReviewOutputValidationError')
+        self.assertEqual(evidence['thread_id'], 'returned-thread')
+        self.assertEqual(evidence['turn_id'], 'returned-turn')
 
     def test_timeout_quota_and_executor_error_fail_closed(self):
         for error in (TimeoutError(), RuntimeError('quota unavailable'), OSError('executor unavailable')):
@@ -381,6 +399,36 @@ class ReviewContractTests(unittest.TestCase):
         self.assertNotIn('implementation_metadata', projection)
         model.result_metadata['independent_review'] = {'verdict': 'blocked', 'findings': [], 'review_attempt': 2}
         self.assertEqual(model.model_dump(mode='json')['independent_review']['verdict'], 'blocked')
+
+    def test_schema_restricts_severity_and_parser_diagnoses_fields(self):
+        from backend.core.codex_review import REVIEW_SCHEMA, ReviewOutputValidationError
+        finding = REVIEW_SCHEMA['properties']['findings']['items']['properties']
+        self.assertEqual(finding['severity']['enum'], ['critical', 'high', 'medium', 'low'])
+        valid = {'verdict': 'changes_requested', 'summary': 'Fix issue',
+                 'findings': [{'severity': 'high', 'path': 'a.py',
+                               'description': 'Issue', 'correction': 'Fix it', 'kind': 'required'}]}
+        self.assertEqual(parse_verdict(json.dumps(valid))['verdict'], 'changes_requested')
+        for label, change in (
+            ('severity', {'severity': 'major'}),
+            ('kind', {'kind': 'optional'}),
+            ('correction', {'correction': '   '}),
+            ('description', {'description': '   '}),
+            ('path', {'path': 'x' * 2001}),
+            ('severity type', {'severity': []}),
+            ('kind type', {'kind': []}),
+        ):
+            with self.subTest(label=label):
+                payload = json.loads(json.dumps(valid))
+                payload['findings'][0].update(change)
+                with self.assertRaises(ReviewOutputValidationError):
+                    parse_verdict(json.dumps(payload))
+        missing_kind = json.loads(json.dumps(valid))
+        del missing_kind['findings'][0]['kind']
+        with self.assertRaises(ReviewOutputValidationError):
+            parse_verdict(json.dumps(missing_kind))
+        for response in ('{', '[]', '{"verdict": {}}'):
+            with self.subTest(response=response), self.assertRaises(ReviewOutputValidationError):
+                parse_verdict(response)
 
     def test_invalid_verdicts_cannot_pass(self):
         for payload in ({'verdict': 'approved'}, {'verdict': 'pass', 'summary': 'ok', 'findings': [{}]}, {'verdict': 'changes_requested', 'summary': 'fix', 'findings': []}):

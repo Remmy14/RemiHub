@@ -405,10 +405,12 @@ class AgentWorkerSettingsTests(unittest.TestCase):
         )
 
     @patch("backend.agent_worker.CodexImplementationExecutor")
+    @patch("backend.agent_worker.CommandImplementationValidator")
     @patch("backend.agent_worker.GitImplementationWorkspaceManager")
     def test_implementation_executor_requires_and_uses_workspace_paths(
         self,
         workspace_manager,
+        implementation_validator,
         implementation_executor,
     ):
         with patch.dict(
@@ -420,13 +422,15 @@ class AgentWorkerSettingsTests(unittest.TestCase):
                 "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
                 "REMIHUB_AGENT_GIT_TIMEOUT_SECONDS": "45",
                 "REMIHUB_CODEX_BIN": "/srv/agent/bin/codex-sandbox",
+                "REMIHUB_AGENT_BACKEND_IMPLEMENTATION_VALIDATOR": (
+                    "/srv/agent/bin/backend-validator"
+                ),
             },
             clear=True,
         ):
             settings = AgentWorkerSettings.from_environment()
-
-        queue = MagicMock()
-        result = build_executor(settings, queue=queue)
+            queue = MagicMock()
+            result = build_executor(settings, queue=queue)
 
         self.assertEqual(result, implementation_executor.return_value)
         workspace_manager.assert_called_once_with(
@@ -435,14 +439,39 @@ class AgentWorkerSettingsTests(unittest.TestCase):
             artifact_root="/srv/agent/artifacts",
             command_timeout_seconds=45,
         )
+        implementation_validator.assert_called_once_with(
+            command="/srv/agent/bin/backend-validator",
+            timeout_seconds=1200,
+        )
         implementation_executor.assert_called_once_with(
             workspace_manager=workspace_manager.return_value,
             workspace_store=queue,
             codex_bin="/srv/agent/bin/codex-sandbox",
             model=None,
             retry_after_seconds=900,
+            validator=implementation_validator.return_value,
         )
 
+
+    def test_backend_implementation_requires_trusted_validator(self):
+        with patch.dict(
+            os.environ,
+            {
+                "REMIHUB_AGENT_EXECUTOR": "codex-implementation",
+                "REMIHUB_AGENT_REPOSITORY": "/srv/agent/source.git",
+                "REMIHUB_AGENT_WORKTREE_ROOT": "/srv/agent/worktrees",
+                "REMIHUB_AGENT_ARTIFACT_ROOT": "/srv/agent/artifacts",
+                "REMIHUB_CODEX_BIN": "/srv/agent/bin/codex-sandbox",
+            },
+            clear=True,
+        ):
+            settings = AgentWorkerSettings.from_environment()
+            with patch("backend.agent_worker.GitImplementationWorkspaceManager"):
+                with self.assertRaisesRegex(
+                    AgentWorkerConfigurationError,
+                    "Backend implementation requires",
+                ):
+                    build_executor(settings, queue=MagicMock())
 
     @patch("backend.agent_worker.CodexImplementationExecutor")
     @patch("backend.agent_worker.CommandImplementationValidator")
