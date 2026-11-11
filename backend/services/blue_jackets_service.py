@@ -389,8 +389,16 @@ def attendance_summary(*, user_id: str, season: int | None = None) -> dict:
     finally:
         put_db_conn(conn)
     opponents = sorted({r["opponent_abbrev"] for r in rows})
+    regular_rows = [r for r in rows if r["game_type"] == 2]
+    playoff_rows = [r for r in rows if r["game_type"] == 3]
     return {"season": season, **_summary(rows),
             "by_opponent": {o: _summary([r for r in rows if r["opponent_abbrev"] == o])
                             for o in opponents},
-            "regular_season": _summary([r for r in rows if r["game_type"] == 2]),
-            "playoffs": _summary([r for r in rows if r["game_type"] == 3])}
+            "by_opponent_regular_season": {
+                o: _summary([r for r in regular_rows if r["opponent_abbrev"] == o])
+                for o in sorted({r["opponent_abbrev"] for r in regular_rows})},
+            "by_opponent_playoffs": {
+                o: _summary([r for r in playoff_rows if r["opponent_abbrev"] == o])
+                for o in sorted({r["opponent_abbrev"] for r in playoff_rows})},
+            "regular_season": _summary(regular_rows),
+            "playoffs": _summary(playoff_rows)}

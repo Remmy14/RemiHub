@@ -51,9 +51,15 @@ to one season. The response has `games_attended` (completed games),
 `pending_attended_games`, `wins`, `regulation_losses`, `ot_shootout_losses`,
 `win_percentage` (0–100), `goals_for`, `goals_against`, `goal_differential`,
 `shots_for`, `shots_against`, `averages`, `available_game_counts`,
-`by_opponent`, `regular_season`, and `playoffs`. Totals and averages for a
-metric are null if any completed attended game lacks that metric; the count
-reports coverage. Going games never affect these totals.
+`by_opponent`, `by_opponent_regular_season`, `by_opponent_playoffs`,
+`regular_season`, and `playoffs`. `by_opponent` remains the combined map of
+opponent abbreviations to the same W–L–OTL summary shape as the overall totals.
+The two new maps use that same shape, restricted to game type 2 (regular season)
+or 3 (playoffs). They include opponents with pending attended games and are
+empty objects when there is no attendance in that competition. The optional
+season filter applies to all three opponent maps and all totals. Totals and
+averages for a metric are null if any completed attended game lacks that metric;
+the count reports coverage. Going games never affect these totals.
 
 ## Errors
 

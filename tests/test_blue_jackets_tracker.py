@@ -95,6 +95,51 @@ class NHLParserTests(unittest.TestCase):
 
 
 class SummaryTests(unittest.TestCase):
+    @staticmethod
+    def _row(opponent, game_type, result, *, season=20212022, shots_for=30):
+        return {"opponent_abbrev": opponent, "game_type": game_type, "season": season,
+                "result": result, "goals_for": 3 if result else None,
+                "goals_against": 2 if result else None,
+                "shots_for": shots_for if result else None,
+                "shots_against": 25 if result else None}
+
+    def _attendance_summary(self, rows, season=None):
+        class Cursor:
+            description = [(key,) for key in (rows[0] if rows else
+                           ("game_type", "opponent_abbrev", "season", "result",
+                            "goals_for", "goals_against", "shots_for", "shots_against"))]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def execute(self, sql, params):
+                self.sql = sql
+                self.params = params
+
+            def fetchall(self):
+                return [tuple(row[key[0]] for key in self.description) for row in rows]
+
+        class Connection:
+            def __init__(self):
+                self.test_cursor = Cursor()
+
+            def cursor(self):
+                return self.test_cursor
+
+        conn = Connection()
+        with patch.object(service, "get_db_conn", return_value=conn), \
+             patch.object(service, "put_db_conn") as release:
+            result = service.attendance_summary(user_id=USER.id, season=season)
+        self.assertIn("attendance.user_id = %s AND attendance.status = 'attended'",
+                      conn.test_cursor.sql)
+        self.assertIn("game.season = %s::integer", conn.test_cursor.sql)
+        self.assertEqual(conn.test_cursor.params, (USER.id, season, season))
+        release.assert_called_once_with(conn)
+        return result
+
     def test_attended_only_completed_totals_and_missing_shots(self):
         rows = [
             {"result": "W", "goals_for": 8, "goals_against": 2,
@@ -115,6 +160,57 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result["available_game_counts"]["shots_for"], 1)
         self.assertIsNone(service._summary(rows[2:])["shots_for"])
         self.assertEqual(service._summary(rows[:1])["games_attended"], 1)
+
+    def test_opponents_split_by_competition_without_changing_combined_summary(self):
+        regular_win = self._row("NYR", 2, "W")
+        regular_loss = self._row("BOS", 2, "L")
+        playoff_otl = self._row("NYR", 3, "OTL", shots_for=None)
+        playoff_pending = self._row("CAR", 3, None)
+        rows = [regular_win, regular_loss, playoff_otl, playoff_pending]
+        result = self._attendance_summary(rows)
+
+        self.assertEqual(set(result), {"season", *service._summary(rows),
+                                       "by_opponent", "by_opponent_regular_season",
+                                       "by_opponent_playoffs", "regular_season", "playoffs"})
+        self.assertEqual(result["by_opponent"], {
+            "BOS": service._summary([regular_loss]),
+            "CAR": service._summary([playoff_pending]),
+            "NYR": service._summary([regular_win, playoff_otl]),
+        })
+        self.assertEqual(result["by_opponent_regular_season"], {
+            "BOS": service._summary([regular_loss]),
+            "NYR": service._summary([regular_win]),
+        })
+        self.assertEqual(result["by_opponent_playoffs"], {
+            "CAR": service._summary([playoff_pending]),
+            "NYR": service._summary([playoff_otl]),
+        })
+        self.assertEqual((result["by_opponent"]["NYR"]["wins"],
+                          result["by_opponent"]["NYR"]["ot_shootout_losses"]), (1, 1))
+        self.assertEqual(result["by_opponent_playoffs"]["CAR"]["pending_attended_games"], 1)
+        self.assertIsNone(result["by_opponent_playoffs"]["NYR"]["shots_for"])
+        self.assertEqual(result["regular_season"], service._summary(rows[:2]))
+        self.assertEqual(result["playoffs"], service._summary(rows[2:]))
+        self.assertEqual(result["games_attended"], 3)
+        self.assertEqual(result["pending_attended_games"], 1)
+
+    def test_season_filter_and_absent_playoff_attendance(self):
+        regular = self._row("NYR", 2, "W")
+        result = self._attendance_summary([regular], season=20212022)
+        self.assertEqual(result["season"], 20212022)
+        self.assertEqual(result["by_opponent"], {"NYR": service._summary([regular])})
+        self.assertEqual(result["by_opponent_regular_season"], result["by_opponent"])
+        self.assertEqual(result["by_opponent_playoffs"], {})
+        self.assertEqual(result["playoffs"], service._summary([]))
+
+    def test_no_attendance_returns_empty_opponent_maps(self):
+        result = self._attendance_summary([], season=20212022)
+        self.assertEqual(result["by_opponent"], {})
+        self.assertEqual(result["by_opponent_regular_season"], {})
+        self.assertEqual(result["by_opponent_playoffs"], {})
+        self.assertEqual(result["games_attended"], 0)
+        self.assertEqual(result["regular_season"], service._summary([]))
+        self.assertEqual(result["playoffs"], service._summary([]))
 
 
 class AttendanceServiceTests(unittest.TestCase):
@@ -169,6 +265,15 @@ class AttendanceServiceTests(unittest.TestCase):
 
 
 class RouteAndWorkerTests(unittest.TestCase):
+    def test_summary_route_preserves_envelope_and_principal(self):
+        summary = {"by_opponent": {}, "by_opponent_regular_season": {},
+                   "by_opponent_playoffs": {}}
+        with patch.object(blue_jackets.service, "attendance_summary",
+                          return_value=summary) as aggregate:
+            response = blue_jackets.get_summary(season=20212022, principal=USER)
+        self.assertEqual(response, {"success": True, "data": summary})
+        aggregate.assert_called_once_with(user_id=USER.id, season=20212022)
+
     def test_every_route_requires_strict_principal(self):
         for route in blue_jackets.router.routes:
             dependencies = [dep.call for dep in route.dependant.dependencies]

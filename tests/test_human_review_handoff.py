@@ -29,8 +29,10 @@ class FindingContractTests(unittest.TestCase):
         for verdict, findings in [('pass', [FINDING]), ('changes_requested', [advisory]),
                                   ('pass', [{**FINDING, 'kind': 'optional'}])]:
             with self.subTest(verdict=verdict, findings=findings), self.assertRaises(ValueError):
-                parse_verdict(json.dumps({'verdict': verdict, 'summary': 'ok', 'findings': findings}))
-        parse_verdict(json.dumps({'verdict': 'changes_requested', 'summary': 'fix', 'findings': [FINDING, advisory]}))
+                parse_verdict(json.dumps({'verdict': verdict, 'summary': 'ok', 'findings': findings}),
+                              allow_legacy_findings=True)
+        parse_verdict(json.dumps({'verdict': 'changes_requested', 'summary': 'fix', 'findings': [FINDING, advisory]}),
+                      allow_legacy_findings=True)
 
     def test_request_model_rejects_missing_notes_and_forged_authority(self):
         valid = dict(review_run_id=str(uuid4()), candidate_digest='a' * 64, notes='Fix one, defer the other',

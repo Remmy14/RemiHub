@@ -139,7 +139,7 @@ class ReviewOutputValidationError(ValueError):
     """
 
 
-def parse_verdict(response: str) -> dict:
+def parse_verdict(response: str, *, allow_legacy_findings: bool = False) -> dict:
     try:
         value = json.loads(response)
     except (ValueError, TypeError) as exc:
@@ -157,8 +157,19 @@ def parse_verdict(response: str) -> dict:
 
     for index, finding in enumerate(value["findings"]):
         prefix = f"Review finding {index + 1}"
-        if (not isinstance(finding, dict)
-            or set(finding) != {"severity", "path", "description", "correction", "kind"}):
+        expected_fields = {
+            "severity", "path", "description", "correction", "kind"
+        }
+        if (
+            not isinstance(finding, dict)
+            or (
+                set(finding) != expected_fields
+                and not (
+                    allow_legacy_findings
+                    and set(finding) == expected_fields - {"kind"}
+                )
+            )
+        ):
             raise ReviewOutputValidationError(f"{prefix} has incorrect fields")
         if not isinstance(finding.get("kind", "required"), str) or finding.get("kind", "required") not in {"required", "advisory"}:
             raise ReviewOutputValidationError(f"{prefix} has invalid kind")

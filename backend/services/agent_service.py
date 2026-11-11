@@ -2452,7 +2452,10 @@ def _exhausted_review(card, run):
 
 def _review_decisions(evidence, decisions):
     from backend.core.codex_review import parse_verdict
-    parse_verdict(json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}))
+    parse_verdict(
+        json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}),
+        allow_legacy_findings=True,
+    )
     if (not isinstance(decisions, list) or len(decisions) != len(evidence["findings"])
         or any(not isinstance(d, dict) or set(d) != {"finding_index", "decision"}
                or type(d["finding_index"]) is not int
