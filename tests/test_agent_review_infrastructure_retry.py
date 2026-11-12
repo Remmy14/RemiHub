@@ -72,6 +72,87 @@ class FailedClosedReviewRecoveryTests(unittest.TestCase):
                     evidence["failure_code"] = "review_execution_failed"
                 self.assertNotIn("retry_review", svc._allowed_actions(card, latest_run=review))
 
+    def test_missing_dossier_evidence_retry_is_advertised_and_same_run_requeues(self):
+        card, review, impl = fixtures()
+        evidence = review["result_metadata"]["independent_review"]
+        evidence.update({
+            "failure_type": None,
+            "failure_code": "review_dossier_context_missing",
+            "boundary": "qualified-no-tools",
+            "thread_id": "independent-thread",
+            "turn_id": "independent-turn",
+            "missing_dossier_paths": ["backend/services/agent_worker_service.py"],
+            "findings": [{"kind": "required", "severity": "high",
+                          "path": "backend/services/agent_worker_service.py",
+                          "description": "Caller was absent from frozen dossier",
+                          "correction": "Supply the frozen caller source"}],
+        })
+        self.assertIn("retry_review", svc._allowed_actions(card, latest_run=review))
+        result, error, conn, cur, event, status, verify = self.run_recovery(
+            card=card, review=review, implementation=impl)
+        self.assertIsNone(error)
+        self.assertEqual(result["status"], "review_queued")
+        self.assertEqual(event.call_args.kwargs["payload"]["previous_review"], evidence)
+        self.assertTrue(any("UPDATE agent.runs" in call.args[0]
+                            for call in cur.execute.call_args_list))
+        conn.commit.assert_called_once()
+
+    def test_missing_dossier_recovery_rejects_unverified_or_defect_findings(self):
+        for mode in ("missing-classification", "wrong-omission", "extra-defect",
+                     "wrong-attempt", "wrong-candidate", "unqualified"):
+            with self.subTest(mode=mode):
+                card, review, _ = fixtures()
+                evidence = review["result_metadata"]["independent_review"]
+                evidence.update({
+                    "failure_type": None,
+                    "failure_code": "review_dossier_context_missing",
+                    "boundary": "qualified-no-tools",
+                    "thread_id": "independent-thread", "turn_id": "independent-turn",
+                    "missing_dossier_paths": ["backend/services/agent_worker_service.py"],
+                    "findings": [{"kind": "required", "path": "backend/services/agent_worker_service.py"}],
+                })
+                if mode == "missing-classification":
+                    evidence.pop("failure_code")
+                elif mode == "wrong-omission":
+                    evidence["missing_dossier_paths"] = ["backend/services/other.py"]
+                elif mode == "extra-defect":
+                    evidence["findings"].append({"kind": "required", "path": "backend/services/security.py"})
+                elif mode == "wrong-attempt":
+                    review["review_attempt"] = 2
+                elif mode == "wrong-candidate":
+                    evidence["candidate_digest"] = "b" * 64
+                elif mode == "unqualified":
+                    evidence["boundary"] = "tools-enabled"
+                self.assertNotIn("retry_review", svc._allowed_actions(card, latest_run=review))
+
+    def test_current_notification_review_one_time_legacy_fallback(self):
+        card, review, implementation = fixtures()
+        card["id"] = "12ae4707-d843-4e77-aa0a-3b4282b186d9"
+        review["id"] = "5cfaf863-63be-431b-bff2-7dea899bb8bf"
+        evidence = review["result_metadata"]["independent_review"]
+        expected_digest = "3af74526ddcb05f799df5fec2e2999f509262eb8e2075056c47d66bdf6451313"
+        review["result_metadata"]["review_source"]["implementation_metadata"]["candidate_digest"] = expected_digest
+        implementation["result_metadata"]["candidate_digest"] = expected_digest
+        evidence.update({
+            "failure_type": None, "boundary": "qualified-no-tools",
+            "dossier_sha256": "299216014eaf71ed0f5cf502dea05007ceed5f5fac3bb753fa23ad6b94bb5ab0",
+            "candidate_digest": expected_digest,
+            "thread_id": "independent-thread", "turn_id": "independent-turn",
+            "findings": [{"kind": "required", "path": "backend/services/agent_worker_service.py"}],
+        })
+        self.assertIn("retry_review", svc._allowed_actions(card, latest_run=review))
+        result, error, conn, _, _, _, _ = self.run_recovery(
+            card=card, review=review, implementation=implementation,
+            run_id=review["id"], digest=expected_digest)
+        self.assertIsNone(error)
+        self.assertEqual(result["status"], "review_queued")
+        wrong_card = dict(card, id="00000000-0000-4000-8000-000000000001")
+        self.assertNotIn("retry_review", svc._allowed_actions(wrong_card, latest_run=review))
+        wrong_run = dict(review, id="00000000-0000-4000-8000-000000000002")
+        self.assertNotIn("retry_review", svc._allowed_actions(card, latest_run=wrong_run))
+        evidence["dossier_sha256"] = "e" * 64
+        self.assertNotIn("retry_review", svc._allowed_actions(card, latest_run=review))
+
     def test_review_queued_transition_requires_explicit_status_change(self):
         require_card_transition(CardStatus.BLOCKED, CardStatus.REVIEW_QUEUED)
         with self.assertRaises(ValueError):
@@ -97,7 +178,7 @@ class FailedClosedReviewRecoveryTests(unittest.TestCase):
               patch("backend.core.codex_review.verify_candidate",
                     side_effect=(ValueError("tampered") if tamper else None)) as verify):
             try:
-                result = svc.retry_infrastructure_review(card_id=CARD, review_run_id=run_id,
+                result = svc.retry_infrastructure_review(card_id=str(card["id"]), review_run_id=run_id,
                         candidate_digest=digest, requested_by="admin")
                 error = None
             except Exception as exc:

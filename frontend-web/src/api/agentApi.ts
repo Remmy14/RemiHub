@@ -8,6 +8,7 @@ export const AgentActions = {
   RETRY: "retry",
   RETURN_TO_IMPLEMENTATION: "return_to_implementation",
   RETRY_GITHUB_SYNC: "retry_github_sync",
+  RETRY_REVIEW: "retry_review",
   CANCEL: "cancel",
   CLOSE: "close",
 } as const;
@@ -240,9 +241,22 @@ export async function performAgentAction(
   if (action === AgentActions.REQUEST_REVISION && (!revision || !correctionInstructions)) {
     throw new Error("Review decisions and operator notes are required.");
   }
+  const latestReview = action === AgentActions.RETRY_REVIEW
+    ? card.runs?.find((run) => run.id === card.latest_run?.id)
+    : undefined;
+  const reviewDigest = latestReview?.independent_review?.candidate_digest;
+  if (action === AgentActions.RETRY_REVIEW &&
+      (!card.allowed_actions.includes(AgentActions.RETRY_REVIEW) ||
+       card.status !== "blocked" || latestReview?.phase !== "review" ||
+       latestReview.status !== "succeeded" ||
+       typeof reviewDigest !== "string" || !/^[0-9a-f]{64}$/.test(reviewDigest))) {
+    throw new Error("An eligible blocked review with a verified candidate digest is required.");
+  }
   const commonOptions = {
     method: "POST",
-    body: action === AgentActions.REQUEST_REVISION
+    body: action === AgentActions.RETRY_REVIEW
+      ? JSON.stringify({ candidate_digest: reviewDigest, notes: correctionInstructions || undefined })
+      : action === AgentActions.REQUEST_REVISION
       ? JSON.stringify({ ...revision, notes: correctionInstructions })
       : returningToImplementation
       ? JSON.stringify({ content: correctionInstructions })
@@ -261,6 +275,8 @@ export async function performAgentAction(
         return `/agent/cards/${card.id}/retry`;
       case AgentActions.RETURN_TO_IMPLEMENTATION:
         return `/agent/cards/${card.id}/return-to-implementation`;
+      case AgentActions.RETRY_REVIEW:
+        return `/agent/cards/${card.id}/reviews/${latestReview!.id}/retry-infrastructure`;
       case AgentActions.RETRY_GITHUB_SYNC:
         if (!card.deployment_recovery?.deployment_run_id) {
           throw new Error("Deployment recovery details are no longer available.");

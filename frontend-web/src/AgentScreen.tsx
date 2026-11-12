@@ -87,6 +87,8 @@ function actionLabel(action: AgentAction): string {
       return "Return to Implementation";
     case AgentActions.RETRY_GITHUB_SYNC:
       return "Retry GitHub Sync";
+    case AgentActions.RETRY_REVIEW:
+      return "Retry Review with Updated Evidence";
     case AgentActions.CANCEL:
       return "Cancel Card";
     case AgentActions.CLOSE:
@@ -562,6 +564,8 @@ function ActionPanel({
           <p className="mt-1 text-sm text-slate-600">
             {pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
               ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
+              : pendingAction === AgentActions.RETRY_REVIEW
+              ? "Rerun independent review with updated frozen source evidence. No implementation code is changed. The previous verdict stays in the audit history; deployment still requires a passing review and approval."
               : "Review the current card state before confirming this lifecycle action."}
           </p>
           {requestingRevision && <div className="mt-3 space-y-3">

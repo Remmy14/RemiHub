@@ -334,6 +334,77 @@ def _retryable_failed_closed_review(card: dict, run: dict | None) -> bool:
             and evidence.get("summary") == "Review failed closed: ValueError")
 
 
+# One-time compatibility for an already completed 2026-11-12 notification review.
+# Future reviews get typed context evidence from the reviewer, rather than
+# matching human-written summaries. Remove this pin after that card recovers.
+_LEGACY_NOTIFICATION_CARD = "12ae4707-d843-4e77-aa0a-3b4282b186d9"
+_LEGACY_NOTIFICATION_REVIEW_RUN = "5cfaf863-63be-431b-bff2-7dea899bb8bf"
+_LEGACY_NOTIFICATION_DOSSIER = (
+    "299216014eaf71ed0f5cf502dea05007ceed5f5fac3bb753fa23ad6b94bb5ab0"
+)
+_LEGACY_NOTIFICATION_CANDIDATE = (
+    "3af74526ddcb05f799df5fec2e2999f509262eb8e2075056c47d66bdf6451313"
+)
+
+
+def _retryable_dossier_context_review(card: dict, run: dict | None) -> bool:
+    """Evidence-only review retry; never accepts a code-defect review.
+
+    New reviews must have a *server-classified* missing-context failure code
+    whose omitted paths match exactly all required findings. The single
+    legacy untyped review is pinned to its immutable dossier/candidate hashes.
+    """
+    if (card.get("status") != CardStatus.BLOCKED.value
+        or card.get("resume_status") != CardStatus.REVIEW_QUEUED.value
+        or card.get("repository_scope") not in {"backend", "android"}
+        or not isinstance(run, dict)
+        or run.get("phase") != RunPhase.REVIEW.value
+        or run.get("status") != RunStatus.SUCCEEDED.value
+        or run.get("card_revision") != card.get("revision")
+        or type(run.get("attempt_count")) is not int
+        or not 1 <= run["attempt_count"] < 3):
+        return False
+    metadata = _run_metadata(run)
+    evidence = metadata.get("independent_review")
+    source = metadata.get("review_source")
+    if not isinstance(evidence, dict) or not isinstance(source, dict):
+        return False
+    findings = evidence.get("findings")
+    if (evidence.get("verdict") != "blocked"
+        or evidence.get("failure_type") is not None
+        or evidence.get("boundary") != "qualified-no-tools"
+        or not isinstance(findings, list) or not findings
+        or not all(isinstance(finding, dict) and finding.get("kind") == "required"
+                   and isinstance(finding.get("path"), str) for finding in findings)
+        or not evidence.get("thread_id") or not evidence.get("turn_id")
+        or evidence.get("review_attempt") != run.get("review_attempt")
+        or evidence.get("review_cycle") != str(run.get("review_cycle"))
+        or source.get("review_cycle") != evidence.get("review_cycle")
+        or source.get("review_attempt") != evidence.get("review_attempt")
+        or evidence.get("card_revision") != card.get("revision")
+        or source.get("implementation_run_id") != evidence.get("implementation_run_id")
+        or not isinstance(source.get("implementation_metadata"), dict)
+        or source["implementation_metadata"].get("candidate_digest") != evidence.get("candidate_digest")
+        or source.get("evidence_correction") is not None):
+        return False
+    required_paths = {finding["path"] for finding in findings}
+    typed = (evidence.get("failure_code") == "review_dossier_context_missing"
+             and isinstance(evidence.get("missing_dossier_paths"), list)
+             and bool(evidence["missing_dossier_paths"])
+             and all(isinstance(path, str) for path in evidence["missing_dossier_paths"])
+             and set(evidence["missing_dossier_paths"]) == required_paths)
+    legacy = (str(card.get("id")) == _LEGACY_NOTIFICATION_CARD
+              and str(run.get("id")) == _LEGACY_NOTIFICATION_REVIEW_RUN
+              and card.get("repository_scope") == "backend"
+              and evidence.get("failure_code") is None
+              and evidence.get("dossier_sha256") == _LEGACY_NOTIFICATION_DOSSIER
+              and evidence.get("candidate_digest") == _LEGACY_NOTIFICATION_CANDIDATE
+              and required_paths == {"backend/services/agent_worker_service.py"}
+              and run.get("review_attempt") == 1
+              and run.get("attempt_count") == 1)
+    return typed or legacy
+
+
 def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]:
     status = CardStatus(card["status"])
     scope = coerce_repository_scope(card["repository_scope"])
@@ -366,7 +437,8 @@ def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]
     if _exhausted_review(card, latest_run):
         actions.append("request_revision")
 
-    if _retryable_failed_closed_review(card, latest_run):
+    if (_retryable_failed_closed_review(card, latest_run)
+        or _retryable_dossier_context_review(card, latest_run)):
         actions.append("retry_review")
 
     recovery = card.get("deployment_recovery")
@@ -1718,10 +1790,11 @@ def retry_infrastructure_review(
             cur.execute("""SELECT * FROM agent.runs WHERE card_id = %s
                 ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""", (card_id,))
             review = _row_to_dict(cur, cur.fetchone())
-            if (not _retryable_failed_closed_review(card, review)
+            if (not (_retryable_failed_closed_review(card, review)
+                     or _retryable_dossier_context_review(card, review))
                 or str(review["id"]) != str(review_run_id)):
                 raise AgentStateConflictError(
-                    "Review retry requires the exact latest infrastructure-blocked review"
+                    "Review retry requires the exact latest eligible blocked review"
                 )
             metadata = _run_metadata(review)
             source = metadata.get("review_source")
