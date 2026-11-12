@@ -153,6 +153,80 @@ class FailedClosedReviewRecoveryTests(unittest.TestCase):
         evidence["dossier_sha256"] = "e" * 64
         self.assertNotIn("retry_review", svc._allowed_actions(card, latest_run=review))
 
+
+    def test_card_queries_project_review_identity_for_retry_action(self):
+        card, review, _ = fixtures()
+        review["card_id"] = card["id"]
+
+        evidence = review["result_metadata"]["independent_review"]
+        evidence.update({
+            "failure_type": None,
+            "failure_code": "review_dossier_context_missing",
+            "boundary": "qualified-no-tools",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "missing_dossier_paths": [
+                "backend/services/agent_worker_service.py"
+            ],
+            "findings": [{
+                "kind": "required",
+                "path": "backend/services/agent_worker_service.py",
+            }],
+        })
+
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = card
+        cur.fetchall.side_effect = [[], [review], [], []]
+
+        with (
+            patch.object(
+                svc, "_row_to_dict",
+                side_effect=lambda _c, row: row
+            ),
+            patch.object(
+                svc, "_rows_to_dicts",
+                side_effect=lambda _c, rows: rows
+            ),
+        ):
+            detail = svc._card_detail(conn, card["id"])
+
+        self.assertIn("retry_review", detail["allowed_actions"])
+
+        queries = [
+            call.args[0] for call in cur.execute.call_args_list
+            if "FROM agent.runs" in call.args[0]
+        ]
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn("review_cycle,", queries[0])
+        self.assertIn("review_attempt,", queries[0])
+
+        cur.execute.reset_mock()
+        cur.fetchall.side_effect = [[card], [review]]
+
+        with (
+            patch.object(svc, "get_db_conn", return_value=conn),
+            patch.object(svc, "put_db_conn"),
+            patch.object(
+                svc, "_rows_to_dicts",
+                side_effect=lambda _c, rows: rows
+            ),
+        ):
+            listing = svc.list_cards()
+
+        self.assertEqual(len(listing), 1)
+        self.assertIn("retry_review", listing[0]["allowed_actions"])
+
+        queries = [
+            call.args[0] for call in cur.execute.call_args_list
+            if "FROM agent.runs" in call.args[0]
+        ]
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn("review_cycle,", queries[0])
+        self.assertIn("review_attempt,", queries[0])
+
     def test_review_queued_transition_requires_explicit_status_change(self):
         require_card_transition(CardStatus.BLOCKED, CardStatus.REVIEW_QUEUED)
         with self.assertRaises(ValueError):
