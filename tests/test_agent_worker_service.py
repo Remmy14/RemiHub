@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import unittest
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
@@ -887,6 +888,96 @@ class RunCompletionTests(unittest.TestCase):
         insert_notification.assert_not_called()
         handoff.assert_called_once()
         self.assertEqual(handoff.call_args.args[3], CardStatus.REVIEW_QUEUED)
+
+    def test_review_notification_only_for_exhausted_corrections(self):
+        cases = (
+            ("changes_requested", 3, CardStatus.BLOCKED, "human"),
+            ("changes_requested", 2, CardStatus.IMPLEMENTATION_QUEUED, None),
+            ("pass", 3, CardStatus.REVIEW_READY, "existing"),
+            ("blocked", 3, CardStatus.BLOCKED, None),
+        )
+        for verdict, attempt, target, expected_notification in cases:
+            with self.subTest(verdict=verdict, attempt=attempt), \
+                 patch.object(agent_worker_service_module, "get_db_conn") as get_db_conn, \
+                 patch.object(agent_worker_service_module, "put_db_conn"), \
+                 patch.object(agent_worker_service_module, "_lock_owned_run", return_value={"card_status": "reviewing"}), \
+                 patch.object(agent_worker_service_module, "_insert_message", return_value="message-id"), \
+                 patch.object(agent_worker_service_module, "_insert_event"), \
+                 patch.object(agent_worker_service_module, "_review_handoff"), \
+                 patch.object(agent_worker_service_module, "insert_notification") as insert_notification, \
+                 patch("backend.core.codex_review.verify_candidate"):
+                connection = MagicMock()
+                get_db_conn.return_value = connection
+                source = {
+                    "review_cycle": "cycle-id",
+                    "review_attempt": attempt,
+                    "implementation_run_id": "implementation-id",
+                    "implementation_metadata": {"candidate_digest": "digest"},
+                }
+                claim = replace(
+                    claimed_run(), phase=RunPhase.REVIEW,
+                    card_status=CardStatus.REVIEWING,
+                    result_metadata={"review_source": source},
+                )
+                evidence = {
+                    "verdict": verdict,
+                    "review_cycle": "cycle-id",
+                    "review_attempt": attempt,
+                    "implementation_run_id": "implementation-id",
+                    "card_revision": claim.card_revision,
+                    "candidate_digest": "digest",
+                    "summary": "Review result",
+                    "findings": [] if verdict == "pass" else [{"description": "Fix this"}],
+                    "thread_id": "thread-id",
+                    "turn_id": "turn-id",
+                    "validation_evidence": ["tests passed"],
+                }
+                insert_notification.side_effect = lambda notification: connection.commit.assert_called_once()
+                complete_run(
+                    claim,
+                    ExecutionResult(
+                        message="Review completed",
+                        card_status=target,
+                        metadata={"independent_review": evidence},
+                    ),
+                )
+                connection.commit.assert_called_once()
+                if expected_notification:
+                    insert_notification.assert_called_once()
+                    notification = insert_notification.call_args.args[0]
+                    if expected_notification == "human":
+                        card_update = next(
+                            call for call in connection.cursor.return_value.__enter__.return_value.execute.call_args_list
+                            if "UPDATE agent.cards" in call.args[0]
+                        )
+                        self.assertEqual(card_update.args[1][:3], (
+                            "blocked", "review_queued", "Independent review requires human attention",
+                        ))
+                        self.assertEqual(notification.title, "Agent review needs your decision")
+                        self.assertIn(claim.title, notification.body)
+                        self.assertIn("Request Revision or Cancel Card", notification.body)
+                    else:
+                        self.assertEqual(notification.title, "Implementation is ready for review")
+                    self.assertEqual(notification.module, "Agent")
+                    self.assertEqual(notification.priority, 1)
+                    self.assertEqual(notification.data, {
+                        "type": "agent_status",
+                        "card_id": claim.card_id,
+                        "run_id": claim.id,
+                        "phase": "review",
+                        "status": target.value,
+                        "action": "request_revision" if expected_notification == "human" else "approve_deployment",
+                    })
+                    # A duplicate completion cannot pass the owned-run lease check.
+                    with patch.object(agent_worker_service_module, "_lock_owned_run", side_effect=AgentLeaseLostError("duplicate")):
+                        with self.assertRaises(AgentLeaseLostError):
+                            complete_run(claim, ExecutionResult(
+                                message="Review completed", card_status=target,
+                                metadata={"independent_review": evidence},
+                            ))
+                    insert_notification.assert_called_once()
+                else:
+                    insert_notification.assert_not_called()
 
     @patch("backend.services.agent_worker_service.insert_notification")
     @patch("backend.services.agent_worker_service._insert_event")

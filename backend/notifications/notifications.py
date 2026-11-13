@@ -10,6 +10,7 @@ AGENT_NOTIFICATION_STATUSES = frozenset(
         "awaiting_feedback",
         "awaiting_implementation_approval",
         "review_ready",
+        "blocked",
         "completed",
     }
 )
@@ -17,6 +18,7 @@ AGENT_ACTION_BY_STATUS = {
     "awaiting_feedback": "add_follow_up",
     "awaiting_implementation_approval": "approve_implementation",
     "review_ready": "approve_deployment",
+    "blocked": "request_revision",
     "completed": "view_card",
 }
 
@@ -58,6 +60,14 @@ def agent_status_notification(
 ) -> Notification | None:
     if status not in AGENT_NOTIFICATION_STATUSES:
         return None
+    if status == "blocked" and not (
+        phase == "review"
+        and isinstance(metadata, dict)
+        and isinstance(metadata.get("independent_review"), dict)
+        and metadata["independent_review"].get("verdict") == "changes_requested"
+        and metadata["independent_review"].get("review_attempt") == 3
+    ):
+        return None
 
     changed_files = _metadata_changed_files(metadata)
     frontend_build_ready = (
@@ -77,6 +87,9 @@ def agent_status_notification(
     elif status == "review_ready":
         title = "Implementation is ready for review"
         body = f"{card_title} is ready for review and deployment approval."
+    elif status == "blocked":
+        title = "Agent review needs your decision"
+        body = f"{card_title} exhausted its review correction attempts. Choose Request Revision or Cancel Card."
     else:
         title = "Agent task completed"
         body = f"{card_title} has been completed."
