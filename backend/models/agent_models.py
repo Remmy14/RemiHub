@@ -78,6 +78,131 @@ class AgentErrorResponse(BaseModel):
     detail: str
 
 
+class CodexUsageWindow(BaseModel):
+    name: str
+    used_percent: int | None = None
+    remaining_percent: int | None = None
+    duration_minutes: int | None = None
+    reset_at: datetime | None = None
+    status: Literal["available", "unavailable"]
+
+
+class CodexUsageBucket(BaseModel):
+    limit_id: str | None = None
+    limit_name: str | None = None
+    model_slug: str | None = None
+    plan_type: str | None = None
+    windows: list[CodexUsageWindow]
+    credits: dict[str, Any] | None = None
+
+
+class CodexQuotaData(BaseModel):
+    status: Literal["available", "unavailable", "stale", "collection_failed"]
+    source: str
+    collected_at: datetime | None = None
+    last_attempt_at: datetime | None = None
+    freshness_seconds: int | None = None
+    error_code: str | None = None
+    account_id: str | None = None
+    buckets: list[CodexUsageBucket]
+    ordinary_usage_allowed: bool | None = None
+    available_reset_credits: int | None = None
+    metric_statuses: dict[str, str]
+
+
+class CodexQuotaResponse(BaseModel):
+    success: bool
+    data: CodexQuotaData
+
+
+class CodexTokenAggregate(BaseModel):
+    execution_count: int
+    available_count: int
+    unavailable_count: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+    stage: str | None = None
+    card_id: UUID | None = None
+    actual_model: str | None = None
+    reasoning_effort: str | None = None
+
+
+class CodexTokenAccounting(BaseModel):
+    overall: CodexTokenAggregate
+    by_stage: list[CodexTokenAggregate]
+    by_card: list[CodexTokenAggregate]
+    by_model: list[CodexTokenAggregate]
+
+
+class CodexSummaryData(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    token_accounting: CodexTokenAccounting
+
+
+class CodexSummaryResponse(BaseModel):
+    success: bool
+    data: CodexSummaryData
+
+
+class CodexExecutionUsage(BaseModel):
+    run_id: UUID
+    attempt_count: int
+    turn_id: str
+    card_id: UUID
+    card_revision: int
+    stage: str
+    review_attempt: int | None = None
+    configured_model: str | None = None
+    actual_model: str | None = None
+    reasoning_effort: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+    usage_status: str
+    usage_source: str
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    recorded_at: datetime
+
+
+class CodexExecutionList(BaseModel):
+    total: int
+    items: list[CodexExecutionUsage]
+    limit: int
+    offset: int
+
+
+class CodexExecutionResponse(BaseModel):
+    success: bool
+    data: CodexExecutionList
+
+
+class CodexStageConfiguration(BaseModel):
+    stage: str
+    configured_model: str | None = None
+    configured_reasoning_effort: str | None = None
+    last_reported_configured_model: str | None = None
+    last_reported_reasoning_effort: str | None = None
+    configuration_source: str | None = None
+    configuration_reported_at: datetime | None = None
+    actual_model_last_execution: str | None = None
+    reasoning_effort_last_execution: str | None = None
+    observed_at: datetime | None = None
+    actual_model_observed_at: datetime | None = None
+    status: str
+
+
+class CodexConfigurationResponse(BaseModel):
+    success: bool
+    data: list[CodexStageConfiguration]
+
+
 class AgentLatestRun(BaseModel):
     id: UUID
     phase: RunPhase

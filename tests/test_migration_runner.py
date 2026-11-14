@@ -62,21 +62,46 @@ class MigrationDiscoveryTests(unittest.TestCase):
             HISTORICAL_MIGRATIONS,
         )
         self.assertGreater(len(migrations), len(HISTORICAL_MIGRATIONS))
+        self.assertEqual(
+            [migration.version for migration in migrations],
+            sorted(migration.version for migration in migrations),
+        )
         latest = migrations[-1]
         self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
         self.assertIsNotNone(latest.down_path)
+        self.assertEqual((latest.version, latest.name), ("0021", "agent_codex_usage"))
+        self.assertEqual(latest.up_path.name, "0021_agent_codex_usage.up.sql")
+        self.assertEqual(latest.down_path.name, "0021_agent_codex_usage.down.sql")
+        self.assertTrue(latest.up_path.is_file())
+        self.assertTrue(latest.down_path.is_file())
+        rollback_sql = latest.down_path.read_text(encoding="utf-8")
+        self.assertIn("DROP TABLE IF EXISTS agent.codex_quota_snapshots", rollback_sql)
+        self.assertIn("DROP TABLE IF EXISTS agent.codex_stage_configuration", rollback_sql)
+        self.assertIn("DROP TABLE IF EXISTS agent.codex_execution_usage", rollback_sql)
         # 0020 replaces workflow constraints and grants worker capabilities. It
         # requires RemiHub's separately approved schema rollout, never the app's
         # restricted automatic migration executor.
-        self.assertEqual(latest.version, "0020")
+        review_migration = next(migration for migration in migrations if migration.version == "0020")
         with self.assertRaises(AgentDeploymentError):
-            GitBackendDeploymentManager._validate_migration_sql(latest.up_path, direction="up")
+            GitBackendDeploymentManager._validate_migration_sql(review_migration.up_path, direction="up")
         with self.assertRaises(AgentDeploymentError):
-            GitBackendDeploymentManager._validate_migration_sql(latest.down_path, direction="down")
+            GitBackendDeploymentManager._validate_migration_sql(review_migration.down_path, direction="down")
         # The conservative pair checker also rejects the schema-qualified index
         # drop. Operator-managed SQL remains outside automatic rollback.
         with self.assertRaises(AgentDeploymentError):
-            GitBackendDeploymentManager._validate_migration_pair(latest.up_path, latest.down_path)
+            GitBackendDeploymentManager._validate_migration_pair(review_migration.up_path, review_migration.down_path)
+
+    def test_codex_usage_migration_passes_trusted_sql_policy(self):
+        up = MIGRATIONS_DIR / "0021_agent_codex_usage.up.sql"
+        down = MIGRATIONS_DIR / "0021_agent_codex_usage.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+        schema = up.read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE agent.codex_execution_usage", schema)
+        self.assertIn("CREATE TABLE agent.codex_quota_snapshots", schema)
+        self.assertIn("CREATE TABLE agent.codex_stage_configuration", schema)
+        self.assertIn("CREATE INDEX codex_execution_usage_period_idx", schema)
 
     def test_repository_candidate_history_contains_current_complete_identity(self):
         history = _expected_migration_history(MIGRATIONS_DIR)

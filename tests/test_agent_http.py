@@ -251,7 +251,25 @@ class AgentHttpBoundaryTests(unittest.TestCase):
         schema = admin_app.openapi()
         paths = schema["paths"]
 
-        self.assertEqual(len([path for path in paths if path.startswith("/agent/")]), 13)
+        usage_contracts = {
+            "/agent/usage/quota": "CodexQuotaResponse",
+            "/agent/usage/summary": "CodexSummaryResponse",
+            "/agent/usage/executions": "CodexExecutionResponse",
+            "/agent/usage/configuration": "CodexConfigurationResponse",
+        }
+        for path, response_model in usage_contracts.items():
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+                responses = paths[path]["get"]["responses"]
+                self.assertEqual(
+                    responses["200"]["content"]["application/json"]["schema"]["$ref"],
+                    f"#/components/schemas/{response_model}",
+                )
+                for code in ("401", "403", "503"):
+                    self.assertEqual(
+                        responses[code]["content"]["application/json"]["schema"]["$ref"],
+                        "#/components/schemas/AgentErrorResponse",
+                    )
         self.assertEqual(
             paths["/agent/cards"]["get"]["responses"]["200"]["content"]
             ["application/json"]["schema"]["$ref"],

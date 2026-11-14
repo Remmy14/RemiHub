@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from backend.core.codex_review_bounded import (
     BoundedReviewGateway, dossier, private_directory, sha, tool_config, toml,
@@ -14,6 +16,46 @@ from backend.core.codex_review_bounded import (
 
 
 class DossierTests(unittest.TestCase):
+    def test_failed_turn_propagates_last_reported_usage_without_accepting_review(self):
+        gateway = object.__new__(BoundedReviewGateway)
+        gateway._lock = threading.Lock()
+        gateway._cancelled = False
+        gateway._client = None
+        gateway.timeout_seconds = 3
+        runtime = MagicMock()
+        runtime.model = "review-model"
+        runtime.config = {}
+        runtime.identity = {"qualified": True}
+        runtime.cancel_requested.return_value = False
+        client = MagicMock()
+        client.account_read.return_value.model_dump.return_value = {"account": {"type": "chatgpt"}}
+        client.request.return_value.model_dump.return_value = {"config": {}}
+        client.thread_start.return_value.thread.id = "thread-1"
+        client.turn_start.return_value.turn.id = "turn-1"
+
+        def event(method, payload):
+            result = MagicMock()
+            result.method = method
+            result.payload.model_dump.return_value = payload
+            return result
+
+        client.next_turn_notification.side_effect = [
+            event("thread/tokenUsage/updated", {"tokenUsage": {"lastTokenUsage": {
+                "inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}),
+            event("thread/tokenUsage/updated", {"tokenUsage": {"lastTokenUsage": {
+                "inputTokens": "invalid", "outputTokens": 9}}}),
+            event("turn/completed", {"turn": {"status": "failed"}}),
+        ]
+        fake_package = types.ModuleType("openai_codex")
+        fake_package.__path__ = []
+        fake_client = types.ModuleType("openai_codex.client")
+        fake_client.CodexClient = lambda *_args: client
+        with patch.dict("sys.modules", {"openai_codex": fake_package, "openai_codex.client": fake_client}):
+            with self.assertRaises(RuntimeError) as failure:
+                gateway._run(runtime, "{}", home=Path("/tmp"))
+        self.assertEqual(failure.exception.codex_turn_id, "turn-1")
+        self.assertEqual(failure.exception.codex_usage["last"]["total_tokens"], 10)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -130,6 +172,25 @@ class DossierTests(unittest.TestCase):
         fixture.gateway.run_turn.side_effect = accept
         result = fixture.executor.execute(fixture.claim)
         self.assertEqual(result.metadata['independent_review']['boundary'], 'qualified-no-tools')
+
+    def test_executor_records_reported_usage_from_failed_turn_and_blocks(self):
+        from tests.test_codex_review import SyntheticCandidate
+        fixture = SyntheticCandidate(methodName='test_first_pass_is_ready_but_requires_human_approval')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+
+        def fail(**_kwargs):
+            error = RuntimeError("review turn failed")
+            error.codex_turn_id = "failed-turn"
+            error.codex_usage = {"last": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}}
+            raise error
+
+        fixture.gateway.run_turn.side_effect = fail
+        with patch("backend.services.agent_usage_writer.record_turn") as record:
+            result = fixture.executor.execute(fixture.claim)
+        self.assertEqual(result.metadata["independent_review"]["verdict"], "blocked")
+        self.assertEqual(result.metadata["independent_review"]["turn_id"], "failed-turn")
+        self.assertEqual(record.call_args.kwargs["usage"]["last"]["total_tokens"], 10)
 
     def test_qualification_provider_rejects_credentials_and_nonempty_tools(self):
         # Protocol validation is also tested without a listening socket; a host

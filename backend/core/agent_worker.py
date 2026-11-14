@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -208,6 +210,25 @@ class AgentWorker:
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = heartbeat_seconds
         self.max_attempts = max_attempts
+        self._usage_write_condition = threading.Condition()
+        self._usage_write_queue = deque()
+        self._usage_write_keys = set()
+        self._usage_writer_active = False
+        self._pending_usage_attempts = 0
+        self._usage_attempt_failed = False
+
+    def flush_usage_attempts(self, *, timeout_seconds: float = 30) -> bool:
+        """Drain placeholder writes before a run-once worker exits."""
+        deadline = time.monotonic() + timeout_seconds
+        with self._usage_write_condition:
+            while self._pending_usage_attempts:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._usage_write_condition.wait(remaining)
+            succeeded = not self._usage_attempt_failed
+            self._usage_attempt_failed = False
+            return succeeded
 
     def process_once(self) -> bool:
         class_scopes = getattr(
@@ -248,12 +269,15 @@ class AgentWorker:
             self._log_lease_lost(claim)
             return True
 
+        self._ensure_usage_attempt(claim)
+
         try:
             result = self._execute_with_heartbeat(claim)
         except AgentLeaseLostError:
             self._log_lease_lost(claim)
             return True
         except AgentTemporarilyBlockedError as exc:
+            self._ensure_usage_attempt(claim)
             try:
                 self.queue.block_run(
                     claim,
@@ -265,6 +289,7 @@ class AgentWorker:
                 self._log_lease_lost(claim)
             return True
         except Exception as exc:
+            self._ensure_usage_attempt(claim)
             logger.exception("Agent run failed: run=%s", claim.id)
             try:
                 self.queue.fail_run(
@@ -275,12 +300,62 @@ class AgentWorker:
                 self._log_lease_lost(claim)
             return True
 
+        self._ensure_usage_attempt(claim)
         try:
             self.queue.complete_run(claim, result)
         except AgentLeaseLostError:
             self._log_lease_lost(claim)
 
         return True
+
+    def _ensure_usage_attempt(self, claim: ClaimedRun) -> None:
+        if (claim.phase is RunPhase.DEPLOYMENT or
+                not type(self.executor).__module__.startswith("backend.core.codex_")):
+            return
+        key = (claim.id, getattr(claim, "attempt_count", None))
+        with self._usage_write_condition:
+            if key in self._usage_write_keys:
+                return
+            self._usage_write_keys.add(key)
+            self._usage_write_queue.append((key, claim, getattr(self.executor, "model", None)))
+            self._pending_usage_attempts += 1
+            if self._usage_writer_active:
+                return
+            self._usage_writer_active = True
+
+        def write() -> None:
+            while True:
+                with self._usage_write_condition:
+                    if not self._usage_write_queue:
+                        self._usage_writer_active = False
+                        self._usage_write_condition.notify_all()
+                        return
+                    queued_key, queued_claim, configured_model = self._usage_write_queue.popleft()
+                succeeded = False
+                try:
+                    from backend.services.agent_usage_writer import ensure_attempt
+                    succeeded = ensure_attempt(queued_claim, configured_model=configured_model)
+                except Exception:
+                    logger.exception("Could not record agent usage availability: run=%s", queued_claim.id)
+                finally:
+                    with self._usage_write_condition:
+                        self._usage_attempt_failed |= not succeeded
+                        self._usage_write_keys.remove(queued_key)
+                        self._pending_usage_attempts -= 1
+                        self._usage_write_condition.notify_all()
+
+        thread = threading.Thread(target=write, name="agent-usage-attempt", daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            with self._usage_write_condition:
+                self._usage_attempt_failed = True
+                self._pending_usage_attempts -= len(self._usage_write_queue)
+                self._usage_write_queue.clear()
+                self._usage_write_keys.clear()
+                self._usage_writer_active = False
+                self._usage_write_condition.notify_all()
+            logger.exception("Could not start agent usage telemetry: run=%s", claim.id)
 
     def _execute_with_heartbeat(self, claim: ClaimedRun) -> ExecutionResult:
         stop_event = threading.Event()

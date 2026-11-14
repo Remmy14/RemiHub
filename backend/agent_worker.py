@@ -39,6 +39,7 @@ from backend.services.agent_worker_service import DatabaseAgentQueue
 
 
 logger = logging.getLogger("remihub.agent_worker")
+CONFIGURATION_REPORT_SECONDS = 60
 
 
 def _implementation_validator_command(
@@ -793,33 +794,70 @@ def run_worker(settings: AgentWorkerSettings) -> None:
         max_attempts=settings.max_attempts,
     )
 
-    if settings.run_once:
-        processed = worker.process_once()
-        logger.info("Agent worker run-once complete: processed=%s", processed)
-        return
+    from backend.services.agent_usage_writer import flush_turn_writes, publish_stage_configuration
+
+    def publish_configuration() -> None:
+        publish_stage_configuration(executor_name=settings.executor_name,
+                                    worker_id=settings.worker_id,
+                                    model=settings.codex_model)
 
     stop_event = threading.Event()
+    configuration_thread = None
+    if settings.executor_name in {"codex-planning", "codex-implementation", "codex-review"}:
+        def report_configuration() -> None:
+            # Database telemetry is best effort. Keep startup and model turns
+            # independent of a stalled pool acquisition or write.
+            while not stop_event.is_set():
+                publish_configuration()
+                if stop_event.wait(CONFIGURATION_REPORT_SECONDS):
+                    return
 
-    def request_stop(signum, _frame):
-        logger.info("Agent worker received signal %s", signum)
+        configuration_thread = threading.Thread(
+            target=report_configuration,
+            name=f"agent-configuration-{settings.worker_id}",
+            daemon=True,
+        )
+        configuration_thread.start()
+
+    try:
+        if settings.run_once:
+            try:
+                processed = worker.process_once()
+            finally:
+                turn_usage_flushed = flush_turn_writes()
+                attempt_usage_flushed = worker.flush_usage_attempts()
+            if not turn_usage_flushed or not attempt_usage_flushed:
+                logger.warning(
+                    "Codex usage telemetry incomplete at worker exit: turn_writes=%s attempt_writes=%s",
+                    turn_usage_flushed, attempt_usage_flushed,
+                )
+            logger.info("Agent worker run-once complete: processed=%s", processed)
+            return
+
+        def request_stop(signum, _frame):
+            logger.info("Agent worker received signal %s", signum)
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+
+        logger.info(
+            "Agent worker started: worker=%s executor=%s environment=%s",
+            settings.worker_id,
+            settings.executor_name,
+            settings.environment,
+        )
+
+        while not stop_event.is_set():
+            processed = worker.process_once()
+            if not processed:
+                stop_event.wait(settings.poll_seconds)
+
+        logger.info("Agent worker stopped")
+    finally:
         stop_event.set()
-
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
-
-    logger.info(
-        "Agent worker started: worker=%s executor=%s environment=%s",
-        settings.worker_id,
-        settings.executor_name,
-        settings.environment,
-    )
-
-    while not stop_event.is_set():
-        processed = worker.process_once()
-        if not processed:
-            stop_event.wait(settings.poll_seconds)
-
-    logger.info("Agent worker stopped")
+        if configuration_thread is not None:
+            configuration_thread.join(timeout=1)
 
 
 def main() -> None:

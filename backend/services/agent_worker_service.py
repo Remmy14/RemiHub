@@ -61,15 +61,17 @@ WORKER_DATABASE_IDENTITIES = {
 }
 
 
-def get_db_conn():
+def get_db_conn(*, connect_timeout: int | None = None):
     database_config_path = resolve_database_config_path(DEFAULT_DATABASE_CONFIG)
     config = load_config(str(database_config_path))["Database"]
+    connection_options = {"connect_timeout": connect_timeout} if connect_timeout is not None else {}
     return psycopg2.connect(
         user=config["user"],
         password=config["password"],
         host=config["host"],
         port=config["port"],
         database=config["database"],
+        **connection_options,
     )
 
 

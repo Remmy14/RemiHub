@@ -184,7 +184,7 @@ class BoundedReviewGateway:
         from pydantic import BaseModel
         class EffectiveConfig(BaseModel):
             config: dict
-        from backend.core.codex_review import REVIEW_INSTRUCTIONS, REVIEW_SCHEMA, parse_verdict
+        from backend.core.codex_review import REVIEW_INSTRUCTIONS, REVIEW_SCHEMA
         stopped = threading.Event()
         def watch_cancel():
             while not stopped.wait(0.05):
@@ -204,6 +204,8 @@ class BoundedReviewGateway:
                 self._client = client
             timer.start()
             watcher.start()
+            turn_id = None
+            usage = None
             try:
                 client.start()
                 with self._lock:
@@ -233,6 +235,19 @@ class BoundedReviewGateway:
                     while True:
                         event = client.next_turn_notification(turn_id)
                         payload = event.payload.model_dump(by_alias=True, mode="json")
+                        if event.method == "thread/tokenUsage/updated":
+                            token_usage = payload.get("tokenUsage") if isinstance(payload, dict) else None
+                            last = token_usage.get("lastTokenUsage") if isinstance(token_usage, dict) else None
+                            if isinstance(last, dict):
+                                candidate = {"last": {
+                                    "input_tokens": last.get("inputTokens"),
+                                    "output_tokens": last.get("outputTokens"),
+                                    "cached_input_tokens": last.get("cachedInputTokens"),
+                                    "reasoning_output_tokens": last.get("reasoningOutputTokens"),
+                                    "total_tokens": last.get("totalTokens")}}
+                                from backend.core.agent_usage import normalize_turn_usage
+                                if normalize_turn_usage(candidate)["usage_status"] == "available":
+                                    usage = candidate
                         if event.method == "item/completed":
                             item = payload["item"]
                             if item["type"] == "agentMessage":
@@ -251,10 +266,15 @@ class BoundedReviewGateway:
                     if self._cancelled:
                         raise TimeoutError("Review interrupted")
                 response = messages[-1] if messages else ""
-                parse_verdict(response)
                 return {"response": response, "thread_id": thread_id, "turn_id": turn_id,
+                        "usage": usage,
                         "dossier_sha256": sha(wire.encode()), "boundary": "qualified-no-tools",
                         "qualification": runtime.identity}
+            except Exception as exc:
+                if turn_id is not None and usage is not None:
+                    exc.codex_turn_id = turn_id
+                    exc.codex_usage = usage
+                raise
             finally:
                 timer.cancel()
                 stopped.set()

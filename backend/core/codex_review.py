@@ -251,7 +251,8 @@ class OpenAICodexReviewGateway:
                 if timed_out.is_set() or self._cancelled:
                     raise TimeoutError("Independent review interrupted or timed out")
                 return {"response": result.final_response, "thread_id": thread.id,
-                        "turn_id": result.id}
+                        "turn_id": result.id,
+                        "usage": result.usage.model_dump(mode="json") if getattr(result, "usage", None) is not None else None}
         finally:
             timer.cancel()
             with self._lock:
@@ -349,6 +350,12 @@ class CodexReviewExecutor:
                     context["source_selection"] = source_selection(Path(workspace["worktree_path"]), frozen, base_manifest)
                     prompt = json.dumps(context, default=str)
                 turn = self.gateway.run_turn(repository_path=frozen, prompt=prompt, model=self.model)
+                from backend.services.agent_usage_writer import record_turn
+                record_turn(claim, turn_id=turn.get("turn_id"), usage=turn.get("usage"),
+                            configured_model=self.model,
+                            actual_model=self.model if turn.get("boundary") == "qualified-no-tools" else None,
+                            source=("codex_app_server_notification" if turn.get("boundary") == "qualified-no-tools"
+                                    else "codex_sdk_turn"))
                 if before != _tree_digest(frozen):
                     raise ValueError("Reviewer modified the frozen candidate")
                 verdict = parse_verdict(turn["response"])
@@ -363,6 +370,17 @@ class CodexReviewExecutor:
         except AgentTemporarilyBlockedError:
             raise
         except Exception as exc:
+            if getattr(exc, "codex_turn_id", None) and getattr(exc, "codex_usage", None):
+                turn = {"turn_id": exc.codex_turn_id}
+                try:
+                    from backend.services.agent_usage_writer import record_turn
+                    record_turn(claim, turn_id=exc.codex_turn_id, usage=exc.codex_usage,
+                                configured_model=self.model, actual_model=self.model,
+                                source="codex_app_server_notification")
+                except Exception:
+                    import logging
+                    logging.getLogger("remihub.agent_worker").exception(
+                        "Could not record usage from failed review turn")
             import logging
             logging.getLogger("remihub.agent_worker").exception(
                 "Independent review failed: implementation_run_id=%s "

@@ -202,8 +202,6 @@ class OpenAICodexPlanningGateway:
             raise
 
         final_response = (result.final_response or "").strip()
-        if not final_response:
-            raise RuntimeError("Codex completed without a final planning response")
 
         return CodexPlanningTurn(
             thread_id=thread.id,
@@ -308,6 +306,8 @@ class CodexPlanningExecutor:
                 retry_after_seconds=self.retry_after_seconds,
             ) from exc
 
+        from backend.services.agent_usage_writer import record_turn
+        record_turn(claim, turn_id=turn.turn_id, usage=turn.usage, configured_model=self.model)
         response, ready, repository_scope = _parse_planning_response(
             turn.final_response
         )

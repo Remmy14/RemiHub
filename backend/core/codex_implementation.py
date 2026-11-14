@@ -235,10 +235,6 @@ class OpenAICodexImplementationGateway:
             raise
 
         final_response = (result.final_response or "").strip()
-        if not final_response:
-            raise RuntimeError(
-                "Codex completed without a final implementation response"
-            )
 
         return CodexImplementationTurn(
             thread_id=thread.id,
@@ -434,6 +430,8 @@ class CodexImplementationExecutor:
             finally:
                 self._set_turn_control(claim.id, None)
 
+            from backend.services.agent_usage_writer import record_turn
+            record_turn(claim, turn_id=turn.turn_id, usage=turn.usage, configured_model=self.model)
             response, tests = _parse_implementation_response(turn.final_response)
             trusted_validation = (
                 self.validator.validate(claim=claim, workspace=workspace)

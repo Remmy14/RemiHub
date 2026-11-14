@@ -1,4 +1,5 @@
 from uuid import UUID
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -14,8 +15,13 @@ from backend.models.agent_models import (
     AgentErrorResponse,
     AgentGitHubSyncRetryRequest,
     AgentMessageCreate,
+    CodexQuotaResponse,
+    CodexSummaryResponse,
+    CodexExecutionResponse,
+    CodexConfigurationResponse,
 )
 from backend.services import agent_service
+from backend.services import agent_usage_service
 
 
 AUTH_ERROR_RESPONSES = {
@@ -36,6 +42,39 @@ router = APIRouter(
     tags=["Agent"],
     dependencies=[Depends(require_admin_principal)],
 )
+
+
+@router.get("/usage/quota", response_model=CodexQuotaResponse, responses=AUTH_ERROR_RESPONSES)
+def codex_quota(_principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    return {"success": True, "data": agent_usage_service.quota()}
+
+
+@router.get("/usage/summary", response_model=CodexSummaryResponse, responses=AUTH_ERROR_RESPONSES)
+def codex_summary(from_time: datetime | None = None, to_time: datetime | None = None,
+                  _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        start, end = agent_usage_service.period(from_time, to_time)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "data": agent_usage_service.summary(start, end)}
+
+
+@router.get("/usage/executions", response_model=CodexExecutionResponse, responses=AUTH_ERROR_RESPONSES)
+def codex_executions(from_time: datetime | None = None, to_time: datetime | None = None,
+                     card_id: UUID | None = None, limit: int = 50, offset: int = 0,
+                     _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        start, end = agent_usage_service.period(from_time, to_time)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not 1 <= limit <= 100 or not 0 <= offset <= 100000:
+        raise HTTPException(status_code=400, detail="limit or offset out of range")
+    return {"success": True, "data": agent_usage_service.executions(start, end, card_id=card_id, limit=limit, offset=offset)}
+
+
+@router.get("/usage/configuration", response_model=CodexConfigurationResponse, responses=AUTH_ERROR_RESPONSES)
+def codex_configuration(_principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    return {"success": True, "data": agent_usage_service.configuration()}
 
 
 def _raise_http_error(exc: Exception) -> None:
