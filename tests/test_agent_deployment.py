@@ -893,6 +893,20 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentDeploymentError, "passing independent review"):
                 manager._validate_approved_implementation(claim, replace(source, implementation_result_metadata=metadata))
 
+    def test_android_style_production_materialization_does_not_require_backend_qa_record(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        manager = self._manager(environment="production")
+        # Android's deployed manager uses this class-level policy. Exercise the
+        # shared real Git materialization path without a backend QA pipeline.
+        manager.BACKEND_QA_PARITY_REQUIRED = False
+        approved = manager._validate_approved_implementation(claim, claim.deployment_source)
+        with patch.object(manager, "_qa_candidate_commit_from_pipeline", side_effect=AssertionError("Backend QA must not gate Android")) as qa:
+            branch, commit, worktree = manager._materialize_candidate(claim, approved)
+        qa.assert_not_called()
+        self.assertNotEqual(commit, self.base_commit)
+        self.assertEqual((worktree / "backend/example.py").read_text(), "VALUE = 2\n")
+        self.assertIn(claim.card_id, branch)
+
     def _qa_succeeded_claim(self, claim):
         expected = self._expected_history(
             self.implementation_workspace.path
@@ -1983,6 +1997,7 @@ printf 'RESULT=%s\\nSECONDS=%s\\nCURL_CALLS=%s\\nDIAGNOSTICS=%s\\n' \
             patch.object(module, "require_source_state") as require_source_state,
             patch.object(module, "require_runtime_state") as require_runtime_state,
             patch.object(module, "harden_planning_checkout") as harden_planning,
+            patch.object(module, "move_clean_checkout") as move_planning,
         ):
             module.synchronize_sources(
                 environment,
@@ -1993,6 +2008,7 @@ printf 'RESULT=%s\\nSECONDS=%s\\nCURL_CALLS=%s\\nDIAGNOSTICS=%s\\n' \
         require_source_state.assert_any_call(candidate)
         require_runtime_state.assert_called_once_with(environment, candidate)
         harden_planning.assert_called_once_with(candidate)
+        move_planning.assert_called_once_with(module.PLANNING_REPO, "main", base, candidate, user="alex")
 
         planning_fetches = [
             command

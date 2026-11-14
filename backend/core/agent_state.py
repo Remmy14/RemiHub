@@ -13,6 +13,7 @@ class CardStatus(str, Enum):
     REVIEW_QUEUED = "review_queued"
     REVIEWING = "reviewing"
     REVIEW_READY = "review_ready"
+    REVIEW_CORRECTIONS_PAUSED = "review_corrections_paused"
     DEPLOYMENT_QUEUED = "deployment_queued"
     DEPLOYING = "deploying"
     BLOCKED = "blocked"
@@ -117,7 +118,8 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
         }
     ),
     CardStatus.REVIEW_QUEUED: frozenset({CardStatus.REVIEWING, CardStatus.FAILED, CardStatus.CANCELLED}),
-    CardStatus.REVIEWING: frozenset({CardStatus.REVIEW_READY, CardStatus.IMPLEMENTATION_QUEUED, CardStatus.BLOCKED, CardStatus.FAILED, CardStatus.CANCELLED}),
+    CardStatus.REVIEWING: frozenset({CardStatus.REVIEW_READY, CardStatus.IMPLEMENTATION_QUEUED, CardStatus.REVIEW_CORRECTIONS_PAUSED, CardStatus.BLOCKED, CardStatus.FAILED, CardStatus.CANCELLED}),
+    CardStatus.REVIEW_CORRECTIONS_PAUSED: frozenset({CardStatus.IMPLEMENTATION_QUEUED, CardStatus.CANCELLED}),
     CardStatus.REVIEW_READY: frozenset(
         {
             CardStatus.IMPLEMENTATION_QUEUED,
@@ -207,7 +209,7 @@ COMPLETION_CARD_STATUSES_BY_PHASE: dict[RunPhase, frozenset[CardStatus]] = {
         }
     ),
     RunPhase.IMPLEMENTATION: frozenset({CardStatus.REVIEW_QUEUED}),
-    RunPhase.REVIEW: frozenset({CardStatus.REVIEW_READY, CardStatus.IMPLEMENTATION_QUEUED, CardStatus.BLOCKED}),
+    RunPhase.REVIEW: frozenset({CardStatus.REVIEW_READY, CardStatus.IMPLEMENTATION_QUEUED, CardStatus.REVIEW_CORRECTIONS_PAUSED}),
     RunPhase.DEPLOYMENT: frozenset({CardStatus.COMPLETED}),
 }
 

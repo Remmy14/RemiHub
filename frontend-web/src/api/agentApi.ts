@@ -4,7 +4,7 @@ export const AgentActions = {
   ADD_FOLLOW_UP: "add_follow_up",
   APPROVE_IMPLEMENTATION: "approve_implementation",
   APPROVE_DEPLOYMENT: "approve_deployment",
-  REQUEST_REVISION: "request_revision",
+  CONTINUE_CORRECTIONS: "continue_corrections",
   RETRY: "retry",
   RETURN_TO_IMPLEMENTATION: "return_to_implementation",
   RETRY_GITHUB_SYNC: "retry_github_sync",
@@ -16,6 +16,7 @@ export const AgentActions = {
 export type AgentAction = (typeof AgentActions)[keyof typeof AgentActions];
 
 export type AgentLatestRun = {
+  independent_review?: Record<string, unknown> | null;
   id: string;
   phase: string;
   status: string;
@@ -194,32 +195,25 @@ export async function addAgentFollowUp(
 export type ReviewRevision = {
   review_run_id: string;
   candidate_digest: string;
-  decisions: { finding_index: number; decision: "fix" | "defer_ignore" }[];
+  finding_indexes?: number[];
 };
 
-// Build decisions only for the exact latest exhausted review displayed by the form.
 export function reviewRevisionForCard(
   card: AgentCardDetail,
-  decisions: Record<number, "fix" | "defer_ignore">,
+  included: Record<number, boolean>,
   notes: string,
 ): ReviewRevision | null {
   const run = card.runs.find((item) => item.id === card.latest_run?.id);
   const review = run?.independent_review;
   const findings = review?.findings;
-  if (!card.allowed_actions.includes(AgentActions.REQUEST_REVISION) || card.status !== "blocked" ||
-      !run || run.phase !== "review" || run.status !== "succeeded" || run.card_revision !== card.revision ||
-      review?.verdict !== "changes_requested" || review.review_attempt !== 3 ||
-      typeof review.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(review.candidate_digest) ||
-      !Array.isArray(findings) || !findings.length || !notes.trim() ||
-      Object.keys(decisions).length !== findings.length ||
-      !findings.every((_, index) => decisions[index] === "fix" || decisions[index] === "defer_ignore")) {
-    return null;
-  }
-  return {
-    review_run_id: run.id,
-    candidate_digest: review.candidate_digest,
-    decisions: findings.map((_, finding_index) => ({ finding_index, decision: decisions[finding_index] })),
-  };
+  if (!card.allowed_actions.includes(AgentActions.CONTINUE_CORRECTIONS) ||
+      !run || run.phase !== "review" || run.status !== "succeeded" ||
+      typeof review?.candidate_digest !== "string" || !/^[a-f0-9]{64}$/.test(review.candidate_digest) ||
+      !Array.isArray(findings) || !findings.length) return null;
+  const selected = findings.map((_, index) => index).filter((index) => included[index] !== false);
+  if (!selected.length || (selected.length !== findings.length && !notes.trim())) return null;
+  return { review_run_id: run.id, candidate_digest: review.candidate_digest,
+           finding_indexes: selected };
 }
 
 export async function performAgentAction(
@@ -238,26 +232,28 @@ export async function performAgentAction(
     );
   }
 
-  if (action === AgentActions.REQUEST_REVISION && (!revision || !correctionInstructions)) {
-    throw new Error("Review decisions and operator notes are required.");
+  if (action === AgentActions.CONTINUE_CORRECTIONS && !revision) {
+    throw new Error("The exact review candidate and correction findings are required.");
   }
   const latestReview = action === AgentActions.RETRY_REVIEW
     ? card.runs?.find((run) => run.id === card.latest_run?.id)
     : undefined;
-  const reviewDigest = latestReview?.independent_review?.candidate_digest;
+  const source = latestReview?.result_metadata.review_source as Record<string, unknown> | undefined;
+  const candidate = source?.implementation_metadata as Record<string, unknown> | undefined;
+  const reviewDigest = latestReview?.independent_review?.candidate_digest ?? candidate?.candidate_digest;
   if (action === AgentActions.RETRY_REVIEW &&
       (!card.allowed_actions.includes(AgentActions.RETRY_REVIEW) ||
-       card.status !== "blocked" || latestReview?.phase !== "review" ||
-       latestReview.status !== "succeeded" ||
+       latestReview?.phase !== "review" ||
+       !["failed", "succeeded"].includes(latestReview.status) ||
        typeof reviewDigest !== "string" || !/^[0-9a-f]{64}$/.test(reviewDigest))) {
-    throw new Error("An eligible blocked review with a verified candidate digest is required.");
+    throw new Error("A retryable review execution with a verified candidate digest is required.");
   }
   const commonOptions = {
     method: "POST",
     body: action === AgentActions.RETRY_REVIEW
       ? JSON.stringify({ candidate_digest: reviewDigest, notes: correctionInstructions || undefined })
-      : action === AgentActions.REQUEST_REVISION
-      ? JSON.stringify({ ...revision, notes: correctionInstructions })
+      : action === AgentActions.CONTINUE_CORRECTIONS
+      ? JSON.stringify({ candidate_digest: revision!.candidate_digest, finding_indexes: revision!.finding_indexes, notes: correctionInstructions || undefined })
       : returningToImplementation
       ? JSON.stringify({ content: correctionInstructions })
       : decisionBody(notes),
@@ -269,14 +265,14 @@ export async function performAgentAction(
         return `/agent/cards/${card.id}/approve-implementation`;
       case AgentActions.APPROVE_DEPLOYMENT:
         return `/agent/cards/${card.id}/approve-deployment`;
-      case AgentActions.REQUEST_REVISION:
-        return `/agent/cards/${card.id}/request-revision`;
+      case AgentActions.CONTINUE_CORRECTIONS:
+        return `/agent/cards/${card.id}/reviews/${revision!.review_run_id}/continue-corrections`;
       case AgentActions.RETRY:
         return `/agent/cards/${card.id}/retry`;
       case AgentActions.RETURN_TO_IMPLEMENTATION:
         return `/agent/cards/${card.id}/return-to-implementation`;
       case AgentActions.RETRY_REVIEW:
-        return `/agent/cards/${card.id}/reviews/${latestReview!.id}/retry-infrastructure`;
+        return `/agent/cards/${card.id}/reviews/${latestReview!.id}/retry`;
       case AgentActions.RETRY_GITHUB_SYNC:
         if (!card.deployment_recovery?.deployment_run_id) {
           throw new Error("Deployment recovery details are no longer available.");

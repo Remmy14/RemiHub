@@ -186,58 +186,7 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             notes="Retry the approved candidate",
         )
 
-    @patch("backend.routers.agent.agent_service.retry_infrastructure_review")
-    def test_review_infrastructure_retry_is_admin_and_digest_bound(self, retry_review):
-        review_run_id = "6f640dfb-db73-4aa8-aaa1-5d9aae13eb72"
-        digest = "a" * 64
-        retry_review.return_value = card_detail(
-            status="review_queued", allowed_actions=["cancel"],
-        )
-        response = admin_client.post(
-            f"/agent/cards/{CARD_ID}/reviews/{review_run_id}/retry-infrastructure",
-            json={"candidate_digest": digest, "notes": "Resume failed-closed review"},
-        )
-        self.assertEqual(response.status_code, 200)
-        retry_review.assert_called_once_with(
-            card_id=CARD_ID, review_run_id=review_run_id,
-            candidate_digest=digest, requested_by=USER_ID,
-            notes="Resume failed-closed review",
-        )
-        retry_review.reset_mock()
-        invalid = admin_client.post(
-            f"/agent/cards/{CARD_ID}/reviews/{review_run_id}/retry-infrastructure",
-            json={"candidate_digest": "not-a-valid-digest"},
-        )
-        self.assertEqual(invalid.status_code, 422)
-        retry_review.assert_not_called()
 
-    @patch("backend.routers.agent.agent_service.retry_review_with_android_evidence")
-    def test_evidence_retry_requires_admin_exact_digest_and_commit(self, retry_evidence):
-        run = "6f640dfb-db73-4aa8-aaa1-5d9aae13eb72"
-        url = f"/agent/cards/{CARD_ID}/reviews/{run}/retry-evidence"
-        payload = {"candidate_digest": "a" * 64,
-                   "android_commit": "907083d48e4614d981ef5476795a378771d8f7c4",
-                   "notes": "Re-review with committed Android response parser"}
-        retry_evidence.return_value = card_detail(status="review_queued")
-        response = admin_client.post(url, json=payload)
-        self.assertEqual(response.status_code, 200)
-        retry_evidence.assert_called_once_with(
-            card_id=CARD_ID, review_run_id=run,
-            candidate_digest=payload["candidate_digest"],
-            android_commit=payload["android_commit"],
-            requested_by=USER_ID, notes=payload["notes"])
-        retry_evidence.reset_mock()
-        for delta in ({"android_commit": "not-a-commit"},
-                      {"candidate_digest": "tampered"},
-                      {"notes": ""},
-                      {"extra": "not-allowed"}):
-            self.assertEqual(admin_client.post(url, json={**payload, **delta}).status_code, 422)
-        retry_evidence.assert_not_called()
-        with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": "transition"}, clear=True):
-            self.assertEqual(strict_client.post(url, json=payload).status_code, 401)
-        retry_evidence.assert_not_called()
-        retry_evidence.side_effect = AgentConflictError("Review not eligible")
-        self.assertEqual(admin_client.post(url, json=payload).status_code, 409)
 
     def test_blank_card_description_is_rejected(self):
         response = admin_client.post(
@@ -280,10 +229,10 @@ class AgentHttpBoundaryTests(unittest.TestCase):
             ["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/AgentCardResponse",
         )
-        revision = paths["/agent/cards/{card_id}/request-revision"]["post"]
+        revision = paths["/agent/cards/{card_id}/reviews/{review_run_id}/continue-corrections"]["post"]
         self.assertEqual(
             revision["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/AgentReviewRevisionRequest",
+            "#/components/schemas/AgentReviewActionRequest",
         )
         self.assertEqual(
             revision["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
@@ -318,30 +267,23 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class HumanReviewHttpTests(unittest.TestCase):
-    def payload(self):
-        return {"review_run_id": "58debd09-e31c-4b5f-9f19-d9dff4bf3f71",
-                "candidate_digest": "a" * 64, "notes": "Fix required issue, defer cosmetic change",
-                "decisions": [{"finding_index": 0, "decision": "fix"},
-                              {"finding_index": 1, "decision": "defer_ignore"}]}
 
-    @patch("backend.routers.agent.agent_service.request_review_revision")
-    def test_authenticated_actor_and_exact_request(self, request_revision):
-        request_revision.return_value = card_detail(status="implementation_queued")
-        payload = self.payload()
-        response = admin_client.post(f"/agent/cards/{CARD_ID}/request-revision", json=payload)
-        self.assertEqual(response.status_code, 200)
-        request_revision.assert_called_once_with(card_id=CARD_ID, requested_by=USER_ID, **payload)
 
-    @patch("backend.routers.agent.agent_service.request_review_revision")
-    def test_authentication_validation_and_conflict(self, request_revision):
-        path = f"/agent/cards/{CARD_ID}/request-revision"
-        with patch.dict(os.environ, {"REMIHUB_AUTH_MODE": "transition"}, clear=True):
-            self.assertEqual(strict_client.post(path, json=self.payload()).status_code, 401)
-        request_revision.assert_not_called()
-        for delta in ({"notes": " "}, {"actor_user_id": USER_ID}, {"decisions": []},
-                      {"candidate_digest": "stale"}):
-            self.assertEqual(admin_client.post(path, json={**self.payload(), **delta}).status_code, 422)
-        request_revision.assert_not_called()
-        request_revision.side_effect = AgentConflictError("Stale third review")
-        self.assertEqual(admin_client.post(path, json=self.payload()).status_code, 409)
+class ReviewRecoveryHttpTests(unittest.TestCase):
+    def test_retry_and_continue_require_administrator_and_bind_actor(self):
+        review_id="58debd09-e31c-4b5f-9f19-d9dff4bf3f71"
+        payload={"candidate_digest":"a"*64,"notes":"Continue approved scope"}
+        for action, name in [("retry","retry_review"),("continue-corrections","continue_corrections")]:
+            path=f"/agent/cards/{CARD_ID}/reviews/{review_id}/{action}"
+            with self.subTest(action=action),patch("backend.routers.agent.agent_service."+name) as operation:
+                operation.return_value=card_detail(status="implementation_queued")
+                with patch.dict(os.environ,{"REMIHUB_AUTH_MODE":"transition"},clear=True):
+                    self.assertEqual(strict_client.post(path,json=payload).status_code,401)
+                operation.assert_not_called()
+                self.assertEqual(admin_client.post(path,json={**payload,"actor_user_id":USER_ID}).status_code,422)
+                self.assertEqual(admin_client.post(path,json={**payload,"finding_indexes":[True]}).status_code,422)
+                self.assertEqual(admin_client.post(path,json=payload).status_code,200)
+                self.assertEqual(operation.call_args.kwargs["requested_by"],USER_ID)
+                self.assertEqual(operation.call_args.kwargs["candidate_digest"],"a"*64)
+                operation.side_effect=AgentConflictError("Stale review")
+                self.assertEqual(admin_client.post(path,json=payload).status_code,409)

@@ -891,10 +891,9 @@ class RunCompletionTests(unittest.TestCase):
 
     def test_review_notification_only_for_exhausted_corrections(self):
         cases = (
-            ("changes_requested", 3, CardStatus.BLOCKED, "human"),
-            ("changes_requested", 2, CardStatus.IMPLEMENTATION_QUEUED, None),
-            ("pass", 3, CardStatus.REVIEW_READY, "existing"),
-            ("blocked", 3, CardStatus.BLOCKED, None),
+            ("request_changes", 4, CardStatus.REVIEW_CORRECTIONS_PAUSED, "human"),
+            ("request_changes", 2, CardStatus.IMPLEMENTATION_QUEUED, None),
+            ("approve", 3, CardStatus.REVIEW_READY, "existing"),
         )
         for verdict, attempt, target, expected_notification in cases:
             with self.subTest(verdict=verdict, attempt=attempt), \
@@ -920,14 +919,15 @@ class RunCompletionTests(unittest.TestCase):
                     result_metadata={"review_source": source},
                 )
                 evidence = {
-                    "verdict": verdict,
+                    "decision": verdict,
+                    "correction_allowance": 3,
                     "review_cycle": "cycle-id",
                     "review_attempt": attempt,
                     "implementation_run_id": "implementation-id",
                     "card_revision": claim.card_revision,
                     "candidate_digest": "digest",
                     "summary": "Review result",
-                    "findings": [] if verdict == "pass" else [{"description": "Fix this"}],
+                    "findings": [] if verdict == "approve" else [{"issue": "Fix this", "required_change": "Correct it"}],
                     "thread_id": "thread-id",
                     "turn_id": "turn-id",
                     "validation_evidence": ["tests passed"],
@@ -950,14 +950,12 @@ class RunCompletionTests(unittest.TestCase):
                             call for call in connection.cursor.return_value.__enter__.return_value.execute.call_args_list
                             if "UPDATE agent.cards" in call.args[0]
                         )
-                        self.assertEqual(card_update.args[1][:3], (
-                            "blocked", "review_queued", "Independent review requires human attention",
-                        ))
+                        self.assertEqual(card_update.args[1][0], "review_corrections_paused")
                         self.assertEqual(notification.title, "Agent review needs your decision")
                         self.assertIn(claim.title, notification.body)
-                        self.assertIn("Request Revision or Cancel Card", notification.body)
+                        self.assertIn("Continue Corrections or Cancel Card", notification.body)
                     else:
-                        self.assertEqual(notification.title, "Implementation is ready for review")
+                        self.assertEqual(notification.title, "Independent review approved")
                     self.assertEqual(notification.module, "Agent")
                     self.assertEqual(notification.priority, 1)
                     self.assertEqual(notification.data, {
@@ -966,7 +964,7 @@ class RunCompletionTests(unittest.TestCase):
                         "run_id": claim.id,
                         "phase": "review",
                         "status": target.value,
-                        "action": "request_revision" if expected_notification == "human" else "approve_deployment",
+                        "action": "continue_corrections" if expected_notification == "human" else "approve_deployment",
                     })
                     # A duplicate completion cannot pass the owned-run lease check.
                     with patch.object(agent_worker_service_module, "_lock_owned_run", side_effect=AgentLeaseLostError("duplicate")):

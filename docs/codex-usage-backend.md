@@ -52,8 +52,7 @@ gateway's `thread/tokenUsage/updated` notification when it provides a last-turn
 breakdown. A turn with no report is marked unavailable, including failures.
 An unavailable attempt is inserted before execution and replaced when a turn
 report arrives, including when later validation fails. The bounded reviewer
-retains the last valid usage report if its turn later fails, while the review
-verdict remains blocked. Deployment currently invokes no model, so its configuration status is
+retains the last valid usage report if its turn later fails, while the review execution remains retryable without a code-correction cycle. Deployment currently invokes no model, so its configuration status is
 unsupported and it has no token records.
 
 Placeholder and turn writes take the same transaction-scoped PostgreSQL
@@ -68,9 +67,10 @@ completed successfully by then, without failing a completed agent run.
 
 Exact actual model and reasoning effort are null unless the gateway verifies
 them. Planning and implementation expose configured model overrides separately;
-an SDK/account default is not guessed. The qualified reviewer exposes its
-pinned model as actual only when its boundary proof is returned. No stage
-reasoning override exists in current worker settings.
+an SDK/account default is not guessed. The reviewer records the server-selected model and reasoning from thread startup,
+plus the actual CLI version. Each incremental source-inspection turn is recorded
+separately. `REMIHUB_CODEX_REASONING_EFFORT` configures reviewer reasoning and is
+published with its stage configuration; other stages retain their existing behavior.
 
 ## Endpoints
 

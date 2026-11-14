@@ -122,8 +122,8 @@ class BackendDeploymentRuntimeCleanlinessTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.module.require_runtime_state(self.environment, self.base)
 
-    def test_runtime_reset_no_longer_restores_tracked_operational_state(self):
-        self.module.reset_runtime_preserving_operational_release(
+    def test_runtime_promotion_preserves_tracked_operational_state(self):
+        self.module.move_runtime_preserving_operational_release(
             self.environment,
             expected_before=self.base,
             target=self.candidate,

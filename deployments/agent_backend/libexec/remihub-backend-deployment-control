@@ -85,31 +85,55 @@ def fail(message: str) -> "NoReturn":
     raise SystemExit(64)
 
 
+def _git_without_executables(command: list[str], *, user: str | None, environment: dict) -> list[str]:
+    # Discover configured driver names without reading or logging their commands.
+    # Config inspection itself does not checkout source or invoke filters/hooks.
+    repository = None
+    for flag in ("-C", "--git-dir"):
+        if flag in command:
+            index = command.index(flag)
+            repository = [flag, command[index + 1]]
+            break
+    if repository is None:
+        fail("Git command is missing its fixed repository context")
+    probe = [GIT, *repository, "config", "--null", "--name-only", "--get-regexp",
+             r"^filter\..*\.(smudge|process|clean|required)$"]
+    if user and user != "root":
+        probe = [RUNUSER, "--user", user, "--", *probe]
+    result = subprocess.run(probe, check=False, capture_output=True, text=True, env=environment)
+    if result.returncode not in (0, 1):
+        fail("Cannot inspect Git filter configuration safely")
+    drivers = set()
+    for key in filter(None, result.stdout.split("\0")):
+        match = re.fullmatch(r"filter\.([A-Za-z0-9._-]+)\.(smudge|process|clean|required)", key)
+        if not match:
+            fail("Unsupported Git filter configuration name")
+        drivers.add(match.group(1))
+    overrides = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                 "-c", "submodule.recurse=false"]
+    for driver in sorted(drivers):
+        for kind in ("smudge", "process", "clean"):
+            overrides += ["-c", f"filter.{driver}.{kind}="]
+        overrides += ["-c", f"filter.{driver}.required=false"]
+    return [GIT, *overrides, *command[1:]]
+
+
 def run(
-    command: list[str],
-    *,
-    user: str | None = None,
-    check: bool = True,
+    command: list[str], *, user: str | None = None, check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    environment = {
+        "HOME": "/root" if not user or user == "root" else f"/home/{user}",
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(GIT_SAFE_CONFIG),
+        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+    }
+    if command and command[0] == GIT:
+        command = _git_without_executables(command, user=user, environment=environment)
     if user and user != "root":
         command = [RUNUSER, "--user", user, "--", *command]
-    result = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env={
-            "HOME": "/root" if not user or user == "root" else f"/home/{user}",
-            "LANG": "C.UTF-8",
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": str(GIT_SAFE_CONFIG),
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
-        },
-    )
+    result = subprocess.run(command, check=False, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", env=environment)
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
         suffix = f": {detail[-1]}" if detail else ""
@@ -340,20 +364,47 @@ def require_runtime_state(environment: Environment, expected: str) -> None:
         fail(f"runtime has tracked modifications: {details}")
 
 
-def reset_runtime_preserving_operational_release(
-    environment: Environment,
-    *,
-    expected_before: str,
-    target: str,
+def move_clean_checkout(repo: Path, branch_name: str, expected: str, target: str, *, user: str) -> None:
+    """Move only a clean, expected branch; never overwrite ignored/local files.
+
+    Forward promotion is fast-forward only. Explicit rollback retains both
+    commits and uses a non-forcing checkout followed by compare-and-swap.
+    """
+    if git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", user=user) != branch_name:
+        fail("checkout branch changed before promotion")
+    if resolve(repo, "HEAD", user=user) != expected:
+        fail("checkout commit changed before promotion")
+    if git(repo, "status", "--porcelain=v1", "--untracked-files=no", user=user):
+        fail("checkout has tracked modifications")
+    if expected == target:
+        return
+    command = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+               "-c", "submodule.recurse=false", "-C", str(repo)]
+    forward = run(command + ["merge-base", "--is-ancestor", expected, target], user=user, check=False)
+    backward = run(command + ["merge-base", "--is-ancestor", target, expected], user=user, check=False)
+    if forward.returncode != 0 and backward.returncode != 0:
+        fail("checkout target is not in the expected history")
+    # Durable evidence survives both promotion and explicit rollback.
+    for oid in (expected, target):
+        run(command + ["update-ref", "refs/remihub-retained/" + oid, oid], user=user)
+    if forward.returncode == 0:
+        run(command + ["merge", "--ff-only", "--no-edit", "--no-overwrite-ignore", target], user=user)
+    else:
+        # switch refuses tracked, untracked and ignored-file collisions. No
+        # force/discard flag is used. Leave a failed CAS detached for diagnosis.
+        run(command + ["switch", "--detach", "--no-overwrite-ignore", target], user=user)
+        run(command + ["update-ref", "refs/heads/" + branch_name, target, expected], user=user)
+        run(command + ["symbolic-ref", "HEAD", "refs/heads/" + branch_name], user=user)
+    if resolve(repo, "HEAD", user=user) != target or git(repo, "status", "--porcelain=v1", "--untracked-files=no", user=user):
+        fail("checkout did not reach the exact clean target")
+
+
+def move_runtime_preserving_operational_release(
+    environment: Environment, *, expected_before: str, target: str,
 ) -> None:
-    # The legacy function name is retained for the installed command contract.
-    # Mutable Android release state now lives outside the Git worktree, so the
-    # runtime must be clean and can be reset directly.
     require_runtime_state(environment, expected_before)
-    run(
-        [GIT, "-C", str(environment.runtime), "reset", "--hard", target],
-        user=environment.runtime_user,
-    )
+    move_clean_checkout(environment.runtime, environment.runtime_branch,
+                        expected_before, target, user=environment.runtime_user)
     if environment.target_branch == "qa-main":
         harden_qa_runtime(environment, target)
     else:
@@ -644,7 +695,7 @@ def promote(environment: Environment, args: list[str]) -> None:
     )
     if resolve(environment.runtime, temporary_ref, user=environment.runtime_user) != candidate:
         fail("runtime fetched an unexpected candidate commit")
-    reset_runtime_preserving_operational_release(
+    move_runtime_preserving_operational_release(
         environment,
         expected_before=base,
         target=candidate,
@@ -662,7 +713,7 @@ def restore(environment: Environment, args: list[str]) -> None:
     if current != expected:
         fail("runtime is neither the expected candidate nor rollback commit")
     require_runtime_state(environment, expected)
-    reset_runtime_preserving_operational_release(
+    move_runtime_preserving_operational_release(
         environment,
         expected_before=expected,
         target=rollback,
@@ -968,6 +1019,11 @@ def synchronize_sources(environment: Environment, args: list[str]) -> None:
         )
         if resolve(SOURCE_REPO, temporary_ref, user="remihub-agent") != candidate:
             fail("implementation source fetched an unexpected commit")
+        run([GIT, "--git-dir", str(SOURCE_REPO), "merge-base", "--is-ancestor", base, candidate],
+            user="remihub-agent")
+        for oid in (base, candidate):
+            run([GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/remihub-retained/" + oid, oid],
+                user="remihub-agent")
         run(
             [GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/heads/main", candidate, base],
             user="remihub-agent",
@@ -984,10 +1040,7 @@ def synchronize_sources(environment: Environment, args: list[str]) -> None:
             ],
             user="alex",
         )
-        run(
-            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", candidate],
-            user="alex",
-        )
+        move_clean_checkout(PLANNING_REPO, "main", base, candidate, user="alex")
         harden_planning_checkout(candidate)
         require_source_state(candidate)
     except BaseException:
@@ -996,11 +1049,8 @@ def synchronize_sources(environment: Environment, args: list[str]) -> None:
             user="remihub-agent",
             check=False,
         )
-        run(
-            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", base],
-            user="alex",
-            check=False,
-        )
+        if resolve(PLANNING_REPO, "HEAD", user="alex") == candidate:
+            move_clean_checkout(PLANNING_REPO, "main", candidate, base, user="alex")
         try:
             harden_planning_checkout(base)
         except BaseException:
@@ -1026,15 +1076,17 @@ def restore_sources(environment: Environment, args: list[str]) -> None:
     if source_current not in allowed or planning_current not in allowed:
         fail("agent sources are neither the expected candidate nor rollback commit")
     if source_current == expected:
+        run([GIT, "--git-dir", str(SOURCE_REPO), "merge-base", "--is-ancestor", rollback, expected],
+            user="remihub-agent")
+        for oid in (expected, rollback):
+            run([GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/remihub-retained/" + oid, oid],
+                user="remihub-agent")
         run(
             [GIT, "--git-dir", str(SOURCE_REPO), "update-ref", "refs/heads/main", rollback, expected],
             user="remihub-agent",
         )
     if planning_current == expected:
-        run(
-            [GIT, "-C", str(PLANNING_REPO), "reset", "--hard", rollback],
-            user="alex",
-        )
+        move_clean_checkout(PLANNING_REPO, "main", expected, rollback, user="alex")
     harden_planning_checkout(rollback)
     require_source_state(rollback)
 

@@ -202,6 +202,8 @@ class OpenAICodexPlanningGateway:
             raise
 
         final_response = (result.final_response or "").strip()
+        if not final_response:
+            raise RuntimeError("Codex completed without a final planning response")
 
         return CodexPlanningTurn(
             thread_id=thread.id,

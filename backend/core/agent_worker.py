@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -11,6 +12,17 @@ from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase
 
 
 logger = logging.getLogger("remihub.agent_worker")
+
+
+def review_execution_allowance(metadata: dict) -> int:
+    """Absolute attempt ceiling; administrator retry grants a fresh window."""
+    retries = int(os.environ.get("REMIHUB_REVIEW_EXECUTION_RETRIES", "2"))
+    if not 0 <= retries <= 100:
+        raise ValueError("Review retry policy must be 0-100")
+    allowance = metadata.get("review_execution_allowance", retries + 1)
+    if type(allowance) is not int or allowance < 1:
+        raise ValueError("Review execution allowance must be positive")
+    return allowance
 
 
 class AgentLeaseLostError(RuntimeError):
@@ -254,13 +266,16 @@ class AgentWorker:
         if claim is None:
             return False
 
-        if claim.attempt_count > self.max_attempts:
-            self.queue.fail_run(
-                claim,
-                error_message=(
-                    f"Maximum worker attempts exceeded ({self.max_attempts})"
-                ),
-            )
+        limit = (review_execution_allowance(claim.result_metadata)
+                 if claim.phase is RunPhase.REVIEW else self.max_attempts)
+        if claim.attempt_count > limit:
+            try:
+                reason = f"Maximum worker attempts exceeded ({limit})"
+                if claim.phase is RunPhase.REVIEW:
+                    reason += "; execution may have lost its lease"
+                self.queue.fail_run(claim, error_message=reason)
+            except AgentLeaseLostError:
+                self._log_lease_lost(claim)
             return True
 
         try:

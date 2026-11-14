@@ -1,3 +1,4 @@
+import { reviewRunStatus } from "./api/agentReview";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
@@ -79,8 +80,8 @@ function actionLabel(action: AgentAction): string {
       return "Approve Implementation";
     case AgentActions.APPROVE_DEPLOYMENT:
       return "Approve Deployment";
-    case AgentActions.REQUEST_REVISION:
-      return "Request Revision";
+    case AgentActions.CONTINUE_CORRECTIONS:
+      return "Continue Corrections";
     case AgentActions.RETRY:
       return "Retry Failed Run";
     case AgentActions.RETURN_TO_IMPLEMENTATION:
@@ -88,7 +89,7 @@ function actionLabel(action: AgentAction): string {
     case AgentActions.RETRY_GITHUB_SYNC:
       return "Retry GitHub Sync";
     case AgentActions.RETRY_REVIEW:
-      return "Retry Review with Updated Evidence";
+      return "Retry Review";
     case AgentActions.CANCEL:
       return "Cancel Card";
     case AgentActions.CLOSE:
@@ -184,7 +185,7 @@ function statusClasses(status: string): string {
   if (status === "blocked") {
     return "border-amber-200 bg-amber-50 text-amber-800";
   }
-  if (status === "completed" || status === "closed" || status === "succeeded") {
+  if (status === "completed" || status === "closed" || status === "succeeded" || status === "review_approved") {
     return "border-emerald-200 bg-emerald-50 text-emerald-700";
   }
   if (activeStatuses.has(status) || status === "running" || status === "queued" || status === "claimed") {
@@ -503,11 +504,11 @@ function ActionPanel({
   );
   const [pendingAction, setPendingAction] = useState<AgentAction | null>(null);
   const [notes, setNotes] = useState("");
-  const [decisions, setDecisions] = useState<Record<number, "fix" | "defer_ignore">>({});
+  const [decisions, setDecisions] = useState<Record<number, boolean>>({});
   const latestReview = card.runs.find((run) => run.id === card.latest_run?.id);
   const evidence = latestReview?.independent_review;
   const findings = Array.isArray(evidence?.findings) ? evidence.findings : [];
-  const requestingRevision = pendingAction === AgentActions.REQUEST_REVISION;
+  const requestingRevision = pendingAction === AgentActions.CONTINUE_CORRECTIONS;
   const revisionRequest = reviewRevisionForCard(card, decisions, notes);
   const revisionReady = revisionRequest !== null;
 
@@ -565,21 +566,17 @@ function ActionPanel({
             {pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
               ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
               : pendingAction === AgentActions.RETRY_REVIEW
-              ? "Rerun independent review with updated frozen source evidence. No implementation code is changed. The previous verdict stays in the audit history; deployment still requires a passing review and approval."
+              ? "Retry the same frozen candidate. This does not consume a correction cycle. Previous execution errors remain in history; deployment still requires an independent approval and separate human approval."
               : "Review the current card state before confirming this lifecycle action."}
           </p>
           {requestingRevision && <div className="mt-3 space-y-3">
-            <p>Choose a decision for every finding. Operator notes are required. A fresh bounded review cycle will follow; deployment still requires a passing review and approval.</p>
+            <p>Continue implementation corrections for the selected findings. All findings are included by default. Explain any exclusions in the notes.</p>
             {findings.map((raw, index) => {
               const finding = raw as Record<string, unknown>;
               return <label className="block" key={`${latestReview?.id}-${index}`}>
-                <span className="block whitespace-pre-wrap">{String(finding.kind ?? "required")}: {String(finding.path ?? "")} — {String(finding.description ?? "")}<br />{String(finding.correction ?? "")}</span>
-                <select aria-label={`Decision for finding ${index + 1}`} value={decisions[index] ?? ""}
-                  onChange={(event) => setDecisions({ ...decisions, [index]: event.target.value as "fix" | "defer_ignore" })}>
-                  <option value="" disabled>Choose a decision</option>
-                  <option value="fix">Fix</option>
-                  <option value="defer_ignore">Defer / Ignore</option>
-                </select>
+                <input type="checkbox" checked={decisions[index] !== false}
+                  onChange={(event) => setDecisions({ ...decisions, [index]: event.target.checked })} />
+                <span className="whitespace-pre-wrap"> {String(finding.file ?? finding.path ?? "")} — {String(finding.issue ?? finding.description ?? "")}<br />{String(finding.required_change ?? finding.correction ?? "")}</span>
               </label>;
             })}
           </div>}
@@ -594,7 +591,7 @@ function ActionPanel({
             placeholder={
               pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
                 ? "Required: describe the fix the implementer should make"
-                : requestingRevision ? "Required: operator instructions and scope decisions" : "Notes (optional)"
+                : requestingRevision ? "Explain excluded findings, if any" : "Notes (optional)"
             }
             value={notes}
           />
@@ -713,7 +710,7 @@ function LatestRunCard({ run }: { run: AgentLatestRun }) {
         <h2 className="text-sm font-black uppercase text-slate-500">
           Latest Run
         </h2>
-        <StatusChip status={run.status} />
+        <StatusChip status={reviewRunStatus(run)} />
       </div>
       <div className="mt-3 grid gap-3 text-sm md:grid-cols-4">
         <Metric label="Phase" value={humanize(run.phase)} />
@@ -813,23 +810,29 @@ function MessageCard({ message }: { message: AgentMessage }) {
 
 function IndependentReviewProgress({ run }: { run: AgentRun }) {
   const review = run.independent_review;
-  if (!review) {
-    return <p className="mt-3 text-sm">Independent review: {humanize(run.status)}</p>;
-  }
-  const findings = Array.isArray(review.findings) ? review.findings : [];
+  const failures = run.result_metadata.review_executions;
+  const findings = Array.isArray(review?.findings) ? review.findings : [];
   return (
     <div className="mt-3 space-y-3 rounded-md border border-blue-100 bg-blue-50 p-3">
-      <h4 className="font-bold">Independent review: attempt {String(review.review_attempt ?? "-")} of 3</h4>
-      <p className="text-sm font-semibold">{humanize(String(review.verdict ?? run.status))}</p>
-      {typeof review.summary === "string" && <p className="whitespace-pre-wrap text-sm">{review.summary}</p>}
-      {findings.map((value, index) => {
-        if (!value || typeof value !== "object") return null;
-        const finding = value as Record<string, unknown>;
-        return <CopyableBlock key={index}
-          label={`${finding.kind === "advisory" ? "Advisory suggestion" : "Required correction"} — ${String(finding.severity ?? "Finding")}: ${String(finding.path ?? "")}`}
-          text={`${String(finding.description ?? "")}\nCorrection: ${String(finding.correction ?? "")}`} />;
+      <h4 className="font-bold">{humanize(reviewRunStatus(run))}</h4>
+      {review && <>
+        <p className="text-sm">Review {String(review.review_attempt ?? "-")}{typeof review.correction_allowance === "number" && <> · Automatic corrections remaining: {Math.max(0, review.correction_allowance - Number(review.review_attempt ?? 1) + 1)}</>}</p>
+        <p className="text-xs">Model: {String(review.actual_model ?? review.configured_model ?? "Not reported")} · Reasoning: {String(review.reasoning_effort ?? "Default / not reported")}</p>
+        {typeof review.summary === "string" && <p className="whitespace-pre-wrap text-sm">{review.summary}</p>}
+        {findings.map((value, index) => {
+          if (!value || typeof value !== "object") return null;
+          const finding = value as Record<string, unknown>;
+          return <CopyableBlock key={index} label={`Finding: ${String(finding.file ?? finding.path ?? "")}`}
+            text={`${String(finding.issue ?? finding.description ?? "")}\nRequired change: ${String(finding.required_change ?? finding.correction ?? "")}`} />;
+        })}
+        {reviewRunStatus(run) === "review_approved" && <p className="text-sm">Worker finished successfully; reviewer approved the implementation. Human deployment approval is still required.</p>}
+        {["changes_requested", "automatic_corrections_paused"].includes(reviewRunStatus(run)) && <p className="text-sm">Worker finished successfully; the implementation requires corrections.</p>}
+      </>}
+      {run.error_message && <p className="whitespace-pre-wrap text-sm">Execution error: {run.error_message}</p>}
+      {Array.isArray(failures) && failures.map((raw, index) => {
+        const failure = raw as Record<string, unknown>;
+        return <p className="text-sm" key={index}>Execution {String(failure.attempt_count)} failed: {String(failure.error)}. The frozen candidate was preserved for retry.</p>;
       })}
-      {review.verdict === "pass" && <p className="text-sm">Human deployment approval is still required.</p>}
     </div>
   );
 }
@@ -846,7 +849,7 @@ function RunCard({ run }: { run: AgentRun }) {
             Revision {run.card_revision} / attempt {run.attempt_count}
           </div>
         </div>
-        <StatusChip status={run.status} />
+        <StatusChip status={reviewRunStatus(run)} />
       </div>
 
       <div className="mt-3 grid gap-3 text-sm md:grid-cols-4">

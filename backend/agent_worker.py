@@ -517,18 +517,36 @@ def build_executor(
 
     if settings.executor_name == "codex-review":
         from backend.core.codex_review import CodexReviewExecutor
-        from backend.core.codex_review_bounded import development_gateway, PINNED_MODEL
-        # Exact reviewer-only CLI and private ChatGPT control home.
-        # Fresh no-tools qualification runs before each authenticated turn.
+        from backend.core.codex_review_bounded import SourceReviewGateway
+        # Explicit reviewer CLI and dedicated control home; native tools stay disabled.
+        # Source inspection is mediated by the host over immutable snapshots.
         wrapper = os.environ.get("REMIHUB_REVIEW_CODEX_BIN")
         home = os.environ.get("REMIHUB_REVIEW_CODEX_HOME")
-        if not wrapper or not home or not settings.artifact_root or not settings.repository_scope or settings.codex_model != PINNED_MODEL:
+        if not wrapper or not home or not settings.codex_model:
             raise AgentWorkerConfigurationError(
-                "codex-review requires pinned CLI/model, dedicated REMIHUB_REVIEW_CODEX_HOME, artifact root and explicit repository scope")
+                "codex-review requires explicit CLI/model and a dedicated REMIHUB_REVIEW_CODEX_HOME")
+        gateway = SourceReviewGateway(codex_bin=wrapper, control_home=home,
+            timeout_seconds=_positive_int("REMIHUB_REVIEW_TIMEOUT_SECONDS", 900),
+            reasoning_effort=os.environ.get("REMIHUB_CODEX_REASONING_EFFORT"))
+        backend_artifacts = os.environ.get("REMIHUB_REVIEW_BACKEND_ARTIFACT_ROOT")
+        android_artifacts = os.environ.get("REMIHUB_REVIEW_ANDROID_ARTIFACT_ROOT")
+        if backend_artifacts or android_artifacts:
+            if (not backend_artifacts or not android_artifacts or settings.artifact_root
+                or settings.repository_scope or not settings.backend_repository_path
+                or not settings.android_repository_path):
+                raise AgentWorkerConfigurationError("Unified reviewer requires both scoped artifacts and Git repositories, without single-scope settings")
+            return CodexReviewExecutor(
+                artifact_roots={RepositoryScope.BACKEND: backend_artifacts,
+                                RepositoryScope.ANDROID: android_artifacts},
+                supporting_repositories={RepositoryScope.BACKEND: settings.backend_repository_path,
+                                         RepositoryScope.ANDROID: settings.android_repository_path},
+                gateway=gateway, model=settings.codex_model)
+        if not settings.artifact_root or not settings.repository_scope:
+            raise AgentWorkerConfigurationError("Single-scope reviewer requires an artifact root and repository scope")
         return CodexReviewExecutor(
             artifact_root=settings.artifact_root,
             repository_scope=RepositoryScope(settings.repository_scope),
-            gateway=development_gateway(codex_bin=wrapper, control_home=home), model=settings.codex_model)
+            gateway=gateway, model=settings.codex_model)
 
     if settings.executor_name == "codex-implementation":
         if queue is None:
@@ -797,9 +815,14 @@ def run_worker(settings: AgentWorkerSettings) -> None:
     from backend.services.agent_usage_writer import flush_turn_writes, publish_stage_configuration
 
     def publish_configuration() -> None:
+        options = {}
+        if settings.executor_name == "codex-review":
+            effort = getattr(getattr(executor, "gateway", None), "reasoning_effort", None)
+            if effort:
+                options["reasoning_effort"] = effort
         publish_stage_configuration(executor_name=settings.executor_name,
                                     worker_id=settings.worker_id,
-                                    model=settings.codex_model)
+                                    model=settings.codex_model, **options)
 
     stop_event = threading.Event()
     configuration_thread = None

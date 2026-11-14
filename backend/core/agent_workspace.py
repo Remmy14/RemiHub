@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import subprocess
 from contextlib import contextmanager
@@ -26,6 +27,7 @@ class ImplementationWorkspace:
     base_branch: str
     feature_branch: str
     base_commit: str
+    base_refresh: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,12 @@ class GitImplementationWorkspaceManager:
             feature_branch=feature_branch,
         )
 
+        refresh = None
+        if claim.result_metadata.get("refresh_base") is True:
+            refresh = self._refresh_approved_base(expected_path, base_branch, base_commit, claim)
+            if refresh is not None:
+                base_commit = refresh["new_base"]
+
         if not claim.feature_branch:
             persist_workspace(feature_branch, str(expected_path))
 
@@ -243,7 +251,130 @@ class GitImplementationWorkspaceManager:
             base_branch=base_branch,
             feature_branch=feature_branch,
             base_commit=base_commit,
+            base_refresh=refresh,
         )
+
+    def _refresh_approved_base(self, path, base_branch, original_base, claim):
+        """Only an authorized correction may advance its base; ordinary retries do not.
+
+        Keep the entire old WIP in a named Git stash, fast-forward only, and retain
+        that stash even after successful application. Never reset or drop source.
+        """
+        pending = self._pending_refresh_ref(path)
+        self._require_refresh_recovered(path, pending)
+        latest = self._resolve_commit(base_branch)
+        if latest == original_base:
+            return None
+        self._run_git(path, "merge-base", "--is-ancestor", original_base, latest,
+                      error_context="Approved source base diverged; refusing to rewrite card history")
+        status = self._run_git(path, "status", "--porcelain", "--untracked-files=all",
+                               error_context="Cannot inspect candidate before base refresh").stdout.strip()
+        stash = None
+        if status:
+            # Record intent before stashing or advancing HEAD. A crash or partial
+            # restore must never let the next retry silently skip the old WIP.
+            self._run_git(path, "update-ref", pending, original_base,
+                          error_context="Cannot record pending candidate preservation")
+            self._run_git(path, "-c", "core.hooksPath=/dev/null", "-c", "user.name=RemiHub Workspace",
+                          "-c", "user.email=remihub-workspace@invalid.local", "stash", "push", "--include-untracked",
+                          "--message", f"RemiHub card {claim.card_id} run {claim.id} before base {latest}",
+                          error_context="Cannot preserve candidate before approved base refresh")
+            stash = self._run_git(path, "rev-parse", "refs/stash",
+                                  error_context="Cannot identify preserved candidate").stdout.strip()
+            self._run_git(path, "update-ref", pending, stash,
+                          error_context="Cannot record preserved candidate recovery")
+            self._run_git(path, "update-ref", "refs/remihub-preserved/" + stash, stash,
+                          error_context="Cannot retain original candidate history")
+        try:
+            self._run_git(path, "-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--no-overwrite-ignore", latest,
+                          error_context="Cannot fast-forward to approved source baseline")
+        except AgentWorkspaceError:
+            if stash:
+                self._run_git(path, "-c", "core.hooksPath=/dev/null", "stash", "apply", stash,
+                              error_context=f"Candidate remains preserved in stash {stash}")
+                self._run_git(path, "update-ref", "-d", pending, stash,
+                              error_context="Cannot clear recovered candidate marker")
+            raise
+        conflicts = []
+        if stash:
+            applied = self._run_git(path, "-c", "core.hooksPath=/dev/null", "stash", "apply", stash,
+                allowed_return_codes=(0, 1), error_context=f"Candidate remains preserved in stash {stash}")
+            conflicts = self._unmerged_paths(path)
+            # stash apply may restore tracked files but skip colliding untracked
+            # paths, even when it also reports ordinary tracked merge conflicts.
+            untracked = self._run_git(path, "rev-parse", "--verify", stash + "^3",
+                allowed_return_codes=(0, 128), error_context="Cannot inspect preserved untracked source")
+            if untracked.returncode == 0:
+                names = self._run_git_bytes(path, "ls-tree", "-r", "--name-only", "-z", stash + "^3",
+                    error_context="Cannot enumerate preserved untracked source").stdout
+                for raw_name in filter(None, names.split(b"\0")):
+                    name = os.fsdecode(raw_name)
+                    target = path / name
+                    self._assert_path_within(target, path, field="preserved untracked source")
+                    expected = self._run_git_bytes(path, "show", stash + "^3:" + name,
+                        error_context="Cannot inspect preserved untracked candidate").stdout
+                    if target.is_symlink() or not target.is_file() or target.read_bytes() != expected:
+                        raise AgentWorkspaceError(
+                            f"Candidate stash {stash} needs explicit recovery at {name}; "
+                            f"restore preserved source and resolve the collision before clearing {pending}. Retries are fenced.")
+            if applied.returncode and not conflicts:
+                raise AgentWorkspaceError(f"Candidate stash {stash} needs explicit recovery; retries are fenced by {pending}")
+            if conflicts:
+                record = self._run_git(path, "hash-object", "-w", "--stdin",
+                    input_text=json.dumps(conflicts), error_context="Cannot retain baseline conflict paths").stdout.strip()
+                self._run_git(path, "update-ref", self._refresh_conflict_ref(path), record,
+                              error_context="Cannot record baseline conflict recovery")
+            self._run_git(path, "update-ref", "-d", pending, stash,
+                          error_context="Cannot clear recovered candidate marker")
+        return {"old_base": original_base, "new_base": latest, "preserved_stash": stash,
+                "conflicted_files": conflicts}
+
+    def _pending_refresh_ref(self, path):
+        branch = self._run_git(path, "symbolic-ref", "--short", "HEAD",
+                               error_context="Cannot identify correction branch").stdout.strip()
+        return "refs/remihub-base-refresh-pending/" + branch
+
+    def _require_refresh_recovered(self, path, pending):
+        result = self._run_git(path, "rev-parse", "--verify", pending,
+            allowed_return_codes=(0, 128), error_context="Cannot inspect pending candidate recovery")
+        if result.returncode == 0:
+            raise AgentWorkspaceError(
+                f"Candidate recovery is incomplete ({pending} -> {result.stdout.strip()}); "
+                "restore preserved source and resolve collisions before clearing this marker and retrying")
+
+    def _unmerged_paths(self, path):
+        value = self._run_git_bytes(path, "diff", "--name-only", "--diff-filter=U", "-z",
+                                    error_context="Cannot inspect baseline merge conflicts").stdout
+        return [os.fsdecode(name) for name in value.split(b"\0") if name]
+
+    def _refresh_conflict_ref(self, path):
+        return self._pending_refresh_ref(path).replace("-pending/", "-conflicts/", 1)
+
+    def prepare_validation(self, workspace):
+        """Check recorded conflicts even after staging and across worker retries."""
+        self._require_refresh_recovered(workspace.path, self._pending_refresh_ref(workspace.path))
+        unmerged = self._unmerged_paths(workspace.path)
+        reference = self._refresh_conflict_ref(workspace.path)
+        record = self._run_git(workspace.path, "rev-parse", "--verify", reference,
+            allowed_return_codes=(0, 128), error_context="Cannot inspect baseline conflict recovery")
+        conflicts = set(unmerged)
+        if record.returncode == 0:
+            paths = json.loads(self._run_git(workspace.path, "show", record.stdout.strip(),
+                error_context="Cannot read baseline conflict recovery").stdout)
+            if not isinstance(paths, list) or not all(isinstance(name, str) for name in paths):
+                raise AgentWorkspaceError("Invalid baseline conflict recovery record")
+            conflicts.update(paths)
+        if conflicts:
+            for name in conflicts:
+                self._assert_path_within(workspace.path / name, workspace.path, field="resolved conflict")
+            self._run_git(workspace.path, "diff", "--check", "HEAD", "--", *sorted(conflicts),
+                          error_context="Resolve baseline merge conflict markers before validation")
+        if unmerged:
+            self._run_git(workspace.path, "-c", "core.hooksPath=/dev/null", "add", "--", *unmerged,
+                          error_context="Cannot record resolved baseline merge conflicts")
+        if record.returncode == 0:
+            self._run_git(workspace.path, "update-ref", "-d", reference, record.stdout.strip(),
+                          error_context="Cannot clear resolved baseline conflict recovery")
 
     def _verify_workspace(self, path: Path, feature_branch: str) -> None:
         self._assert_path_within_root(path)
@@ -479,6 +610,7 @@ class GitImplementationWorkspaceManager:
         repository: Path,
         *arguments: str,
         allowed_return_codes: Sequence[int] = (0,),
+        input_text: str | None = None,
         error_context: str,
     ) -> subprocess.CompletedProcess[str]:
         command = [self.git_binary, "-C", str(repository), *arguments]
@@ -494,6 +626,7 @@ class GitImplementationWorkspaceManager:
         try:
             result = subprocess.run(
                 command,
+                input=input_text,
                 check=False,
                 capture_output=True,
                 encoding="utf-8",

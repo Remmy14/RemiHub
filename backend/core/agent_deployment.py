@@ -2497,14 +2497,14 @@ class GitBackendDeploymentManager:
             )
         self._reject_special_git_modes(approved_patch)
         patch_sha256 = hashlib.sha256(approved_patch).hexdigest()
-        from backend.core.codex_review import candidate_digest, parse_verdict
+        from backend.core.codex_review import candidate_digest, require_approval, review_decision
         review = metadata.get("independent_review", {})
         try:
             digest = candidate_digest(metadata, run_id=source.implementation_run_id, revision=claim.card_revision)
         except (KeyError, TypeError, ValueError) as exc:
             raise AgentDeploymentError("Independent review candidate identity is missing") from exc
         if (metadata.get("candidate_digest") != digest or workspace.get("patch_sha256") != patch_sha256
-            or review.get("verdict") != "pass" or review.get("candidate_digest") != digest
+            or review_decision(review) != "approve" or review.get("candidate_digest") != digest
             or review.get("implementation_run_id") != source.implementation_run_id
             or review.get("card_revision") != claim.card_revision
             or not review.get("thread_id") or not review.get("turn_id")
@@ -2512,7 +2512,7 @@ class GitBackendDeploymentManager:
             raise AgentDeploymentError("Deployment requires a passing independent review of this exact candidate")
 
         try:
-            parse_verdict(json.dumps({k: review.get(k) for k in ("verdict", "summary", "findings")}))
+            require_approval(review)
         except (TypeError, ValueError) as exc:
             raise AgentDeploymentError("Deployment requires a passing independent review of this exact candidate") from exc
 
@@ -2559,7 +2559,7 @@ class GitBackendDeploymentManager:
         target_head = self._resolve_commit(self.target_repository, self.target_branch)
         existing_candidate = self._branch_commit(candidate_branch)
         qa_candidate_commit = None
-        if self.environment == "production":
+        if self.environment == "production" and self.BACKEND_QA_PARITY_REQUIRED:
             qa_candidate_commit = self._qa_candidate_commit_from_pipeline(claim)
             if target_head not in {approved.base_commit, existing_candidate}:
                 raise AgentDeploymentError(
@@ -2628,7 +2628,10 @@ class GitBackendDeploymentManager:
             )
 
         branch_head = self._resolve_commit(candidate_path, "HEAD")
-        if branch_head == approved.base_commit and self.environment != "production":
+        if branch_head == approved.base_commit and (
+            self.environment != "production"
+            or not self.BACKEND_QA_PARITY_REQUIRED
+        ):
             self._require_clean(candidate_path)
             self._run_git(
                 candidate_path,

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 from backend.core.agent_state import RunPhase
 from backend.core.agent_workspace import (
@@ -151,6 +152,102 @@ class GitImplementationWorkspaceManagerTests(unittest.TestCase):
                 recovered.base_commit,
                 _git(self.source, "rev-parse", "main"),
             )
+
+    def _advanced_correction(self, *, conflict):
+        persisted = []
+        with self.manager.locked_workspace(self.claim,
+                persist_workspace=lambda branch,path:persisted.append((branch,str(path)))) as workspace:
+            original_base = workspace.base_commit
+            (workspace.path / "tracked.txt").write_text("candidate change\n")
+            (workspace.path / "new.txt").write_text("preserve new source\n")
+            original_snapshot = self.manager.capture_snapshot(self.claim, workspace)
+            original_bytes = original_snapshot.patch_path.read_bytes()
+        clone = self.root / "approved-advance"
+        subprocess.run(["git","clone",str(self.source),str(clone)],check=True,capture_output=True)
+        _git(clone,"config","user.name","Approved Source Fixture")
+        _git(clone,"config","user.email","fixture@example.invalid")
+        (clone / "later.txt").write_text("new approved infrastructure\n")
+        if conflict:(clone / "tracked.txt").write_text("approved baseline change\n")
+        _git(clone,"add",".");_git(clone,"commit","-m","Approved source advance");_git(clone,"push","origin","main")
+        correction = replace(self.claim,id=str(uuid4()),feature_branch=persisted[0][0],
+            worktree_path=persisted[0][1],result_metadata={"refresh_base":True,"review_attempt":2})
+        return correction, original_base, original_snapshot.patch_path, original_bytes
+
+    def test_authorized_correction_advances_base_and_preserves_candidate_and_history(self):
+        claim, old_base, original_patch, original_bytes = self._advanced_correction(conflict=False)
+        with self.manager.locked_workspace(claim,persist_workspace=lambda *_args:None) as workspace:
+            self.assertEqual(workspace.base_commit,_git(self.source,"rev-parse","main"))
+            self.assertNotEqual(workspace.base_commit,old_base)
+            self.assertEqual((workspace.path / "tracked.txt").read_text(),"candidate change\n")
+            self.assertEqual((workspace.path / "new.txt").read_text(),"preserve new source\n")
+            self.assertEqual((workspace.path / "later.txt").read_text(),"new approved infrastructure\n")
+            stash=workspace.base_refresh["preserved_stash"]
+            self.assertEqual(_git(workspace.path,"show",stash+":tracked.txt"),"candidate change")
+            self.manager.prepare_validation(workspace)
+            snapshot=self.manager.capture_snapshot(claim,workspace)
+            self.assertEqual(snapshot.changed_files,("new.txt","tracked.txt"))
+        self.assertEqual(original_patch.read_bytes(),original_bytes)
+
+    def test_overlapping_baseline_changes_require_source_resolution_before_validation(self):
+        claim, _old, original_patch, original_bytes = self._advanced_correction(conflict=True)
+        with self.manager.locked_workspace(claim,persist_workspace=lambda *_args:None) as workspace:
+            self.assertIn("tracked.txt",workspace.base_refresh["conflicted_files"])
+            self.assertIn("<<<<<<<",(workspace.path / "tracked.txt").read_text())
+            with self.assertRaisesRegex(AgentWorkspaceError,"Resolve baseline merge"):
+                self.manager.prepare_validation(workspace)
+            (workspace.path / "tracked.txt").write_text("approved baseline change\ncandidate correction\n")
+            self.manager.prepare_validation(workspace)
+            self.assertEqual(self.manager._unmerged_paths(workspace.path),[])
+            snapshot=self.manager.capture_snapshot(claim,workspace)
+            self.assertEqual(snapshot.head_commit,workspace.base_commit)
+            self.assertNotIn("later.txt",snapshot.changed_files)
+        self.assertEqual(original_patch.read_bytes(),original_bytes)
+
+    def test_staged_unresolved_conflicts_remain_fenced_across_workspace_retries(self):
+        claim, _old, patch, original_bytes = self._advanced_correction(conflict=True)
+        with self.manager.locked_workspace(claim, persist_workspace=lambda *_:None) as workspace:
+            self.assertIn("<<<<<<<", (workspace.path / "tracked.txt").read_text())
+            _git(workspace.path, "add", "tracked.txt")
+            self.assertEqual(self.manager._unmerged_paths(workspace.path), [])
+            with self.assertRaisesRegex(AgentWorkspaceError, "Resolve baseline merge"):
+                self.manager.prepare_validation(workspace)
+        with self.manager.locked_workspace(claim, persist_workspace=lambda *_:None) as recovered:
+            self.assertIsNone(recovered.base_refresh)
+            with self.assertRaisesRegex(AgentWorkspaceError, "Resolve baseline merge"):
+                self.manager.prepare_validation(recovered)
+            (recovered.path / "tracked.txt").write_text("approved baseline change\ncandidate correction\n")
+            _git(recovered.path, "add", "tracked.txt")
+            self.manager.prepare_validation(recovered)
+            self.manager.prepare_validation(recovered)
+        self.assertEqual(patch.read_bytes(), original_bytes)
+
+    def test_untracked_baseline_collision_fences_retries_until_explicit_source_recovery(self):
+        claim, _old, patch, original_bytes = self._advanced_correction(conflict=False)
+        clone = self.root / "approved-advance"
+        (clone / "new.txt").write_text("approved new source\n")
+        _git(clone, "add", ".");_git(clone, "commit", "-m", "Add colliding source");_git(clone, "push", "origin", "main")
+        path = Path(claim.worktree_path)
+        with self.assertRaisesRegex(AgentWorkspaceError, "needs explicit recovery"):
+            with self.manager.locked_workspace(claim, persist_workspace=lambda *_:None):
+                self.fail("partially restored candidate must not reach implementation")
+        self.assertEqual(_git(path, "rev-parse", "HEAD"), _git(self.source, "rev-parse", "main"))
+        pending = self.manager._pending_refresh_ref(path)
+        stash = _git(path, "rev-parse", pending)
+        self.assertEqual(_git(path, "show", stash + "^3:new.txt"), "preserve new source")
+        self.assertEqual(_git(path, "rev-parse", "refs/remihub-preserved/" + stash), stash)
+        with self.assertRaisesRegex(AgentWorkspaceError, "recovery is incomplete"):
+            with self.manager.locked_workspace(claim, persist_workspace=lambda *_:None):
+                self.fail("HEAD matching latest must not bypass pending recovery")
+        # Explicit operator recovery restores old source before clearing the host marker.
+        preserved = subprocess.run(["git", "-C", str(path), "show", stash + "^3:new.txt"],
+                                   check=True, capture_output=True).stdout
+        (path / "new.txt").write_bytes(preserved)
+        _git(path, "update-ref", "-d", pending, stash)
+        with self.manager.locked_workspace(claim, persist_workspace=lambda *_:None) as workspace:
+            self.manager.prepare_validation(workspace)
+            self.assertEqual((workspace.path / "new.txt").read_text(), "preserve new source\n")
+            self.assertEqual((workspace.path / "tracked.txt").read_text(), "candidate change\n")
+        self.assertEqual(patch.read_bytes(), original_bytes)
 
     def test_existing_workspace_rejects_agent_created_commit(self):
         persisted = []

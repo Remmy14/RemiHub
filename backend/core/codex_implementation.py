@@ -235,6 +235,10 @@ class OpenAICodexImplementationGateway:
             raise
 
         final_response = (result.final_response or "").strip()
+        if not final_response:
+            raise RuntimeError(
+                "Codex completed without a final implementation response"
+            )
 
         return CodexImplementationTurn(
             thread_id=thread.id,
@@ -257,6 +261,14 @@ class ImplementationValidator(Protocol):
         claim: ClaimedRun,
         workspace: ImplementationWorkspace,
     ) -> dict: ...
+
+
+class ImplementationValidationFailure(RuntimeError):
+    """A completed trusted validator explicitly reported failed checks."""
+
+
+class ImplementationValidationExecutionError(RuntimeError):
+    """Validation did not complete reliably; no application verdict is inferred."""
 
 
 class CommandImplementationValidator:
@@ -282,34 +294,40 @@ class CommandImplementationValidator:
         claim: ClaimedRun,
         workspace: ImplementationWorkspace,
     ) -> dict:
-        result = subprocess.run(
-            [
-                str(self.command),
-                str(workspace.path),
-                claim.card_id,
-                claim.id,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                "Trusted implementation validation failed"
-                + (f": {detail[-4000:]}" if detail else "")
+        scope = claim.repository_scope
+        if scope is not RepositoryScope.BACKEND and scope is not RepositoryScope.ANDROID:
+            raise RuntimeError("Implementation validation requires a resolved backend or android scope")
+        try:
+            result = subprocess.run(
+                [
+                    str(self.command),
+                    str(workspace.path),
+                    claim.card_id,
+                    claim.id,
+                    scope.value,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
             )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ImplementationValidationExecutionError("Trusted validator could not complete") from exc
+        detail = (result.stderr or result.stdout).strip()[-4000:]
         try:
             payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Trusted implementation validator returned invalid JSON"
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ImplementationValidationExecutionError(
+                f"Trusted validator returned no usable structured result (exit {result.returncode})"
+                + (f": {detail}" if detail else "")
             ) from exc
-        if not isinstance(payload, dict) or payload.get("success") is not True:
-            raise RuntimeError(
-                "Trusted implementation validator did not report success"
-            )
+        if not isinstance(payload, dict) or type(payload.get("success")) is not bool:
+            raise ImplementationValidationExecutionError("Trusted validator result is malformed")
+        if payload["success"] is False:
+            raise ImplementationValidationFailure("Trusted validator explicitly reported failed checks"
+                                                  + (f": {detail}" if detail else ""))
+        if result.returncode != 0:
+            raise ImplementationValidationExecutionError("Trusted validator exit status conflicts with its result")
         return payload
 
 
@@ -433,6 +451,8 @@ class CodexImplementationExecutor:
             from backend.services.agent_usage_writer import record_turn
             record_turn(claim, turn_id=turn.turn_id, usage=turn.usage, configured_model=self.model)
             response, tests = _parse_implementation_response(turn.final_response)
+            if claim.result_metadata.get("refresh_base") is True:
+                self.workspace_manager.prepare_validation(workspace)
             trusted_validation = (
                 self.validator.validate(claim=claim, workspace=workspace)
                 if self.validator is not None
@@ -470,6 +490,7 @@ class CodexImplementationExecutor:
                     "artifact_patch": str(snapshot.patch_path),
                     "base_branch": workspace.base_branch,
                     "base_commit": workspace.base_commit,
+                    "base_refresh": workspace.base_refresh,
                     "branch": snapshot.branch,
                     "changed_files": list(snapshot.changed_files),
                     "diff_stat": snapshot.diff_stat,
@@ -560,6 +581,9 @@ Card revision: {claim.card_revision}
 Run: {claim.id}
 Base branch: {workspace.base_branch}
 Feature branch: {workspace.feature_branch}
+Baseline refresh: {json.dumps(workspace.base_refresh)}
+If the approved baseline advanced, preserve its new behavior and resolve any
+source conflict markers in the assigned files. The host manages Git metadata.
 
 Remain inside the assigned worktree. Do not commit or deploy. Run focused tests
 inside the sandbox when possible, then respond using the required structured

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, computed_field
 
 from backend.core.agent_state import CardStatus, RepositoryScope, RunPhase, RunStatus
 
@@ -29,34 +29,6 @@ class AgentDecisionRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
-class AgentFindingDecision(AgentRequestModel):
-    model_config = ConfigDict(extra="forbid")
-    finding_index: int = Field(ge=0, le=49, strict=True)
-    decision: Literal["fix", "defer_ignore"]
-
-
-class AgentInfrastructureReviewRetryRequest(AgentRequestModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    notes: str | None = Field(default=None, max_length=2000)
-
-
-class AgentEvidenceReviewRetryRequest(AgentRequestModel):
-    """Admin-requested repeat review of the same candidate with pinned Android evidence."""
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    android_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    notes: str = Field(min_length=1, max_length=2000)
-
-
-class AgentReviewRevisionRequest(AgentRequestModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    review_run_id: UUID
-    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    notes: str = Field(min_length=1, max_length=2000)
-    decisions: list[AgentFindingDecision] = Field(min_length=1, max_length=50)
-
-
 class AgentGitHubSyncRetryRequest(AgentRequestModel):
     notes: str | None = Field(default=None, max_length=2000)
 
@@ -65,7 +37,7 @@ class AgentCardAction(str, Enum):
     ADD_FOLLOW_UP = "add_follow_up"
     APPROVE_IMPLEMENTATION = "approve_implementation"
     APPROVE_DEPLOYMENT = "approve_deployment"
-    REQUEST_REVISION = "request_revision"
+    CONTINUE_CORRECTIONS = "continue_corrections"
     RETRY = "retry"
     RETURN_TO_IMPLEMENTATION = "return_to_implementation"
     RETRY_GITHUB_SYNC = "retry_github_sync"
@@ -204,6 +176,7 @@ class CodexConfigurationResponse(BaseModel):
 
 
 class AgentLatestRun(BaseModel):
+    independent_review: dict[str, Any] | None = None
     id: UUID
     phase: RunPhase
     status: RunStatus
@@ -329,3 +302,10 @@ class AgentCardResponse(BaseModel):
 class AgentCardListResponse(BaseModel):
     success: Literal[True] = True
     data: list[AgentCardSummary]
+
+
+class AgentReviewActionRequest(AgentRequestModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    notes: str | None = Field(default=None, max_length=2000)
+    finding_indexes: list[StrictInt] | None = Field(default=None, min_length=1, max_length=50)

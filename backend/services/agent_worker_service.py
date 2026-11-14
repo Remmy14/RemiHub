@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ from backend.core.agent_worker import (
     ClaimedRun,
     DeploymentSource,
     ExecutionResult,
+    review_execution_allowance,
 )
 from backend.notifications.notifications import (
     agent_status_notification,
@@ -139,7 +141,7 @@ def _failure_metadata(existing: object) -> dict:
     if isinstance(pipeline, dict):
         return {"deployment_pipeline": pipeline}
     return {k: metadata[k] for k in ("review_cycle", "review_attempt", "review_findings",
-                                     "human_review_handoffs", "review_source") if k in metadata}
+                                     "human_review_handoffs", "review_source", "correction_allowance", "review_executions", "review_execution_allowance", "refresh_base") if k in metadata}
 
 
 def _deployment_source_from_row(row: dict) -> DeploymentSource | None:
@@ -217,7 +219,7 @@ def _validate_candidate(row: dict) -> tuple[RunPhase, CardStatus, CardStatus]:
         source = _normalized_metadata(row.get("result_metadata")).get("review_source", {})
         if (str(row.get("review_cycle")) != source.get("review_cycle")
             or row.get("review_attempt") != source.get("review_attempt")
-            or type(row.get("review_attempt")) is not int or not 1 <= row["review_attempt"] <= 3):
+            or type(row.get("review_attempt")) is not int or row["review_attempt"] < 1):
             raise AgentQueueStateError("Review claim has inconsistent durable attempt identity")
     if phase is RunPhase.DEPLOYMENT:
         if _deployment_source_from_row(row) is None:
@@ -369,7 +371,7 @@ def claim_next_run(
                     WHERE review_run.card_id = runs.card_id
                       AND review_run.card_revision = runs.card_revision
                       AND review_run.phase = 'review' AND review_run.status = 'succeeded'
-                      AND review_run.result_metadata #>> '{{independent_review,verdict}}' = 'pass'
+                      AND (review_run.result_metadata #>> '{{independent_review,decision}}' = 'approve' OR (review_run.result_metadata #>> '{{independent_review,decision}}' IS NULL AND review_run.result_metadata #>> '{{independent_review,verdict}}' = 'pass'))
                       AND review_run.result_metadata #>> '{{independent_review,implementation_run_id}}' = implementation_run.id::text
                       AND review_run.result_metadata #>> '{{independent_review,candidate_digest}}' = implementation_run.result_metadata ->> 'candidate_digest'
                     ORDER BY review_run.created_at DESC, review_run.id DESC LIMIT 1
@@ -866,6 +868,8 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         metadata_payload["human_review_handoffs"] = claim.result_metadata.get("human_review_handoffs", [])
         metadata_payload["review_cycle"] = claim.result_metadata.get("review_cycle", claim.id)
         metadata_payload["review_attempt"] = claim.result_metadata.get("review_attempt", 1)
+        from backend.core.codex_review import correction_limit
+        metadata_payload["correction_allowance"] = claim.result_metadata.get("correction_allowance", correction_limit())
     elif claim.phase is RunPhase.REVIEW:
         metadata_payload["review_source"] = claim.result_metadata["review_source"]
     deployment_pipeline = metadata_payload.get("deployment_pipeline")
@@ -906,7 +910,7 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         from backend.core.codex_review import verify_candidate
         verify_candidate(metadata_payload, run_id=claim.id, revision=claim.card_revision, live=True)
     elif claim.phase is RunPhase.REVIEW:
-        from backend.core.codex_review import review_target
+        from backend.core.codex_review import review_target, parse_verdict
         evidence = metadata_payload.get("independent_review", {})
         source = claim.result_metadata["review_source"]
         expected = {
@@ -917,11 +921,16 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
         }
         if any(evidence.get(k) != v for k, v in expected.items()):
             raise AgentQueueStateError("Independent review result identity mismatch")
-        if review_target(evidence.get("verdict"), source["review_attempt"]) is not target_status:
+        parse_verdict(json.dumps({k: evidence.get(k) for k in ("decision", "summary", "findings")}))
+        from backend.core.codex_review import correction_limit
+        allowance = source.get("correction_allowance", correction_limit())
+        if evidence.get("correction_allowance") != allowance:
+            raise AgentQueueStateError("Review correction allowance changed")
+        if review_target(evidence.get("decision"), source["review_attempt"], allowance=allowance) is not target_status:
             raise AgentQueueStateError("Independent review result status mismatch")
         if target_status is CardStatus.REVIEW_READY:
             from backend.core.codex_review import parse_verdict, verify_candidate
-            parse_verdict(json.dumps({k: evidence.get(k) for k in ("verdict", "summary", "findings")}))
+            parse_verdict(json.dumps({k: evidence.get(k) for k in ("decision", "summary", "findings")}))
             if not evidence.get("thread_id") or not evidence.get("turn_id") or not evidence.get("validation_evidence"):
                 raise AgentQueueStateError("Independent review pass evidence is missing")
             verify_candidate(source["implementation_metadata"], run_id=source["implementation_run_id"],
@@ -1144,6 +1153,16 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
     normalized_error = error_message.strip() or "Agent worker failed"
     normalized_error = normalized_error[:10000]
 
+    failure = _failure_metadata(claim.result_metadata)
+    is_review = claim.phase is RunPhase.REVIEW
+    automatic_retry = False
+    if is_review:
+        allowance = review_execution_allowance(failure)
+        automatic_retry = claim.attempt_count < allowance
+        failure["review_execution_allowance"] = allowance
+        failure["review_executions"] = list(failure.get("review_executions", [])) + [{
+            "attempt_count": claim.attempt_count, "error": normalized_error,
+            "state": "failed", "retryable": True, "worker_id": claim.worker_id}]
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -1177,10 +1196,7 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
                 (
                     RunStatus.FAILED.value,
                     normalized_error,
-                    json.dumps(
-                        _failure_metadata(claim.result_metadata),
-                        sort_keys=True,
-                    ),
+                    json.dumps(failure, sort_keys=True),
                     claim.id,
                 ),
             )
@@ -1208,6 +1224,18 @@ def fail_run(claim: ClaimedRun, *, error_message: str) -> None:
                     "worker_id": claim.worker_id,
                 },
             )
+            if automatic_retry:
+                delay = int(os.environ.get("REMIHUB_REVIEW_RETRY_SECONDS", "30"))
+                if not 1 <= delay <= 86400:
+                    raise ValueError("Review retry delay must be 1-86400 seconds")
+                cur.execute("""UPDATE agent.runs SET status = 'queued', worker_id = NULL,
+                    available_at = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
+                    WHERE id = %s""", (delay, claim.id))
+                cur.execute("UPDATE agent.cards SET status = 'review_queued' WHERE id = %s", (claim.card_id,))
+                _insert_event(cur, card_id=claim.card_id, event_type="review.execution_retry_queued",
+                    actor_type="worker", actor_user_id=None,
+                    payload={"run_id": claim.id, "attempt_count": claim.attempt_count,
+                             "error": normalized_error, "retry_after_seconds": delay})
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1322,8 +1350,9 @@ def _review_handoff(cur, claim, metadata, target_status, message_id):
         cycle = metadata["review_cycle"]
         attempt = metadata["review_attempt"]
         from backend.core.codex_review import review_target
-        review_target("blocked", attempt)
+        review_target("approve", attempt)
         source = {"review_cycle": cycle, "review_attempt": attempt,
+                  "correction_allowance": metadata["correction_allowance"],
                   "implementation_run_id": claim.id, "implementation_metadata": metadata,
                   "human_review_handoffs": claim.result_metadata.get("human_review_handoffs", [])}
         next_metadata = {"review_source": source}
@@ -1337,7 +1366,9 @@ def _review_handoff(cur, claim, metadata, target_status, message_id):
         cycle = evidence["review_cycle"]
         attempt = evidence["review_attempt"] + 1
         next_metadata = {"review_cycle": cycle, "review_attempt": attempt,
-                         "review_findings": [f for f in evidence["findings"] if f.get("kind", "required") == "required"],
+                         "review_findings": evidence["findings"],
+                         "refresh_base": True,
+                         "correction_allowance": evidence["correction_allowance"],
                          "human_review_handoffs": claim.result_metadata.get("review_source", {}).get("human_review_handoffs", [])}
         next_phase = RunPhase.IMPLEMENTATION
     # Preserve the authorizing principal; the reviewer never inserts an approval.
