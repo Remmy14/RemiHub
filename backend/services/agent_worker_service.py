@@ -141,7 +141,7 @@ def _failure_metadata(existing: object) -> dict:
     if isinstance(pipeline, dict):
         return {"deployment_pipeline": pipeline}
     return {k: metadata[k] for k in ("review_cycle", "review_attempt", "review_findings",
-                                     "human_review_handoffs", "review_source", "correction_allowance", "review_executions", "review_execution_allowance", "refresh_base") if k in metadata}
+                                     "human_review_handoffs", "review_source", "correction_allowance", "review_executions", "review_execution_allowance", "refresh_base", "eligibility_attempt", "eligibility_correction", "eligibility_source_run_id") if k in metadata}
 
 
 def _deployment_source_from_row(row: dict) -> DeploymentSource | None:
@@ -909,6 +909,21 @@ def complete_run(claim: ClaimedRun, result: ExecutionResult) -> None:
     if claim.phase is RunPhase.IMPLEMENTATION:
         from backend.core.codex_review import verify_candidate
         verify_candidate(metadata_payload, run_id=claim.id, revision=claim.card_revision, live=True)
+        if claim.repository_scope is RepositoryScope.BACKEND:
+            from pathlib import Path
+            from backend.core.agent_deployment import GitBackendDeploymentManager
+            ws = metadata_payload["workspace"]
+            effective = GitBackendDeploymentManager.deployment_eligibility(
+                tuple(ws["changed_files"]), Path(ws["worktree_path"]), Path(ws["artifact_patch"]).read_bytes())
+            if effective != metadata_payload.get("deployment_eligibility"):
+                raise AgentQueueStateError("Deployment eligibility evidence changed")
+            correcting = not effective["eligible"]
+            if correcting and (any(i["remediation"] != "implementer" for i in effective["issues"])
+                               or claim.result_metadata.get("eligibility_attempt", 0) >= 3):
+                raise AgentQueueStateError("Deployment eligibility requires operator remediation")
+            expected_status = CardStatus.IMPLEMENTATION_QUEUED if correcting else CardStatus.REVIEW_QUEUED
+            if target_status is not expected_status:
+                raise AgentQueueStateError("Deployment eligibility handoff mismatch")
     elif claim.phase is RunPhase.REVIEW:
         from backend.core.codex_review import review_target, parse_verdict
         evidence = metadata_payload.get("independent_review", {})
@@ -1357,6 +1372,14 @@ def _review_handoff(cur, claim, metadata, target_status, message_id):
                   "human_review_handoffs": claim.result_metadata.get("human_review_handoffs", [])}
         next_metadata = {"review_source": source}
         next_phase = RunPhase.REVIEW
+        if target_status is CardStatus.IMPLEMENTATION_QUEUED:
+            next_phase = RunPhase.IMPLEMENTATION
+            next_metadata = {"review_cycle": cycle, "review_attempt": attempt,
+                "correction_allowance": metadata["correction_allowance"],
+                "eligibility_attempt": claim.result_metadata.get("eligibility_attempt", 0) + 1,
+                "eligibility_correction": metadata["deployment_eligibility"],
+                "eligibility_source_run_id": claim.id,
+                "human_review_handoffs": claim.result_metadata.get("human_review_handoffs", [])}
     else:
         evidence = metadata["independent_review"]
         _insert_event(cur, card_id=claim.card_id, event_type="review.verdict",
@@ -1381,7 +1404,8 @@ def _review_handoff(cur, claim, metadata, target_status, message_id):
         VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s::jsonb, %s, %s)""",
         (run_id, claim.card_id, next_phase.value, claim.card_revision, requested_by,
          message_id, json.dumps(next_metadata, sort_keys=True), cycle, attempt))
-    _insert_event(cur, card_id=claim.card_id, event_type="review.queued" if next_phase is RunPhase.REVIEW else "review.correction_queued",
+    _insert_event(cur, card_id=claim.card_id, event_type=("review.queued" if next_phase is RunPhase.REVIEW else
+                              "implementation.eligibility_correction_queued" if claim.phase is RunPhase.IMPLEMENTATION else "review.correction_queued"),
                   actor_type="worker", actor_user_id=None,
                   payload={"run_id": run_id, "review_cycle": cycle, "review_attempt": attempt,
                            "implementation_revision": claim.card_revision})

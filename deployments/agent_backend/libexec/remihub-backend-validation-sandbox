@@ -193,6 +193,15 @@ PY
         rm -rf /tmp/frontend-build/frontend-web/dist /tmp/frontend-build/frontend-web/node_modules
         cd /tmp/frontend-build/frontend-web
         npm ci --ignore-scripts
+        frontend_tests=()
+        if [[ -d tests ]]; then
+          while IFS= read -r -d "" test_file; do frontend_tests+=("$test_file"); done < <(
+            find tests -type f \( -name "*.test.mjs" -o -name "*.spec.mjs" -o -name "*.test.js" -o -name "*.spec.js" \) -print0 | sort -z
+          )
+        fi
+        if (( ${#frontend_tests[@]} )); then
+          node --experimental-strip-types --test "${frontend_tests[@]}"
+        fi
         npm run lint
         npm run build
       fi

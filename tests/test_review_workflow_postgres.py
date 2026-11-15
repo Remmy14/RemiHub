@@ -83,16 +83,28 @@ class PostgreSQLWorkflowTests(unittest.TestCase):
             allowed_phases=frozenset({phase}),allowed_repository_scopes=frozenset({RepositoryScope.BACKEND}))
         self.assertIsNotNone(claim);queue.start_run(claim,lease_seconds=120);return claim
 
-    def implement(self,*,fixed,initial=False):
+    def implement(self,*,fixed,initial=False,invalid=False):
         candidate=self.fixture.claim(fixed=fixed);meta=candidate.result_metadata['review_source']['implementation_metadata']
+        from backend.core.codex_review import build_patch
+        invalid_path=self.fixture.repo/'unexpected.txt'
+        if invalid:invalid_path.write_text('Not an authorized deployment path')
+        elif invalid_path.exists():invalid_path.unlink()
+        raw=build_patch(self.fixture.repo)
+        meta['workspace']['patch_sha256']=__import__('hashlib').sha256(raw).hexdigest()
+        Path(meta['workspace']['artifact_patch']).write_bytes(raw)
+        if invalid:meta['workspace']['changed_files'].append('unexpected.txt')
         if initial:
             impl=candidate.result_metadata['review_source']['implementation_run_id']
             self.query("INSERT INTO agent.runs(id,card_id,phase,status,card_revision,requested_by,review_cycle,review_attempt,result_metadata) VALUES (%s,%s,'implementation','queued',1,%s,%s,1,%s::jsonb)",
                 (impl,self.card,self.user,impl,json.dumps({'review_cycle':impl,'review_attempt':1,'correction_allowance':3})))
         claim=self.claim(RunPhase.IMPLEMENTATION)
+        from backend.core.agent_deployment import GitBackendDeploymentManager
+        ws=meta['workspace']
+        meta['deployment_eligibility']=GitBackendDeploymentManager.deployment_eligibility(tuple(ws['changed_files']),Path(ws['worktree_path']),Path(ws['artifact_patch']).read_bytes())
         from backend.core.codex_review import candidate_digest
         meta['candidate_digest']=candidate_digest(meta,run_id=claim.id,revision=1)
-        queue.complete_run(claim,ExecutionResult(message='Synthetic implementation completed',card_status=CardStatus.REVIEW_QUEUED,metadata=meta))
+        queue.complete_run(claim,ExecutionResult(message='Synthetic implementation completed',card_status=CardStatus.REVIEW_QUEUED if meta['deployment_eligibility']['eligible'] else CardStatus.IMPLEMENTATION_QUEUED,metadata=meta))
+        if not meta['deployment_eligibility']['eligible']:return claim
         return self.claim(RunPhase.REVIEW)
 
     def review(self,claim):
@@ -102,6 +114,24 @@ class PostgreSQLWorkflowTests(unittest.TestCase):
 
     def detail(self):
         with self.connect() as conn:return service._card_detail(conn,self.card)
+
+    def test_eligibility_correction_preserves_history_and_review_ordinal(self):
+        first=self.implement(fixed=True,initial=True,invalid=True)
+        self.assertEqual(self.detail()['status'],'implementation_queued')
+        self.assertEqual(self.query("SELECT id FROM agent.runs WHERE phase='review'"),[])
+        rows=self.query("SELECT result_metadata FROM agent.runs WHERE phase='implementation' AND status='queued'")
+        self.assertEqual(rows[0]['result_metadata']['eligibility_attempt'],1)
+        self.assertEqual(rows[0]['result_metadata']['review_attempt'],1)
+        self.assertEqual(rows[0]['result_metadata']['eligibility_correction']['issues'][0]['path'],'unexpected.txt')
+        claim=self.implement(fixed=True)
+        self.assertEqual(claim.result_metadata['review_source']['review_attempt'],1)
+        self.review(claim)
+        self.assertEqual(self.detail()['status'],'review_ready')
+        rows=self.query("SELECT result_metadata FROM agent.runs WHERE phase='implementation' AND status='succeeded' ORDER BY created_at")
+        self.assertEqual(len(rows),2)
+        self.assertFalse(rows[0]['result_metadata']['deployment_eligibility']['eligible'])
+        self.assertTrue(rows[1]['result_metadata']['deployment_eligibility']['eligible'])
+        self.assertNotEqual(rows[0]['result_metadata']['candidate_digest'],rows[1]['result_metadata']['candidate_digest'])
 
     def test_real_implementation_review_approval_and_separate_human_deployment_gate(self):
         claim=self.implement(fixed=True,initial=True);self.review(claim)
@@ -231,7 +261,7 @@ class PostgreSQLWorkflowTests(unittest.TestCase):
         # Historical rows are synthesized only in this disposable test database.
         evidence=result.metadata['independent_review'].copy();evidence.pop('decision');evidence['verdict']='blocked'
         evidence['findings']=[{'path':'backend/api.py','description':'Missing dossier context','correction':'Inspect source'},
-                              {'path':'frontend-web/Dashboard.tsx','description':'Refresh defect','correction':'Refresh summary'}]
+                              {'path':'frontend-web/src/Dashboard.tsx','description':'Refresh defect','correction':'Refresh summary'}]
         metadata=self.query('SELECT result_metadata FROM agent.runs WHERE id=%s',(claim.id,))[0]['result_metadata']
         metadata['independent_review']=evidence
         # Old blocked reviews did not queue an implementation correction.

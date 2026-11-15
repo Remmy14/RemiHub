@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Offline, sandboxed frontend implementation validator."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+ROOT = Path("/opt/remihub-agent/implementation/worktrees")
+CACHE = Path("/opt/remihub-agent/validators/frontend-npm-cache")
+
+EXCLUDE = {
+    "node_modules", "dist", "coverage",
+    ".git", ".cache", ".next", ".npm",
+}
+
+
+def fail(message):
+    print(
+        "FRONTEND_VALIDATION_FAILED=" + str(message)[-3000:],
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def git(worktree, *args):
+    result = subprocess.run(
+        ["git", "-C", str(worktree), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode:
+        fail("Git inspection failed: " + result.stderr[-1000:])
+    return result.stdout.strip()
+
+
+def main():
+    if len(sys.argv) != 4:
+        fail("Expected worktree_path card_id run_id")
+
+    path, card_id, run_id = sys.argv[1:]
+
+    try:
+        uuid.UUID(card_id)
+        uuid.UUID(run_id)
+    except ValueError:
+        fail("Invalid card or run ID")
+
+    worktree = Path(path)
+
+    if (
+        not worktree.is_absolute()
+        or worktree.parent != ROOT
+        or worktree.name != "card-" + card_id
+        or worktree.is_symlink()
+        or not worktree.is_dir()
+    ):
+        fail("Invalid implementation worktree")
+
+    if git(worktree, "rev-parse", "--show-toplevel") != str(worktree):
+        fail("Unexpected Git worktree root")
+
+    changed = set(
+        git(
+            worktree, "diff", "--name-only",
+            "HEAD", "--", "frontend-web/",
+        ).splitlines()
+    )
+
+    changed.update(
+        git(
+            worktree, "ls-files", "--others",
+            "--exclude-standard", "--", "frontend-web/",
+        ).splitlines()
+    )
+
+    if not changed:
+        print(json.dumps({
+            "success": True,
+            "validator": "frontend-build-v1",
+            "result": "skipped_no_frontend_changes",
+        }))
+        return
+
+    source = worktree / "frontend-web"
+
+    if not source.is_dir() or source.is_symlink():
+        fail("Frontend source missing or symlinked")
+
+    for parent, dirs, files in os.walk(
+        source, followlinks=False
+    ):
+        dirs[:] = [
+            name for name in dirs
+            if name not in EXCLUDE
+            and not name.startswith(".env")
+            and name != ".npmrc"
+        ]
+
+        for name in dirs + files:
+            if name.startswith(".env") or name == ".npmrc":
+                continue
+            if (Path(parent) / name).is_symlink():
+                fail("Frontend contains a symlink")
+
+    package = json.loads(
+        (source / "package.json").read_text()
+    )
+    scripts = package.get("scripts") or {}
+
+    if (
+        scripts.get("lint") != "eslint ."
+        or scripts.get("build") != "tsc -b && vite build"
+    ):
+        fail("Unapproved frontend build scripts")
+
+    if not (source / "package-lock.json").is_file():
+        fail("Missing package-lock.json")
+
+    if not CACHE.is_dir():
+        fail("Trusted npm cache missing")
+
+    with tempfile.TemporaryDirectory(
+        prefix="remihub-ui-validator-"
+    ) as temp:
+        temp = Path(temp)
+        build = temp / "frontend"
+        cache = temp / "cache"
+
+        shutil.copytree(
+            source,
+            build,
+            ignore=lambda parent, names: {
+                n for n in names
+                if n in EXCLUDE
+                or n.startswith(".env")
+                or n == ".npmrc"
+            },
+        )
+
+        shutil.copytree(CACHE, cache)
+
+        sandbox = [
+            "/usr/bin/bwrap",
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-net",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--clearenv",
+            "--setenv", "PATH", "/usr/bin:/bin",
+            "--setenv", "HOME", "/work",
+            "--setenv", "TMPDIR", "/tmp",
+            "--setenv", "LANG", "C.UTF-8",
+            "--ro-bind", "/usr", "/usr",
+        ]
+
+        for directory in ("/bin", "/lib", "/lib64"):
+            if Path(directory).exists():
+                sandbox.extend([
+                    "--ro-bind", directory, directory
+                ])
+
+        sandbox.extend([
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", "/tmp",
+            "--bind", str(build), "/work",
+            "--bind", str(cache), "/cache",
+            "--chdir", "/work",
+            "--",
+        ])
+
+        test_files = sorted(str(p.relative_to(build)) for p in (build / "tests").rglob("*")
+                            if p.is_file() and not p.is_symlink()
+                            and p.name.endswith((".test.mjs", ".spec.mjs", ".test.js", ".spec.js")))
+        test_commands = (("frontend_tests", ["node", "--experimental-strip-types", "--test", *test_files], 180),) if test_files else ()
+        commands = (
+            (
+                "npm_ci",
+                [
+                    "npm", "ci",
+                    "--offline",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                    "--cache", "/cache",
+                ],
+                240,
+            ),
+            (
+                "lint",
+                ["npm", "run", "lint"],
+                180,
+            ),
+            (
+                "production_build",
+                ["npm", "run", "build"],
+                240,
+            ),
+        )
+
+        commands = commands[:1] + test_commands + commands[1:]
+        for label, args, seconds in commands:
+            result = subprocess.run(
+                sandbox + args,
+                capture_output=True,
+                text=True,
+                timeout=seconds,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C.UTF-8",
+                },
+            )
+
+            if result.returncode:
+                fail(
+                    label + f" exit={result.returncode}: "
+                    + (result.stderr + "\n" + result.stdout)[-2500:]
+                )
+
+        if not (build / "dist/index.html").is_file():
+            fail("Production build output missing")
+
+    print(json.dumps({
+        "success": True,
+        "validator": "frontend-build-v1",
+        "result": "passed",
+        "changed_frontend_files": len(changed),
+        "checks": [
+            "npm_ci_offline",
+            "eslint",
+            "tsc_vite_build",
+            {"frontend_tests": len(test_files), "status": "passed" if test_files else "not_present"},
+        ],
+        "sandbox": "bubblewrap_no_network",
+    }))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.TimeoutExpired:
+        fail("Validation command timed out")
+    except (OSError, ValueError, KeyError) as exc:
+        fail(f"{type(exc).__name__}: {exc}")

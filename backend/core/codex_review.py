@@ -130,6 +130,8 @@ def candidate_digest(metadata: dict, *, run_id: str, revision: int) -> str:
         "validation": metadata.get("tests"),
         "trusted_validation": metadata.get("trusted_validation"),
     }
+    if metadata.get("deployment_eligibility") is not None:
+        identity["deployment_eligibility"] = metadata["deployment_eligibility"]
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
@@ -265,6 +267,7 @@ class CodexReviewExecutor:
                     'repositories': list(snapshots), 'supporting_references': references,
                     'implementer_validation': metadata.get('tests'),
                     'trusted_validation': metadata.get('trusted_validation'),
+                    'deployment_eligibility': metadata.get('deployment_eligibility'),
                     'human_review_handoffs': source.get('human_review_handoffs', [])}, default=str)
                 turn = self.gateway.run_turn(repository_path=frozen, prompt=prompt, model=self.model,
                                              inspector=inspector)

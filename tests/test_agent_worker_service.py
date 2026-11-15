@@ -875,13 +875,14 @@ class RunCompletionTests(unittest.TestCase):
         )
         claim = claimed_run(phase=RunPhase.IMPLEMENTATION)
 
-        with patch("backend.core.codex_review.verify_candidate"), patch.object(agent_worker_service_module, "_review_handoff") as handoff:
+        from backend.core.agent_deployment import GitBackendDeploymentManager
+        with patch("backend.core.codex_review.verify_candidate"), patch("pathlib.Path.read_bytes", return_value=b"fixture"), patch.object(GitBackendDeploymentManager, "deployment_eligibility", return_value={"eligible": True}), patch.object(agent_worker_service_module, "_review_handoff") as handoff:
             complete_run(
                 claim,
             ExecutionResult(
                 message="Done",
                 card_status=CardStatus.REVIEW_QUEUED,
-                metadata={"workspace": {"changed_files": ["backend/example.py"]}},
+                metadata={"deployment_eligibility": {"eligible": True}, "workspace": {"changed_files": ["backend/example.py"], "worktree_path": "/fixture", "artifact_patch": "/fixture.patch"}},
             ),
         )
 

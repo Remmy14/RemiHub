@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import codecs
 import hashlib
 import json
 import os
@@ -1582,6 +1583,7 @@ class GitBackendDeploymentManager:
             "frontend-web/.gitignore",
         }
     )
+    FRONTEND_TEST_PATTERN = re.compile(r"[A-Za-z0-9_-]+(?:[.][A-Za-z0-9_-]+)*[.](?:test|spec)[.](?:mjs|js)")
     FRONTEND_SOURCE_SUFFIXES = frozenset(
         {
             ".css",
@@ -2740,6 +2742,21 @@ class GitBackendDeploymentManager:
         if not status_lines:
             return MigrationPlan(expected_history=expected_history)
 
+        base_files = self._run_git(
+            self.target_repository,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            base_commit,
+            "--",
+            migration_prefix,
+            error_context="Unable to inspect historical migration versions",
+        ).stdout.splitlines()
+        return self._migration_file_plan(status_lines, base_files, candidate_path, expected_history)
+
+    @classmethod
+    def _migration_file_plan(cls, status_lines, base_files, candidate_path, expected_history=()):
+        migration_prefix = "backend/database/migrations/"
         added_files: list[str] = []
         grouped: dict[tuple[str, str], set[str]] = {}
         for line in status_lines:
@@ -2758,21 +2775,11 @@ class GitBackendDeploymentManager:
             key = (match.group("version"), match.group("name"))
             grouped.setdefault(key, set()).add(match.group("direction"))
             added_files.append(relative)
-            self._validate_migration_sql(
+            cls._validate_migration_sql(
                 candidate_path / relative,
                 direction=match.group("direction"),
             )
 
-        base_files = self._run_git(
-            self.target_repository,
-            "ls-tree",
-            "-r",
-            "--name-only",
-            base_commit,
-            "--",
-            migration_prefix,
-            error_context="Unable to inspect historical migration versions",
-        ).stdout.splitlines()
         base_versions = [
             match.group("version")
             for path in base_files
@@ -2794,7 +2801,7 @@ class GitBackendDeploymentManager:
                 raise AgentDeploymentError(
                     f"New migration version {version} must be greater than {maximum_base}"
                 )
-            self._validate_migration_pair(
+            cls._validate_migration_pair(
                 candidate_path / migration_prefix / f"{version}_{name}.up.sql",
                 candidate_path / migration_prefix / f"{version}_{name}.down.sql",
             )
@@ -3023,8 +3030,85 @@ class GitBackendDeploymentManager:
         normalized = re.sub(r"--[^\n]*", " ", sql)
         return re.sub(r"/\*.*?\*/", " ", normalized, flags=re.DOTALL)
 
-    def _require_backend_paths(
-        self,
+    @classmethod
+    def deployment_eligibility(cls, changed_files: tuple[str, ...], worktree: Path,
+                               patch: bytes) -> dict:
+        """Deterministic preflight; the deployer independently enforces these rules again.
+
+        A policy mismatch is an operator execution failure, never a model verdict.
+        This result grants no deployment authority.
+        """
+        issues = []
+        if len(changed_files) > cls.MAX_CHANGED_FILES or len(patch) > cls.MAX_PATCH_BYTES:
+            for relative in changed_files:
+                issues.append({"path": relative, "rule": "candidate-size-limits",
+                    "reason": f"At most {cls.MAX_CHANGED_FILES} files and {cls.MAX_PATCH_BYTES} patch bytes permitted",
+                    "remediation": "implementer"})
+        for relative in changed_files:
+            try:
+                cls._require_backend_paths((relative,), worktree)
+            except AgentDeploymentError as exc:
+                reason = str(exc)
+                # Be conservative about meaningful tests and protected infrastructure.
+                # The Implementer must never remove coverage to evade a policy mismatch.
+                mismatch = (relative in cls.PROTECTED_BACKEND_PATHS or
+                    (re.search(r"[.](test|spec)[.](mjs|js|ts|tsx)$", relative) is not None
+                     and "permits only" in reason))
+                issues.append({"path": relative, "rule": "backend-deployment-file-policy",
+                               "reason": reason,
+                               "remediation": "operator_required" if mismatch else "implementer"})
+        migrations = [p for p in changed_files if p.startswith("backend/database/migrations/")]
+        if migrations and not any(i["path"] in migrations for i in issues):
+            statuses = [("M" if ("--- a/" + p + "\n").encode() in patch else "A") + "\t" + p
+                        for p in migrations]
+            git = subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                "-C", str(worktree), "ls-tree", "-r", "--name-only", "HEAD", "--", "backend/database/migrations/"],
+                check=True, capture_output=True, text=True, timeout=30)
+            try:
+                cls._migration_file_plan(statuses, git.stdout.splitlines(), worktree)
+            except (AgentDeploymentError, OSError) as exc:
+                for relative in migrations:
+                    issues.append({"path": relative, "rule": "migration-file-policy", "reason": str(exc),
+                                   "remediation": "implementer"})
+        for section in patch.split(b"diff --git ")[1:]:
+            try:
+                cls._reject_special_git_modes(section)
+            except AgentDeploymentError as exc:
+                header = codecs.escape_decode(section.split(b"\n", 1)[0])[0]
+                paths = [p for p in changed_files if ("b/" + p).encode() in header]
+                if not paths:
+                    raise AgentDeploymentError("Cannot attribute unsafe Git mode to a candidate path")
+                for relative in paths:
+                    issues.append({"path": relative, "rule": "git-file-modes", "reason": str(exc),
+                                   "remediation": "implementer"})
+        if b"diff --git " not in patch:
+            cls._reject_special_git_modes(patch)
+        return {"policy": "backend-deployment-file-policy-v2", "eligible": not issues,
+                "changed_files": list(changed_files), "issues": issues,
+                "policy_source": "backend/core/agent_deployment.py",
+                "policy_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "effective_policy": {"frontend_fixed_files": sorted(cls.FRONTEND_FIXED_FILES),
+                    "frontend_source_roots": ["frontend-web/src", "frontend-web/public"],
+                    "frontend_source_suffixes": sorted(cls.FRONTEND_SOURCE_SUFFIXES),
+                    "frontend_test_directory": "frontend-web/tests",
+                    "frontend_test_name_pattern": cls.FRONTEND_TEST_PATTERN.pattern,
+                    "protected_backend_paths": sorted(cls.PROTECTED_BACKEND_PATHS),
+                    "other_paths": ["requirements.txt", "backend/**/*.py", "tests/**/*.py", "docs/**/*.md", "paired new SQL migrations"],
+                    "safety": "normalized relative paths, no symlinks/special Git modes/executables, bounded UTF-8 source; frontend secret and generated path rejection"},
+                "frontend_tests": "frontend-web/tests/**/*.{test,spec}.{mjs,js}",
+                "deployment_authority": False}
+
+    @classmethod
+    def _require_backend_paths(cls, changed_files, worktree):
+        for relative in changed_files:
+            try:
+                cls._require_backend_path_rules((relative,), worktree)
+            except AgentDeploymentError as exc:
+                raise AgentDeploymentError(f"{relative}: {exc}") from exc
+
+    @classmethod
+    def _require_backend_path_rules(
+        cls,
         changed_files: tuple[str, ...],
         worktree: Path,
     ) -> None:
@@ -3032,9 +3116,9 @@ class GitBackendDeploymentManager:
             if any(ord(character) < 32 for character in relative):
                 raise AgentDeploymentError("Changed path contains control characters")
             pure_path = PurePosixPath(relative)
-            if pure_path.is_absolute() or ".." in pure_path.parts:
+            if pure_path.is_absolute() or ".." in pure_path.parts or str(pure_path) != relative or "\\" in relative:
                 raise AgentDeploymentError("Changed path escapes the worktree")
-            if relative in self.PROTECTED_BACKEND_PATHS:
+            if relative in cls.PROTECTED_BACKEND_PATHS:
                 raise AgentDeploymentError(
                     f"Automatic deployment blocks protected control-plane file: {relative}"
                 )
@@ -3058,14 +3142,19 @@ class GitBackendDeploymentManager:
                 allowed = pure_path.suffix.lower() == ".md"
             elif len(pure_path.parts) >= 2 and pure_path.parts[0] == "frontend-web":
                 frontend_file = True
-                allowed = self._frontend_path_allowed(relative, pure_path)
+                allowed = cls._frontend_path_allowed(relative, pure_path)
             if not allowed:
                 raise AgentDeploymentError(
                     "Backend deployment permits only requirements.txt, backend Python, tests, docs, "
-                    "paired SQL migration files, and reviewed frontend-web source files"
+                    f"paired SQL migration files, and reviewed frontend-web source files; rejected path: {relative}"
                 )
 
             actual_path = worktree.joinpath(*pure_path.parts)
+            for parent in actual_path.parents:
+                if parent == worktree:
+                    break
+                if parent.is_symlink():
+                    raise AgentDeploymentError("Backend deployment rejects symbolic link parents")
             if actual_path.is_symlink():
                 raise AgentDeploymentError("Backend deployment rejects symbolic links")
             if actual_path.exists():
@@ -3097,22 +3186,25 @@ class GitBackendDeploymentManager:
                 if "\x00" in content:
                     raise AgentDeploymentError("Backend deployment rejects binary files")
 
-    def _frontend_path_allowed(self, relative: str, pure_path: PurePosixPath) -> bool:
+    @classmethod
+    def _frontend_path_allowed(cls, relative: str, pure_path: PurePosixPath) -> bool:
         name = pure_path.name
         lowered = name.lower()
         if lowered == ".env" or lowered.startswith(".env."):
             raise AgentDeploymentError("Frontend deployment rejects environment files")
-        if self.FRONTEND_SECRET_NAME_RE.search(name):
+        if cls.FRONTEND_SECRET_NAME_RE.search(name):
             raise AgentDeploymentError("Frontend deployment rejects secret-like files")
-        if relative in self.FRONTEND_FIXED_FILES:
+        if relative in cls.FRONTEND_FIXED_FILES:
             return True
         if len(pure_path.parts) < 3:
             return False
-        if pure_path.parts[1] in {"dist", "node_modules"}:
+        if any(part in {"dist", "node_modules", "coverage", "__pycache__"} for part in pure_path.parts[1:]):
             raise AgentDeploymentError("Frontend deployment rejects generated dependency or dist paths")
+        if pure_path.parts[1] == "tests":
+            return bool(cls.FRONTEND_TEST_PATTERN.fullmatch(name))
         if pure_path.parts[1] not in {"src", "public"}:
             return False
-        return pure_path.suffix.lower() in self.FRONTEND_SOURCE_SUFFIXES
+        return pure_path.suffix.lower() in cls.FRONTEND_SOURCE_SUFFIXES
 
     @staticmethod
     def _reject_special_git_modes(patch: bytes) -> None:

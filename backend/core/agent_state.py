@@ -111,6 +111,7 @@ ALLOWED_CARD_TRANSITIONS: dict[CardStatus, frozenset[CardStatus]] = {
     ),
     CardStatus.IMPLEMENTING: frozenset(
         {
+            CardStatus.IMPLEMENTATION_QUEUED,
             CardStatus.REVIEW_QUEUED,
             CardStatus.BLOCKED,
             CardStatus.FAILED,
@@ -208,7 +209,7 @@ COMPLETION_CARD_STATUSES_BY_PHASE: dict[RunPhase, frozenset[CardStatus]] = {
             CardStatus.AWAITING_IMPLEMENTATION_APPROVAL,
         }
     ),
-    RunPhase.IMPLEMENTATION: frozenset({CardStatus.REVIEW_QUEUED}),
+    RunPhase.IMPLEMENTATION: frozenset({CardStatus.REVIEW_QUEUED, CardStatus.IMPLEMENTATION_QUEUED}),
     RunPhase.REVIEW: frozenset({CardStatus.REVIEW_READY, CardStatus.IMPLEMENTATION_QUEUED, CardStatus.REVIEW_CORRECTIONS_PAUSED}),
     RunPhase.DEPLOYMENT: frozenset({CardStatus.COMPLETED}),
 }

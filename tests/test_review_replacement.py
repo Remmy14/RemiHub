@@ -23,15 +23,15 @@ class InspectingReviewer:
     def cancel(self): pass
     def run_turn(self, *, repository_path, prompt, model, inspector):
         context = json.loads(prompt)
-        assert context['changed_files'][0]['file'] == 'frontend-web/Dashboard.tsx'
+        assert context['changed_files'][0]['file'] == 'frontend-web/src/Dashboard.tsx'
         contract = inspector.inspect(operation='search', query='get_usage', repository='candidate')
         assert any(h['file'] == 'backend/api.py' for h in contract['matches'])
-        text = inspector.inspect(operation='read', path='frontend-web/Dashboard.tsx')['text']
+        text = inspector.inspect(operation='read', path='frontend-web/src/Dashboard.tsx')['text']
         inspector.inspect(operation='diff')
         defective = 'refreshSummary()' not in text
         response = {'decision': 'request_changes' if defective else 'approve',
             'summary': 'Refresh is missing' if defective else 'Fixture meets requirements',
-            'findings': [{'file': 'frontend-web/Dashboard.tsx', 'issue': 'Card update does not refresh summary',
+            'findings': [{'file': 'frontend-web/src/Dashboard.tsx', 'issue': 'Card update does not refresh summary',
                           'required_change': 'Refresh summary on card changes'}] if defective else []}
         return {'response': json.dumps(response), 'thread_id': 'independent-thread', 'turn_id': str(uuid4()),
                 'actual_model': 'synthetic-fixture', 'cli_version': 'fixture'}
@@ -43,9 +43,9 @@ class ReviewCandidateTests(unittest.TestCase):
         self.root = Path(self.tmp.name);self.repo = self.root/'repo';self.repo.mkdir()
         self.artifacts = self.root/'artifacts';self.artifacts.mkdir()
         self.git('init', '-q');self.git('config', 'user.name', 'Fixture');self.git('config', 'user.email', 'fixture@example.invalid')
-        (self.repo/'backend').mkdir();(self.repo/'frontend-web').mkdir()
+        (self.repo/'backend').mkdir();(self.repo/'frontend-web/src').mkdir(parents=True)
         (self.repo/'backend/api.py').write_text('def get_usage(card_id):\n    return {"card_id":card_id, "total":42}\n')
-        (self.repo/'frontend-web/Dashboard.tsx').write_text('function updateCard() { oldBehavior(); }\n')
+        (self.repo/'frontend-web/src/Dashboard.tsx').write_text('function updateCard() { oldBehavior(); }\n')
         self.git('add','.');self.git('commit','-qm','base');self.base=self.git('rev-parse','HEAD').strip()
         self.gateway=InspectingReviewer()
         self.writer=patch('backend.services.agent_usage_writer.record_turn');self.writer.start();self.addCleanup(self.writer.stop)
@@ -54,11 +54,11 @@ class ReviewCandidateTests(unittest.TestCase):
         return subprocess.run(['git','-C',str(self.repo),*args],check=True,capture_output=True,text=True).stdout
 
     def claim(self, *, fixed=True, attempt=1, scope=RepositoryScope.BACKEND):
-        (self.repo/'frontend-web/Dashboard.tsx').write_text('function updateCard() { '+('refreshSummary();' if fixed else 'loadDetails();')+' }\n')
+        (self.repo/'frontend-web/src/Dashboard.tsx').write_text('function updateCard() { '+('refreshSummary();' if fixed else 'loadDetails();')+' }\n')
         impl=str(uuid4());patch_bytes=build_patch(self.repo);artifact=self.artifacts/(impl+'.patch');artifact.write_bytes(patch_bytes)
         metadata={'repository_scope':scope.value,'summary':'Updated dashboard',
             'tests':[], 'trusted_validation':{'success':True,'checks':[{'status':'passed'}]},
-            'workspace':{'artifact_patch':str(artifact),'base_commit':self.base,'worktree_path':str(self.repo),
+            'workspace':{'changed_files':['frontend-web/src/Dashboard.tsx'],'artifact_patch':str(artifact),'base_commit':self.base,'worktree_path':str(self.repo),
                          'patch_sha256':hashlib.sha256(patch_bytes).hexdigest()}}
         metadata['candidate_digest']=candidate_digest(metadata,run_id=impl,revision=1)
         return replace(claimed_run(phase=RunPhase.IMPLEMENTATION),id=str(uuid4()),phase=RunPhase.REVIEW,
@@ -73,7 +73,7 @@ class ReviewCandidateTests(unittest.TestCase):
         result=self.executor().execute(self.claim())
         self.assertEqual(result.card_status,CardStatus.REVIEW_READY)
         evidence=result.metadata['independent_review'];self.assertEqual(evidence['decision'],'approve')
-        self.assertEqual(evidence['source_manifest'][0]['file'],'frontend-web/Dashboard.tsx')
+        self.assertEqual(evidence['source_manifest'][0]['file'],'frontend-web/src/Dashboard.tsx')
         self.assertNotIn('verdict',evidence);require_approval(evidence)
 
     def test_real_defect_fix_and_repeated_correction_budget(self):

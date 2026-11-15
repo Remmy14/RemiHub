@@ -159,6 +159,27 @@ class CodexImplementationExecutorTests(unittest.TestCase):
         )
 
 
+    def test_eligibility_requeues_before_trusted_validation(self):
+        self.manager.snapshot=replace(self.manager.snapshot,changed_files=('other/script.sh',))
+        executor=self.executor(RecordingGateway());executor.validator=RecordingValidator()
+        result=executor.execute(self.claim)
+        self.assertEqual(result.card_status,CardStatus.IMPLEMENTATION_QUEUED)
+        self.assertEqual(executor.validator.calls,[])
+        self.assertEqual(result.metadata['deployment_eligibility']['issues'][0]['path'],'other/script.sh')
+        self.assertTrue(self.manager.snapshot.patch_path.is_file())
+
+    def test_eligibility_mismatch_preserves_test_and_fails_operationally(self):
+        self.manager.snapshot=replace(self.manager.snapshot,changed_files=('frontend-web/unsupported/a.test.mjs',))
+        with self.assertRaisesRegex(RuntimeError,'policy/infrastructure mismatch'):
+            self.executor(RecordingGateway()).execute(self.claim)
+        self.assertTrue(self.manager.snapshot.patch_path.is_file())
+
+    def test_eligibility_corrections_are_bounded(self):
+        self.manager.snapshot=replace(self.manager.snapshot,changed_files=('other/script.sh',))
+        claim=replace(self.claim,result_metadata={'eligibility_attempt':3})
+        with self.assertRaisesRegex(RuntimeError,'correction budget exhausted'):
+            self.executor(RecordingGateway()).execute(claim)
+
     def test_no_file_changes_never_succeeds(self):
         self.manager.snapshot = replace(self.manager.snapshot, changed_files=())
         gateway = RecordingGateway()
