@@ -102,6 +102,8 @@
     --tmpfs /tmp
     --tmpfs /run
     --dir /etc
+    --ro-bind-data 3 /etc/passwd
+    --ro-bind-data 4 /etc/group
     --dir /opt
     --dir /opt/remihub
     --dir /workspace
@@ -197,5 +199,8 @@ PY
     '
   )
 
+  # Provide only this isolated identity; never mount host account databases.
+  exec 3<<< "remihub-validator:x:$(id -u):$(id -g):Isolated validation:/tmp/home:/usr/sbin/nologin"
+  exec 4<<< "remihub-validator:x:$(id -g):"
   exec /usr/bin/env -i "${args[@]}"
 )
