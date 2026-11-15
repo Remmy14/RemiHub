@@ -123,6 +123,131 @@ export type AgentCardDetail = AgentCardSummary & {
   events: AgentEvent[];
 };
 
+export type CodexUsageWindow = {
+  name: string;
+  used_percent: number | null;
+  remaining_percent: number | null;
+  duration_minutes: number | null;
+  reset_at: string | null;
+  status: "available" | "unavailable";
+};
+
+export type CodexQuota = {
+  status: "available" | "unavailable" | "stale" | "collection_failed";
+  source: string;
+  collected_at: string | null;
+  last_attempt_at: string | null;
+  freshness_seconds: number | null;
+  error_code: string | null;
+  account_id: string | null;
+  buckets: {
+    limit_id: string | null;
+    limit_name: string | null;
+    model_slug: string | null;
+    plan_type: string | null;
+    windows: CodexUsageWindow[];
+    credits: { balance?: string | null; has_credits?: boolean | null; unlimited?: boolean | null } | null;
+  }[];
+  ordinary_usage_allowed: boolean | null;
+  available_reset_credits: number | null;
+  metric_statuses: Record<string, string>;
+};
+
+export type CodexTokenAggregate = {
+  execution_count: number;
+  available_count: number;
+  unavailable_count: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  stage: string | null;
+  card_id: string | null;
+  actual_model: string | null;
+  reasoning_effort: string | null;
+};
+
+export type CodexSummary = {
+  period_start: string;
+  period_end: string;
+  token_accounting: {
+    overall: CodexTokenAggregate;
+    by_stage: CodexTokenAggregate[];
+    by_card: CodexTokenAggregate[];
+    by_model: CodexTokenAggregate[];
+  };
+};
+
+export type CodexExecution = {
+  run_id: string;
+  attempt_count: number;
+  turn_id: string;
+  card_id: string;
+  card_revision: number;
+  stage: string;
+  review_attempt: number | null;
+  configured_model: string | null;
+  actual_model: string | null;
+  reasoning_effort: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_input_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  usage_status: string;
+  usage_source: string;
+  started_at: string | null;
+  finished_at: string | null;
+  recorded_at: string;
+};
+
+export type CodexExecutionList = {
+  total: number;
+  items: CodexExecution[];
+  limit: number;
+  offset: number;
+};
+
+export type CodexStageConfiguration = {
+  stage: string;
+  configured_model: string | null;
+  configured_reasoning_effort: string | null;
+  last_reported_configured_model: string | null;
+  last_reported_reasoning_effort: string | null;
+  configuration_source: string | null;
+  configuration_reported_at: string | null;
+  actual_model_last_execution: string | null;
+  reasoning_effort_last_execution: string | null;
+  observed_at: string | null;
+  actual_model_observed_at: string | null;
+  status: string;
+};
+
+type UsageResponse<T> = { success: boolean; data: T };
+
+export async function getCodexQuota(): Promise<CodexQuota> {
+  return (await apiRequest<UsageResponse<CodexQuota>>("/agent/usage/quota")).data;
+}
+
+export async function getCodexSummary(fromTime: string, toTime: string): Promise<CodexSummary> {
+  const query = new URLSearchParams({ from_time: fromTime, to_time: toTime });
+  return (await apiRequest<UsageResponse<CodexSummary>>(`/agent/usage/summary?${query}`)).data;
+}
+
+export async function getCodexExecutions(
+  fromTime: string, toTime: string, cardId?: string, offset = 0, limit = 100,
+): Promise<CodexExecutionList> {
+  const query = new URLSearchParams({ from_time: fromTime, to_time: toTime,
+    offset: String(offset), limit: String(limit) });
+  if (cardId) query.set("card_id", cardId);
+  return (await apiRequest<UsageResponse<CodexExecutionList>>(`/agent/usage/executions?${query}`)).data;
+}
+
+export async function getCodexConfiguration(): Promise<CodexStageConfiguration[]> {
+  return (await apiRequest<UsageResponse<CodexStageConfiguration[]>>("/agent/usage/configuration")).data;
+}
+
 type AgentCardListResponse = {
   success: true;
   data: AgentCardSummary[];

@@ -1,6 +1,7 @@
 import { reviewRunStatus } from "./api/agentReview";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { CardUsage, CodexUsageDashboard } from "./CodexUsage";
 
 import {
   addAgentFollowUp,
@@ -21,6 +22,7 @@ import type {
   AgentLatestRun,
   AgentMessage,
   AgentRun,
+  CodexSummary,
   ReviewRevision,
 } from "./api/agentApi";
 
@@ -290,10 +292,16 @@ function CopyableBlock({
 
 function CardSummaryRow({
   card,
+  usage,
+  usageLoaded,
+  usageCurrent,
   selected,
   onSelect,
 }: {
   card: AgentCardSummary;
+  usage: number | null;
+  usageLoaded: boolean;
+  usageCurrent: boolean;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -322,6 +330,9 @@ function CardSummaryRow({
         <InfoPill>Revision {card.revision}</InfoPill>
         <InfoPill>Updated {formatDateTime(card.updated_at)}</InfoPill>
       </div>
+      <div className="mt-2 text-xs font-semibold text-slate-600">
+        Codex tokens ({usageCurrent ? "shown summary period" : "last loaded summary"}): {usageLoaded ? usage == null ? "Unavailable" : new Intl.NumberFormat().format(usage) : "Loading…"}
+      </div>
 
       {card.latest_run && (
         <div className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
@@ -347,10 +358,14 @@ function CardSummaryRow({
 
 function CardList({
   cards,
+  usageSummary,
+  usageCurrent,
   selectedId,
   onSelect,
 }: {
   cards: AgentCardSummary[];
+  usageSummary: CodexSummary | null;
+  usageCurrent: boolean;
   selectedId: string | null;
   onSelect: (cardId: string) => void;
 }) {
@@ -379,6 +394,9 @@ function CardList({
             activeCards.map((card) => (
               <CardSummaryRow
                 card={card}
+                usage={usageSummary?.token_accounting.by_card.find((item) => item.card_id === card.id)?.total_tokens ?? null}
+                usageLoaded={usageSummary !== null}
+                usageCurrent={usageCurrent}
                 key={card.id}
                 onSelect={() => onSelect(card.id)}
                 selected={selectedId === card.id}
@@ -402,6 +420,9 @@ function CardList({
             {historicalCards.map((card) => (
               <CardSummaryRow
                 card={card}
+                usage={usageSummary?.token_accounting.by_card.find((item) => item.card_id === card.id)?.total_tokens ?? null}
+                usageLoaded={usageSummary !== null}
+                usageCurrent={usageCurrent}
                 key={card.id}
                 onSelect={() => onSelect(card.id)}
                 selected={selectedId === card.id}
@@ -940,18 +961,24 @@ function Section({
 function CardDetail({
   actionInProgress,
   card,
+  usageSummary,
+  usageCurrent,
   isLoading,
   onAction,
   onBack,
   onRefresh,
+  onUsageRefresh,
   onSendFollowUp,
 }: {
   actionInProgress: AgentAction | "create" | null;
   card: AgentCardDetail;
+  usageSummary: CodexSummary | null;
+  usageCurrent: boolean;
   isLoading: boolean;
   onAction: (action: AgentAction, notes?: string | null, revision?: ReviewRevision) => void;
   onBack: () => void;
   onRefresh: () => void;
+  onUsageRefresh: () => void;
   onSendFollowUp: (content: string) => void;
 }) {
   return (
@@ -981,6 +1008,7 @@ function CardDetail({
       )}
 
       <DetailHeader card={card} />
+      <CardUsage key={card.id} cardId={card.id} summary={usageSummary} summaryCurrent={usageCurrent} onRefresh={onUsageRefresh} />
 
       <Section count={card.messages.length} title="Conversation">
         <div className="space-y-3">
@@ -1061,6 +1089,28 @@ export default function AgentScreen() {
   const [isCreateFormOpen, setIsCreateFormOpen] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<AgentAction | "create" | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [usageSummary, setUsageSummary] = useState<CodexSummary | null>(null);
+  const [usageSummaryVersion, setUsageSummaryVersion] = useState(-1);
+  const [usageSummaryRefresh, setUsageSummaryRefresh] = useState(0);
+  const lastUsageSignature = useRef<string | null>(null);
+  const receiveUsageSummary = useCallback((summary: CodexSummary, refreshVersion: number) => {
+    setUsageSummary(summary);
+    setUsageSummaryVersion(refreshVersion);
+  }, []);
+  const refreshUsageSummary = useCallback(() => setUsageSummaryRefresh((value) => value + 1), []);
+
+  useEffect(() => {
+    if (!selectedCard) {
+      lastUsageSignature.current = null;
+      return;
+    }
+    const signature = [selectedCard.id, selectedCard.revision, selectedCard.latest_run?.id,
+      selectedCard.latest_run?.status, selectedCard.latest_run?.attempt_count].join(":");
+    if (lastUsageSignature.current !== signature) {
+      lastUsageSignature.current = signature;
+      refreshUsageSummary();
+    }
+  }, [selectedCard, refreshUsageSummary]);
 
   const selectedSummary = useMemo(
     () => cards.find((card) => card.id === selectedCardId) ?? null,
@@ -1235,6 +1285,8 @@ export default function AgentScreen() {
         </div>
       )}
 
+      <CodexUsageDashboard onSummary={receiveUsageSummary} summaryRefresh={usageSummaryRefresh} />
+
       <div className="grid gap-5 lg:grid-cols-[minmax(20rem,24rem)_1fr]">
         <aside className={isCreateFormOpen ? "order-2 space-y-4 lg:order-none" : "space-y-4"}>
           <section className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
@@ -1266,6 +1318,8 @@ export default function AgentScreen() {
           ) : (
             <CardList
               cards={cards}
+              usageSummary={usageSummary}
+              usageCurrent={usageSummary !== null && usageSummaryVersion === usageSummaryRefresh}
               onSelect={selectCard}
               selectedId={selectedCardId}
             />
@@ -1284,13 +1338,16 @@ export default function AgentScreen() {
             <CardDetail
               actionInProgress={actionInProgress}
               card={selectedCard}
+              usageSummary={usageSummary}
+              usageCurrent={usageSummary !== null && usageSummaryVersion === usageSummaryRefresh}
               isLoading={isLoadingCard}
               onAction={runAction}
               onBack={() => {
                 setSelectedCard(null);
                 setSelectedCardId(null);
               }}
-              onRefresh={() => void loadCard(selectedCard.id, false)}
+              onRefresh={() => { void loadCard(selectedCard.id, false); refreshUsageSummary(); }}
+              onUsageRefresh={refreshUsageSummary}
               onSendFollowUp={sendFollowUp}
             />
           ) : selectedSummary ? (
