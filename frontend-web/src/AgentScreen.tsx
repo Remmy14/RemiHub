@@ -1,6 +1,6 @@
 import { reviewRunStatus } from "./api/agentReview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { FormEvent, KeyboardEvent, ReactNode } from "react";
 import { CardUsage, CodexUsageDashboard } from "./CodexUsage";
 
 import {
@@ -1080,6 +1080,7 @@ function CardDetail({
 }
 
 export default function AgentScreen() {
+  const [activeTab, setActiveTab] = useState<"cards" | "usage">("cards");
   const [cards, setCards] = useState<AgentCardSummary[]>([]);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<AgentCardDetail | null>(null);
@@ -1255,8 +1256,20 @@ export default function AgentScreen() {
     }
   };
 
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    const tabs = ["cards", "usage"] as const;
+    const current = tabs.indexOf(activeTab);
+    const next = event.key === "ArrowRight" ? (current + 1) % tabs.length :
+      event.key === "ArrowLeft" ? (current + tabs.length - 1) % tabs.length :
+        event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+    if (next === null) return;
+    event.preventDefault();
+    setActiveTab(tabs[next]);
+    document.getElementById(`agent-tab-${tabs[next]}`)?.focus();
+  };
+
   return (
-    <main className="mx-auto max-w-7xl px-4 py-6">
+    <main className="mx-auto max-w-7xl min-w-0 px-4 py-6 [overflow-wrap:anywhere]">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-black text-slate-950">Agent</h1>
@@ -1264,16 +1277,15 @@ export default function AgentScreen() {
             Monitor RemiHub Agent cards, review output, and perform approved lifecycle actions.
           </p>
         </div>
-        {!isCreateFormOpen && (
-          <button
-            className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-            disabled={actionInProgress !== null}
-            onClick={() => setIsCreateFormOpen(true)}
-            type="button"
-          >
-            New Card
-          </button>
-        )}
+      </div>
+
+      <div role="tablist" aria-label="Agent sections" className="mb-5 flex flex-wrap gap-2 border-b border-slate-300">
+        {(["cards", "usage"] as const).map((tab) => <button key={tab} id={`agent-tab-${tab}`}
+          type="button" role="tab" aria-controls={`agent-panel-${tab}`} aria-selected={activeTab === tab}
+          tabIndex={activeTab === tab ? 0 : -1} onClick={() => setActiveTab(tab)} onKeyDown={onTabKeyDown}
+          className={`rounded-t-md px-4 py-2 text-sm font-bold focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600 ${activeTab === tab ? "border-b-2 border-blue-600 bg-white text-blue-800" : "text-slate-600 hover:bg-slate-200"}`}>
+          {tab === "cards" ? "Cards" : "Codex Usage"}
+        </button>)}
       </div>
 
       {errorMessage && (
@@ -1285,10 +1297,16 @@ export default function AgentScreen() {
         </div>
       )}
 
-      <CodexUsageDashboard onSummary={receiveUsageSummary} summaryRefresh={usageSummaryRefresh} />
+      <div id="agent-panel-usage" role="tabpanel" aria-labelledby="agent-tab-usage" hidden={activeTab !== "usage"} tabIndex={0}>
+        <CodexUsageDashboard onSummary={receiveUsageSummary} summaryRefresh={usageSummaryRefresh} />
+      </div>
 
-      <div className="grid gap-5 lg:grid-cols-[minmax(20rem,24rem)_1fr]">
-        <aside className={isCreateFormOpen ? "order-2 space-y-4 lg:order-none" : "space-y-4"}>
+      <div id="agent-panel-cards" role="tabpanel" aria-labelledby="agent-tab-cards" hidden={activeTab !== "cards"} tabIndex={0}>
+        {!isCreateFormOpen && <div className="mb-4 flex justify-end"><button
+          className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+          disabled={actionInProgress !== null} onClick={() => setIsCreateFormOpen(true)} type="button">New Card</button></div>}
+      <div className="grid min-w-0 gap-5 lg:grid-cols-[minmax(20rem,24rem)_minmax(0,1fr)]">
+        <aside className={isCreateFormOpen ? "order-2 min-w-0 space-y-4 lg:order-none" : "min-w-0 space-y-4"}>
           <section className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
@@ -1358,6 +1376,7 @@ export default function AgentScreen() {
             <EmptyPanel>Select an Agent card to inspect its details.</EmptyPanel>
           ) : null}
         </section>
+      </div>
       </div>
     </main>
   );

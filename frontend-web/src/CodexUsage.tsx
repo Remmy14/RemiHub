@@ -6,6 +6,7 @@ import type {
   CodexExecution, CodexQuota, CodexStageConfiguration, CodexSummary,
   CodexTokenAggregate, CodexUsageWindow,
 } from "./api/agentApi";
+import { derivedInputTokens, remainingQuota } from "./usageMetrics";
 
 const number = new Intl.NumberFormat();
 const QUOTA_REFRESH_MS = 300_000;
@@ -56,26 +57,33 @@ function windowLabel(window: CodexUsageWindow): string {
 }
 
 function tokenMetrics(aggregate: CodexTokenAggregate) {
+  const input = aggregate.input_tokens;
+  const cached = aggregate.cached_input_tokens;
+  const derived = derivedInputTokens(input, cached);
   return [
-    ["Total", aggregate.total_tokens], ["Input", aggregate.input_tokens],
-    ["Output", aggregate.output_tokens], ["Cached input", aggregate.cached_input_tokens],
-  ] as const;
+    { name: "Input", value: input, help: "All input tokens reported for the execution, including cached input tokens." },
+    { name: "Output", value: aggregate.output_tokens, help: "Tokens generated in the output." },
+    { name: "Cached input", value: cached, help: "Reported reused input tokens. These are already included in input tokens and must not be added again." },
+    { name: "Fresh input", value: derived.fresh, help: "Input tokens minus reported cached input tokens; unavailable when the reported values are missing or inconsistent." },
+    { name: "Cached %", value: derived.cachedPercent, help: "Reported cached input divided by input tokens. Unavailable when input is zero or values are missing or inconsistent." },
+  ];
 }
 
 function QuotaWindow({ window, now }: { window: CodexUsageWindow; now: number }) {
-  const available = window.status === "available" && window.used_percent != null;
-  const used = available ? Math.max(0, Math.min(100, window.used_percent!)) : 0;
-  return <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-    <div className="flex items-center justify-between gap-2 text-sm font-bold text-slate-900">
-      <span>{windowLabel(window)}</span><span>{available ? `${used}% used` : "Unavailable"}</span>
+  const remaining = remainingQuota(window.used_percent, window.status);
+  const used = remaining == null ? null : 100 - remaining;
+  return <div className="min-w-0 rounded-lg border border-slate-200 bg-slate-50 p-3">
+    <div className="text-sm font-bold text-slate-900">
+      {windowLabel(window)}
     </div>
-    {available && <>
-      <div role="progressbar" aria-label={`${windowLabel(window)} quota used`} aria-valuenow={used}
+    <p className="mt-1 text-xl font-black tabular-nums text-slate-950">{remaining == null ? "Unavailable" : `${remaining}% remaining`}</p>
+    {remaining != null && <>
+      <div role="progressbar" aria-label={`${windowLabel(window)} quota remaining`} aria-valuenow={remaining}
         aria-valuemin={0} aria-valuemax={100} className="mt-2 h-2.5 overflow-hidden rounded-full bg-slate-200">
-        <div className={`h-full rounded-full ${used >= 90 ? "bg-amber-600" : "bg-blue-600"}`}
-          style={{ width: `${used}%` }} />
+        <div className={`h-full rounded-full ${remaining <= 10 ? "bg-amber-600" : "bg-blue-600"}`}
+          style={{ width: `${remaining}%` }} />
       </div>
-      <p className="mt-2 text-xs text-slate-600">{window.remaining_percent == null ? "Remaining percentage unavailable" : `${number.format(window.remaining_percent)}% remaining`}</p>
+      <p className="mt-2 text-xs text-slate-600">{used}% used</p>
     </>}
     <p className="mt-2 text-xs text-slate-600">{countdown(window.reset_at, now)}</p>
     {window.reset_at && <p className="text-xs text-slate-500">{formatDate(window.reset_at)}</p>}
@@ -105,8 +113,8 @@ function QuotaPanel({ quota, error, loading, now }: {
       {quota.last_attempt_at && <p className="text-xs text-slate-500">Last attempted: {formatDate(quota.last_attempt_at)}</p>}
       {quota.status === "unavailable" && <p className="mt-3 text-sm text-slate-600">Quota information is unavailable{quota.error_code ? ` (${quota.error_code})` : ""}.</p>}
       {quota.buckets.length === 0 && quota.status !== "unavailable" && <p className="mt-3 text-sm text-slate-600">No quota windows were reported.</p>}
-      <div className="mt-3 grid gap-3 lg:grid-cols-2">
-        {quota.buckets.map((bucket, index) => <div key={`${bucket.limit_id ?? "limit"}-${index}`} className="rounded-lg border border-slate-200 p-3">
+      <div className="mt-3 grid min-w-0 gap-3 lg:grid-cols-2">
+        {quota.buckets.map((bucket, index) => <div key={`${bucket.limit_id ?? "limit"}-${index}`} className="min-w-0 rounded-lg border border-slate-200 p-3">
           <h4 className="font-bold text-slate-900">{bucket.limit_name || bucket.limit_id || "Codex limit"}</h4>
           <div className="mt-1 text-xs text-slate-600">Plan: {bucket.plan_type || "Unavailable"}{bucket.model_slug && ` · ${bucket.model_slug}`}</div>
           <div className="mt-3 grid gap-2 sm:grid-cols-2">{bucket.windows.map((window, windowIndex) =>
@@ -128,12 +136,12 @@ function QuotaPanel({ quota, error, loading, now }: {
 }
 
 function AggregateCard({ title, value }: { title: string; value: CodexTokenAggregate | null }) {
-  return <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+  return <div className="min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
     <h4 className="text-sm font-bold text-slate-900">{title}</h4>
     <p className="mt-1 text-xl font-black tabular-nums text-slate-950">{value ? formatNumber(value.total_tokens) : "Unavailable"}</p>
     <p className="text-xs text-slate-600">{value ? `${number.format(value.execution_count)} executions · ${number.format(value.unavailable_count)} without usage` : "No telemetry reported"}</p>
-    {value && <dl className="mt-2 grid grid-cols-2 gap-2 text-xs">{tokenMetrics(value).slice(1).map(([name, count]) =>
-      <div key={name}><dt className="text-slate-500">{name}</dt><dd className="font-semibold tabular-nums text-slate-800">{formatNumber(count)}</dd></div>)}</dl>}
+    {value && <dl className="mt-2 grid grid-cols-2 gap-2 text-xs">{tokenMetrics(value).map(({ name, value: count, help }) =>
+      <div className="min-w-0" key={name}><dt className="text-slate-500"><span title={help} aria-label={`${name}: ${help}`} tabIndex={0} className="cursor-help underline decoration-dotted underline-offset-2">{name}</span></dt><dd className="font-semibold tabular-nums text-slate-800">{count == null ? "Unavailable" : name === "Cached %" ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(count)}%` : formatNumber(count)}</dd></div>)}</dl>}
   </div>;
 }
 
@@ -187,6 +195,21 @@ function Trend({ records, total, periodDays }: { records: CodexExecution[]; tota
       </div>}
     <p className="mt-2 text-xs text-slate-500">{periodDays <= 30 ? "Daily" : periodDays <= 90 ? "Weekly" : "Monthly"} totals from reported turns. Cached input is included in input tokens.</p>
   </div>;
+}
+
+function ExecutionDetails({ records, total }: { records: CodexExecution[]; total: number }) {
+  return <details className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+    <summary className="cursor-pointer text-sm font-bold text-slate-900">Execution details ({number.format(records.length)} loaded)</summary>
+    {total > records.length && <p className="mt-2 text-xs font-semibold text-amber-800">Showing {number.format(records.length)} of {number.format(total)} executions for this period.</p>}
+    {records.length === 0 ? <p className="mt-2 text-sm text-slate-600">No execution details are available for this period.</p> :
+      <div className="mt-3 max-h-96 space-y-2 overflow-y-auto">{records.map((row) => <div key={`${row.run_id}-${row.attempt_count}-${row.turn_id}`}
+        className="min-w-0 rounded-md border border-slate-200 p-2 text-xs text-slate-700">
+        <div className="font-bold text-slate-900">{label(row.stage)} · Revision {row.card_revision} · Attempt {row.attempt_count}</div>
+        <div>Card {row.card_id} · Run {row.run_id} · Turn {row.turn_id} · {formatDate(row.recorded_at)}</div>
+        <div>Model: {row.actual_model || row.configured_model || "Unavailable"} · Reasoning: {row.reasoning_effort || "Unavailable"}</div>
+        <div>{row.usage_status === "available" ? `Total ${formatNumber(row.total_tokens)} · Input ${formatNumber(row.input_tokens)} · Output ${formatNumber(row.output_tokens)} · Cached input ${formatNumber(row.cached_input_tokens)}` : "Token usage unavailable"}</div>
+      </div>)}</div>}
+  </details>;
 }
 
 export function CodexUsageDashboard({ onSummary, summaryRefresh }: {
@@ -295,8 +318,9 @@ export function CodexUsageDashboard({ onSummary, summaryRefresh }: {
       <p className="mt-2 text-xs text-slate-600">Totals cover reported turn usage in this period, including retries. Unavailable executions are counted but contribute no token total. Token totals do not represent quota percentages.</p>
     </div>
     {errors.trend && <p role="alert" className="text-sm text-amber-800">Trend refresh failed: {errors.trend}. Previously loaded trend may be old.</p>}
-    {trend && <>{trend.days !== days && <p className="text-xs font-semibold text-amber-800">Trend shows the previous period until refresh completes.</p>}
-      <Trend records={trend.items} total={trend.total} periodDays={trend.days} /></>}
+    {trend && <>{trend.days !== days && <p className="text-xs font-semibold text-amber-800">Trend and execution details show the previous period until refresh completes.</p>}
+      <Trend records={trend.items} total={trend.total} periodDays={trend.days} />
+      <ExecutionDetails records={trend.items} total={trend.total} /></>}
     <ConfigPanel items={configuration} error={errors.configuration ?? null} loading={!!loading.configuration} />
   </section>;
 }
