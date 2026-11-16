@@ -1,7 +1,10 @@
 import os
+import math
+import re
 from pathlib import Path
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from backend.services import jdownloader_api_service as jd2
 
 # 3rd Party Imports
@@ -15,6 +18,8 @@ CATEGORY_PATHS = {
 MAX_FILENAME_ATTEMPTS = 100
 MAX_DOWNLOAD_PAGE = 25
 MAX_JD2_PAGES = 5
+MAX_DISCOVERY_JOBS = 10
+DISCOVERY_AGE = timedelta(days=7)
 MEDIA_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv"}
 ARCHIVE_SUFFIXES = {".rar", ".zip", ".7z"}
 
@@ -240,7 +245,43 @@ def _read_requests(limit: int, offset: int = 0, request_id: str | None = None) -
 
 
 def _nonnegative(value):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+    return (value if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0 else None)
+
+
+_RAR_PART = re.compile(r"^(?P<stem>.+?)\.part0*(?P<part>[1-9]\d*)\.rar$", re.I)
+_RAR_VOLUME = re.compile(r"^(?P<stem>.+?)\.r(?P<part>\d{2,3})$", re.I)
+_EPISODE = re.compile(r"^(?P<show>.+?)[ ._-]+(?P<episode>s\d{1,2}e\d{1,2}(?:e\d{1,2})?)\b", re.I)
+_COMPANION_SUFFIXES = MEDIA_SUFFIXES | {".srt", ".ass", ".ssa", ".sub", ".nfo"}
+
+
+def _logical_group(file: dict, request_id: str) -> tuple[str, str]:
+    """A package is evidence, but may contain many unrelated archive sets."""
+    name = file.get("name")
+    package_id = file.get("package_id")
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        return f"request:{request_id}:link:{file.get('id')}", "Unnamed file"
+    scope = (f"package:{package_id}" if isinstance(package_id, int)
+             and not isinstance(package_id, bool) and package_id > 0 else f"request:{request_id}")
+    part = _RAR_PART.fullmatch(name)
+    volume = _RAR_VOLUME.fullmatch(name)
+    if part or volume:
+        stem = (part or volume).group("stem").strip(" ._-")
+        if stem:
+            return f"{scope}:archive:{stem.casefold()}", stem
+    if name.lower().endswith(".rar"):
+        stem = name[:-4].strip(" ._-")
+        if stem:
+            return f"{scope}:archive:{stem.casefold()}", stem
+    episode = _EPISODE.match(name)
+    if episode:
+        title = f"{episode.group('show').strip(' ._-')} {episode.group('episode').upper()}"
+        return f"{scope}:episode:{title.casefold()}", title
+    if scope.startswith("package:") and Path(name).suffix.lower() in _COMPANION_SUFFIXES:
+        stem = Path(name).stem.strip(" ._-")
+        if stem:
+            return f"{scope}:content:{stem.casefold()}", stem
+    return f"request:{request_id}:link:{file.get('id')}", name
 
 
 def _file(link: dict, source: str) -> dict:
@@ -257,11 +298,27 @@ def _file(link: dict, source: str) -> dict:
         "extraction_status": link.get("extractionStatus"),
         "package_id": link.get("packageUUID"),
         "job_id": link.get("jobUUID"),
+        "enabled": link.get("enabled") if isinstance(link.get("enabled"), bool) else None,
+        "package_name": None, "package_child_count": None,
+    }
+
+
+def _persisted_file(link: dict) -> dict:
+    """Show last observed link identity when JD2 no longer returns its job UUID."""
+    return {
+        "id": link["link_id"], "name": link["name"], "source": "persisted",
+        "status": "Last observed complete" if link["finished"] else "Live status unknown",
+        "finished": bool(link["finished"]), "bytes_downloaded": None,
+        "total_bytes": None, "download_speed": None, "eta": None,
+        "extraction_status": link.get("extraction_status"),
+        "package_id": link.get("package_id"), "job_id": link.get("jd2_job_id"),
+        "enabled": None, "package_name": None, "package_child_count": None,
     }
 
 
 def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
-             truncated: bool = False, tracking: dict | None = None) -> dict:
+             truncated: bool = False, inventory_incomplete: bool = False,
+             tracking: dict | None = None) -> dict:
     tracking = tracking or {"links": [], "processed": [], "event": None}
     outcome = row["submission_outcome"]
     if outcome is None:
@@ -304,26 +361,39 @@ def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
         state = "completed"
     if unavailable and state not in {"completed", "failed"}:
         state = "unavailable"
+    if inventory_incomplete and state not in {"completed", "failed"}:
+        state = "unavailable"
 
     known_totals = [item["total_bytes"] for item in files]
-    total = sum(known_totals) if files and all(value is not None for value in known_totals) else None
+    valid_totals = bool(files) and all(
+        _nonnegative(item["total_bytes"]) is not None and item["total_bytes"] > 0
+        and _nonnegative(item["bytes_downloaded"]) is not None
+        and item["bytes_downloaded"] <= item["total_bytes"] for item in files)
+    total = sum(known_totals) if valid_totals and not inventory_incomplete and not truncated else None
     loaded = (sum(item["bytes_downloaded"] or 0 for item in files)
               if not files or any(item["bytes_downloaded"] is not None for item in files) else None)
+    if inventory_incomplete or truncated:
+        loaded = None
     speed = (sum(item["download_speed"] or 0 for item in files)
              if any(item["download_speed"] is not None for item in files) else None)
+    if inventory_incomplete or truncated:
+        speed = None
     etas = [item["eta"] for item in files if not item["finished"]]
     eta = max(etas) if etas and all(value is not None for value in etas) else None
-    percentage = round(min(100, loaded * 100 / total), 2) if total and loaded is not None else None
+    percentage = round(loaded * 100 / total, 2) if total and loaded is not None and not truncated else None
     return {
         "request_id": str(row["id"]), "jd2_job_id": row["jd2_job_id"],
         "name": row["name"], "category": row["category"],
         "requested_at": row["requested_at"].isoformat() if row["requested_at"] else None,
         "submission_outcome": outcome, "state": state,
         "discovered_files": len(files),
-        "finished_files": sum(item["finished"] for item in files),
+        "finished_files": sum(item["finished"] for item in files
+                              if not inventory_incomplete or item["source"] != "persisted"),
         "bytes_downloaded": loaded, "total_bytes": total,
         "percentage_complete": percentage, "download_speed": speed,
-        "eta": eta, "truncated": truncated,
+        "eta": None if inventory_incomplete else eta, "truncated": truncated,
+        "inventory_incomplete": inventory_incomplete,
+        "jd2_unavailable": unavailable,
         "extraction_status": [item["extraction_status"] for item in files if item["extraction_status"] is not None],
         "files": files,
         "lifecycle_state": state,
@@ -347,9 +417,13 @@ def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
     }
 
 
-def _query_job_files(job_ids: list[int], *, include_packages: bool = False) -> tuple[dict[int, list[dict]], bool]:
+def _query_job_files(job_ids: list[int], *, include_packages: bool = False,
+                     known_link_jobs: dict[str, int | None] | None = None,
+                     discover_job_ids: list[int] | None = None) -> tuple[dict[int, list[dict]], bool]:
     by_job = {job_id: {} for job_id in job_ids}
     package_by_file = {}
+    unclaimed_downloads: dict[str, dict] = {}
+    live_link_jobs: dict[str, int | None] = {}
     truncated = False
     for source, list_name in (("linkgrabber", "linkgrabberv2"), ("downloads", "downloadsV2")):
         for page in range(MAX_JD2_PAGES):
@@ -357,24 +431,71 @@ def _query_job_files(job_ids: list[int], *, include_packages: bool = False) -> t
             for link in links:
                 if not isinstance(link, dict):
                     continue
+                file_id = link.get("uuid")
+                key = str(file_id) if file_id is not None else None
                 job_id = link.get("jobUUID")
                 if isinstance(job_id, str) and job_id.isdecimal():
                     job_id = int(job_id)
+                if key is not None and job_id in by_job:
+                    if key not in live_link_jobs:
+                        live_link_jobs[key] = job_id
+                    elif live_link_jobs[key] != job_id:
+                        live_link_jobs[key] = None
+                if job_id is None and key is not None:
+                    persisted_owner = (known_link_jobs or {}).get(key)
+                    live_owner = live_link_jobs.get(key)
+                    if known_link_jobs is not None and key in known_link_jobs:
+                        job_id = (persisted_owner if key not in live_link_jobs or
+                                  live_owner == persisted_owner else None)
+                    else:
+                        job_id = live_owner
                 if job_id not in by_job:
+                    if source == "downloads" and link.get("jobUUID") is None and key is not None:
+                        unclaimed_downloads[key] = link
                     continue
-                file_id = link.get("uuid")
                 if file_id is None:
                     continue
-                key = str(file_id)
                 # Prefer the download-list version after automatic confirmation.
                 if source == "downloads" or key not in by_job[job_id]:
                     by_job[job_id][key] = _file(link, source)
+                    if by_job[job_id][key]["job_id"] is None:
+                        by_job[job_id][key]["job_id"] = job_id
                     if source == "downloads" and link.get("packageUUID") is not None:
                         package_by_file[(job_id, key)] = link["packageUUID"]
             if len(links) < jd2.MAX_QUERY_RESULTS:
                 break
         else:
             truncated = True
+    # A filtered response is not proof that JD2 excluded other real jobs' links.
+    # Discover only links whose own jobUUID provides positive ownership evidence.
+    if discover_job_ids and unclaimed_downloads:
+        try:
+            candidates = {}
+            for job_id in discover_job_ids:
+                for page in range(MAX_JD2_PAGES):
+                    links = jd2.query_links("downloadsV2", [job_id], page * jd2.MAX_QUERY_RESULTS)
+                    for link in links:
+                        if not isinstance(link, dict) or link.get("uuid") is None:
+                            continue
+                        key = str(link["uuid"])
+                        if key in unclaimed_downloads and str(link.get("jobUUID")) == str(job_id):
+                            candidates.setdefault(key, []).append((job_id, link))
+                    if len(links) < jd2.MAX_QUERY_RESULTS:
+                        break
+                else:
+                    truncated = True
+            for key, matches in candidates.items():
+                if len({job_id for job_id, _ in matches}) != 1:
+                    continue
+                job_id, link = matches[0]
+                owner = (known_link_jobs or {}).get(key)
+                if known_link_jobs and key in known_link_jobs and owner != job_id:
+                    continue
+                by_job[job_id][key] = _file(link, "downloads")
+                if link.get("packageUUID") is not None:
+                    package_by_file[(job_id, key)] = link["packageUUID"]
+        except jd2.JDownloaderError:
+            pass  # Unavailable positive evidence leaves links unassociated.
     if include_packages:
         package_ids = list(dict.fromkeys(package_by_file.values()))
         if package_ids:
@@ -393,7 +514,60 @@ def _query_job_files(job_ids: list[int], *, include_packages: bool = False) -> t
                 if by_job[job_id][file_id]["extraction_status"] is None:
                     by_job[job_id][file_id]["extraction_status"] = package.get("extractionStatus")
                 by_job[job_id][file_id]["save_to"] = package.get("saveTo")
+                by_job[job_id][file_id]["package_name"] = package.get("name")
+                by_job[job_id][file_id]["package_child_count"] = package.get("childCount")
     return {job_id: list(files.values()) for job_id, files in by_job.items()}, truncated
+
+
+def _discovery_jobs(rows: list[dict], tracking: dict[str, dict] | None = None,
+                    now: datetime | None = None) -> list[int]:
+    now = now or datetime.now(timezone.utc)
+    candidates = []
+    for row in rows:
+        requested = row.get("requested_at")
+        if not isinstance(requested, datetime):
+            continue
+        if requested.tzinfo is None:
+            requested = requested.replace(tzinfo=timezone.utc)
+        links = tracking.get(str(row["id"]), {}).get("links", []) if tracking is not None else None
+        unresolved = not links if links is not None else row.get("needs_discovery", False)
+        active = (any(link.get("finished") is False for link in links) if links is not None
+                  else row.get("has_unfinished_links", False))
+        recent = timedelta(0) <= now - requested <= DISCOVERY_AGE
+        if (row.get("jd2_job_id") is not None and row.get("submission_outcome") == "succeeded"
+                and (recent or unresolved or active)):
+            # Older unresolved or unfinished jobs can still produce later parts.
+            candidates.append(row["jd2_job_id"])
+    if len(candidates) > MAX_DISCOVERY_JOBS:
+        # Rotate the bounded probe window so jobs still crawling do not starve
+        # later submissions on the same dashboard or monitor page.
+        start = int(now.timestamp() // 30) % len(candidates)
+        candidates = candidates[start:] + candidates[:start]
+    return candidates[:MAX_DISCOVERY_JOBS]
+
+
+def _merge_observed_files(live: list[dict], links: list[dict]) -> tuple[list[dict], bool]:
+    live_ids = {str(file["id"]) for file in live if file.get("id") is not None}
+    missing = [_persisted_file(link) for link in links
+               if link.get("link_id") is not None and isinstance(link.get("name"), str)
+               and str(link["link_id"]) not in live_ids]
+    return [*live, *missing], bool(missing)
+
+
+def _known_link_jobs(tracking: dict[str, dict]) -> dict[str, int | None]:
+    ownership: dict[str, int | None] = {}
+    for record in tracking.values():
+        for link in record["links"]:
+            if link.get("link_id") is None or link.get("jd2_job_id") is None:
+                continue
+            key = str(link["link_id"])
+            job = link["jd2_job_id"]
+            if key not in ownership:
+                ownership[key] = job
+            elif ownership[key] != job:
+                # None is an absorbing conflict: later tracking rows cannot claim it.
+                ownership[key] = None
+    return ownership
 
 
 def get_downloads(limit: int = 10, offset: int = 0, request_id: str | None = None) -> dict:
@@ -403,22 +577,34 @@ def get_downloads(limit: int = 10, offset: int = 0, request_id: str | None = Non
     job_ids = list(dict.fromkeys(row["jd2_job_id"] for row in rows if row["jd2_job_id"] is not None))
     files_by_job = {}
     unavailable = truncated = False
+    tracking = {str(row["id"]): read_tracking(str(row["id"])) for row in rows}
+    known_link_jobs = _known_link_jobs(tracking)
     if job_ids:
         try:
-            files_by_job, truncated = _query_job_files(job_ids, include_packages=True)
+            files_by_job, truncated = _query_job_files(
+                job_ids, include_packages=True, known_link_jobs=known_link_jobs,
+                discover_job_ids=_discovery_jobs(rows, tracking))
         except jd2.JDownloaderError:
             unavailable = True
-    tracking = {}
     for row in rows:
         key = str(row["id"])
-        tracking[key] = read_tracking(key)
         if row["jd2_job_id"] is not None and not unavailable and not truncated:
             # Inventory is durable even when JD2 later removes a link.
             sync_link_inventory(row, files_by_job.get(row["jd2_job_id"], []))
             tracking[key] = read_tracking(key)
-    summaries = [_summary(row, files_by_job.get(row["jd2_job_id"], []),
-                          unavailable=unavailable and row["jd2_job_id"] is not None,
-                          truncated=truncated, tracking=tracking[str(row["id"])]) for row in rows]
+    summaries = []
+    for row in rows:
+        record = tracking[str(row["id"])]
+        files, incomplete = _merge_observed_files(
+            files_by_job.get(row["jd2_job_id"], []), record["links"])
+        summaries.append(_summary(row, files,
+                                  unavailable=unavailable and row["jd2_job_id"] is not None,
+                                  truncated=truncated, inventory_incomplete=incomplete,
+                                  tracking=record))
+    for summary in summaries:
+        for file in summary["files"]:
+            file["logical_group_key"], file["logical_group_name"] = _logical_group(
+                file, summary["request_id"])
     for row, summary in zip(rows, summaries):
         if row["submission_outcome"] is not None:
             record_request_lifecycle(str(row["id"]), summary["state"])
@@ -514,21 +700,41 @@ def sync_link_inventory(row: dict, files: list[dict]) -> None:
 def refresh_link_inventory():
     """Called by the existing Plex monitor loop; no additional worker is needed."""
     with _transaction() as cur:
-        cur.execute("""SELECT id, name, category, jd2_job_id, submission_outcome, requested_at
-                       FROM public.plex_download_requests
-                       WHERE jd2_job_id IS NOT NULL ORDER BY requested_at DESC""")
+        cur.execute("""SELECT requests.id, requests.name, requests.category,
+                              requests.jd2_job_id, requests.submission_outcome,
+                              requests.requested_at,
+                              NOT EXISTS (SELECT 1 FROM public.plex_download_links AS links
+                                          WHERE links.request_id = requests.id) AS needs_discovery,
+                              EXISTS (SELECT 1 FROM public.plex_download_links AS links
+                                      WHERE links.request_id = requests.id AND NOT links.finished)
+                                  AS has_unfinished_links
+                       FROM public.plex_download_requests AS requests
+                       WHERE requests.jd2_job_id IS NOT NULL
+                       ORDER BY requests.requested_at DESC""")
         rows = [dict(zip([d[0] for d in cur.description], row)) for row in cur.fetchall()]
+        # Include every persisted owner, including other monitor batches, so a
+        # conflicted UUID cannot be claimed by whichever batch sees it first.
+        cur.execute("""SELECT link_id, jd2_job_id FROM public.plex_download_links
+                       WHERE link_id IS NOT NULL AND jd2_job_id IS NOT NULL""")
+        ownership = _known_link_jobs({"all": {"links": [
+            {"link_id": link_id, "jd2_job_id": job_id}
+            for link_id, job_id in cur.fetchall()
+        ]}})
     for start in range(0, len(rows), 50):
         batch = rows[start:start + 50]
         job_ids = [row["jd2_job_id"] for row in batch]
-        files_by_job, truncated = _query_job_files(job_ids, include_packages=True)
+        files_by_job, truncated = _query_job_files(
+            job_ids, include_packages=True, known_link_jobs=ownership,
+            discover_job_ids=_discovery_jobs(batch))
         if truncated:
             continue
         for row in batch:
             files = files_by_job.get(row["jd2_job_id"], [])
             sync_link_inventory(row, files)
             if row["submission_outcome"] is not None:
-                summary = _summary(row, files, tracking=read_tracking(str(row["id"])))
+                record = read_tracking(str(row["id"]))
+                merged, incomplete = _merge_observed_files(files, record["links"])
+                summary = _summary(row, merged, inventory_incomplete=incomplete, tracking=record)
                 record_request_lifecycle(str(row["id"]), summary["state"])
 
 

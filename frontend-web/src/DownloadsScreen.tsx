@@ -3,6 +3,8 @@ import type { FormEvent, ReactNode } from "react";
 
 import { downloadsApi } from "./api/downloadsApi";
 import type { DownloadRequest, SubmissionResponse } from "./api/downloadsApi";
+import { groupDownloads } from "./downloadGroups";
+import type { LogicalDownload } from "./downloadGroups";
 
 const PAGE_SIZE = 25;
 const MAX_OFFSET = 10000;
@@ -20,13 +22,13 @@ function storedHistoryWindow(): HistoryWindow {
   return "12";
 }
 
-function completionTime(item: DownloadRequest): number | null {
+function completionTime(item: { completed_at: string | null }): number | null {
   if (!item.completed_at) return null;
   const value = new Date(item.completed_at).getTime();
   return Number.isFinite(value) ? value : null;
 }
 
-function completedWithinWindow(item: DownloadRequest, historyWindow: HistoryWindow, now: number): boolean {
+function completedWithinWindow(item: { completed_at: string | null }, historyWindow: HistoryWindow, now: number): boolean {
   if (historyWindow === "none") return false;
   const completedAt = completionTime(item);
   if (completedAt === null) return false;
@@ -75,8 +77,8 @@ function etaText(value: number | null | undefined): string {
 
 function percent(item: { bytes_downloaded: number | null; total_bytes: number | null }): number | null {
   const { bytes_downloaded: loaded, total_bytes: total } = item;
-  if (loaded === null || total === null || !Number.isFinite(loaded) || !Number.isFinite(total) || loaded < 0 || total <= 0) return null;
-  return Math.min(100, Math.max(0, loaded / total * 100));
+  if (loaded === null || total === null || !Number.isFinite(loaded) || !Number.isFinite(total) || loaded < 0 || total <= 0 || loaded > total) return null;
+  return loaded / total * 100;
 }
 
 function Progress({ item }: { item: { bytes_downloaded: number | null; total_bytes: number | null } }) {
@@ -157,6 +159,67 @@ function RequestCard({ item, expanded, detail, detailLoading, detailError, onTog
   </article>;
 }
 
+function GroupCard({ item, expanded, onToggle }: { item: LogicalDownload; expanded: boolean; onToggle: () => void }) {
+  const completed = item.entries.filter(({ file }) => file.finished && file.source !== "persisted").length;
+  const groupLinkIds = new Set(item.entries.filter(({ file }) => file.id !== null).map(({ file }) => String(file.id)));
+  const packageNames = [...new Set(item.entries.map(({ file }) => file.package_name).filter((name): name is string => !!name))];
+  const processingErrors = [...new Set(item.entries.flatMap(({ file, requests }) =>
+    file.id === null ? [] : requests.flatMap((request) => (request.processing_files || [])
+      .filter((result) => result.state === "failed" && result.link_id !== null && String(result.link_id) === String(file.id))
+      .map((result) => result.error).filter((error): error is string => !!error))))];
+  return <article className="min-w-0 rounded-xl border border-slate-200 bg-white p-4 shadow-sm md:p-5">
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="min-w-0 flex-1"><h3 className="break-words text-base font-bold text-slate-950">{safeText(item.name)}</h3><p className="mt-1 text-xs text-slate-600">{item.category} · {item.entries.length} file(s) · {completed} live downloaded · {item.requests.length} request(s)</p></div>
+      <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${item.section === "attention" ? "bg-red-100 text-red-800" : item.section === "completed" ? "bg-green-100 text-green-800" : item.section === "legacy" ? "bg-slate-100 text-slate-700" : "bg-blue-100 text-blue-800"}`}>{item.status}</span>
+    </div>
+    <div className="mt-3"><Progress item={item} /></div>
+    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600"><span>Speed: {item.download_speed === null ? "Unknown" : `${sizeText(item.download_speed)}/s`}</span><span>ETA: {etaText(item.eta)}</span>{item.completed_at && <span>Plex completed {dateText(item.completed_at)}</span>}</div>
+    {item.truncated && <p role="alert" className="mt-3 rounded-md bg-amber-50 p-2 text-sm text-amber-900">Live JD2 inventory is incomplete or unavailable. Some files show their last observed status; aggregate progress is unknown.</p>}
+    {item.section === "legacy" && <p className="mt-3 text-sm text-slate-700">Legacy request; final outcome is unknown.</p>}
+    {processingErrors.length > 0 && <p role="alert" className="mt-3 rounded-md bg-red-50 p-2 text-sm text-red-800">{processingErrors.map(safeText).join(" · ")}</p>}
+    <button type="button" aria-expanded={expanded} onClick={onToggle} className="mt-4 rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold text-blue-700 hover:bg-slate-50">{expanded ? "Hide files" : `View ${item.entries.length} file(s)`}</button>
+    {expanded && <div className="mt-4 space-y-4 border-t border-slate-200 pt-4 text-sm text-slate-700">
+      {packageNames.length > 0 && <p className="break-words text-xs">JD2 package: {packageNames.map(safeText).join(", ")}</p>}
+      <ul className="space-y-2">{item.entries.map(({ file, requests }, index) => <li key={`${file.id ?? index}:${requests[0].request_id}`} className="min-w-0 rounded-lg bg-slate-50 p-3">
+        <div className="flex flex-wrap justify-between gap-2"><span className="break-all font-medium">{safeText(file.name) || "Unnamed file"}</span><span className="text-xs font-semibold">{file.source === "persisted" ? safeText(file.status) : file.finished ? "Downloaded" : file.enabled === false ? "Paused / disabled" : safeText(file.status) || "Status unknown"}</span></div>
+        <div className="mt-2"><Progress item={file} /></div><p className="mt-1 text-xs">Size: {sizeText(file.total_bytes)} · Speed: {file.download_speed === null ? "Unknown" : `${sizeText(file.download_speed)}/s`} · Extraction: {safeText(file.extraction_status) || "Unknown"}</p>
+        <p className="mt-1 break-all text-xs text-slate-500">Request{requests.length === 1 ? "" : "s"} {requests.map((request) => request.request_id).join(", ")} · JD2 link {file.id ?? "unknown"} · Package {file.package_id ?? "unknown"}</p>
+        {/\b(error|failed|failure)\b/i.test(file.status) && <p role="alert" className="mt-1 break-words text-xs text-red-800">{safeText(file.status)}</p>}
+      </li>)}</ul>
+      <div><h4 className="font-semibold">Request and Plex history</h4><ul className="mt-2 space-y-2">{item.requests.map((request) => <li key={request.request_id} className="min-w-0 rounded-lg bg-slate-50 p-3">
+        <p className="break-words">{safeText(request.name)} · {labels[request.state] || safeText(request.state)} · Submitted {dateText(request.requested_at)}</p>
+        <p className="mt-1 break-all text-xs">Request {request.request_id} · JD2 job {request.jd2_job_id ?? "unknown"} · Submission {request.submission_outcome || "unknown"}</p>
+        <p className="mt-1 text-xs">Request-wide Plex processing: {safeText(request.processing_status) || "Not yet reported"} · Extraction: {request.extraction_status?.length ? request.extraction_status.map(safeText).join(", ") : "Unknown"}</p>
+        <p className="mt-1 text-xs">JD2 entries: {request.jd2_entries_removed ? "Removed" : "No removal recorded"} · Cleanup: {safeText(request.cleanup_reason) || "Unknown"}</p>
+        {request.completed_at && <p className="mt-1 text-xs">Request-wide completion: {dateText(request.completed_at)}</p>}
+        {request.final_plex_destination && <p className="mt-1 break-all text-xs">Request-wide final Plex destination: {safeText(request.final_plex_destination)}</p>}
+        {request.failure && <p role="alert" className="mt-1 break-words text-xs text-red-800">Request failure: {safeText(request.failure)}</p>}
+        {(request.processing_files || []).filter((file) => file.link_id !== null && groupLinkIds.has(String(file.link_id))).map((file) => <div key={file.id} className="mt-2 min-w-0 rounded-md border border-slate-200 bg-white p-2 text-xs">
+          <p className="break-words font-medium">Plex: {safeText(file.destination_path?.split("/").pop() || file.source_path?.split("/").pop()) || "Unnamed file"} · {safeText(file.state)}</p>
+          <p>Link {file.link_id ?? "unknown"} · Completed: {dateText(file.completed_at)}</p>
+          {file.source_path && <p className="break-all">Source: {safeText(file.source_path)}</p>}
+          {file.destination_path && <p className="break-all">Destination: {safeText(file.destination_path)}</p>}
+          {file.error && <p role="alert" className="break-words text-red-800">{safeText(file.error)}</p>}
+        </div>)}
+        {request.files.length > 0 && item.entries.some(({ file, requests }) =>
+          requests.some((owner) => owner.request_id === request.request_id) &&
+          (file === request.files[0] || (file.id !== null && String(file.id) === String(request.files[0].id)))) &&
+          (request.processing_files || []).some((file) => file.link_id === null ||
+            !request.files.some((download) => download.id !== null && String(download.id) === String(file.link_id))) && <details className="mt-2 text-xs">
+          <summary className="cursor-pointer font-medium text-blue-700">Processing files without a matching JD2 link</summary>
+          {(request.processing_files || []).filter((file) => file.link_id === null ||
+            !request.files.some((download) => download.id !== null && String(download.id) === String(file.link_id))).map((file) => <div key={file.id} className="mt-2 min-w-0 rounded-md border border-slate-200 bg-white p-2">
+            <p className="break-words font-medium">Plex: {safeText(file.state)} · Link {file.link_id ?? "unknown"} · Completed: {dateText(file.completed_at)}</p>
+            {file.source_path && <p className="break-all">Source: {safeText(file.source_path)}</p>}
+            {file.destination_path && <p className="break-all">Destination: {safeText(file.destination_path)}</p>}
+            {file.error && <p role="alert" className="break-words text-red-800">{safeText(file.error)}</p>}
+          </div>)}
+        </details>}
+      </li>)}</ul></div>
+    </div>}
+  </article>;
+}
+
 export default function DownloadsScreen() {
   const [pages, setPages] = useState<Map<number, DownloadRequest[]>>(new Map());
   const pagesRef = useRef<Map<number, DownloadRequest[]>>(new Map());
@@ -166,6 +229,7 @@ export default function DownloadsScreen() {
   const [error, setError] = useState<string | null>(null);
   const [historyNow, setHistoryNow] = useState(() => Date.now());
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [expandedGroup, setExpandedGroup] = useState<string | null>(null);
   const [detail, setDetail] = useState<DownloadRequest | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -299,19 +363,26 @@ export default function DownloadsScreen() {
     }
   };
 
-  const filtered = requests.filter((item) => categoryFilter === "all" || item.category === categoryFilter);
+  const filtered = useMemo(() => requests.filter((item) => categoryFilter === "all" || item.category === categoryFilter), [requests, categoryFilter]);
+  const logical = useMemo(() => groupDownloads(filtered), [filtered]);
+  const fallback = filtered.filter((item) => item.files.length === 0);
+  type Card = { kind: "logical"; item: LogicalDownload } | { kind: "request"; item: DownloadRequest };
+  const cards: Card[] = [...logical.map((item): Card => ({ kind: "logical", item })), ...fallback.map((item): Card => ({ kind: "request", item }))];
+  const sectionOf = (card: Card) => card.kind === "logical" ? card.item.section : group(card.item);
   const sections = {
-    active: filtered.filter((item) => group(item) === "active"),
-    processing: filtered.filter((item) => group(item) === "processing"),
-    completed: filtered.filter((item) => group(item) === "completed" && completedWithinWindow(item, historyWindow, historyNow)),
-    attention: filtered.filter((item) => group(item) === "attention"),
-    legacy: showLegacy ? filtered.filter((item) => group(item) === "legacy") : [],
+    active: cards.filter((item) => sectionOf(item) === "active"),
+    processing: cards.filter((item) => sectionOf(item) === "processing"),
+    completed: cards.filter((card) => sectionOf(card) === "completed" && completedWithinWindow(card.item, historyWindow, historyNow)),
+    attention: cards.filter((item) => sectionOf(item) === "attention"),
+    legacy: showLegacy ? cards.filter((item) => sectionOf(item) === "legacy") : [],
   };
   const completedPages = Math.ceil(sections.completed.length / PAGE_SIZE);
   const shownHistoryPage = Math.min(historyPage, Math.max(0, completedPages - 1));
   const legacyPages = Math.ceil(sections.legacy.length / PAGE_SIZE);
   const shownLegacyPage = Math.min(legacyPage, Math.max(0, legacyPages - 1));
-  const renderCards = (items: DownloadRequest[]) => <div className="grid gap-3 lg:grid-cols-2">{items.map((item) => <RequestCard key={item.request_id} item={item} expanded={expanded === item.request_id} detail={detail} detailLoading={detailLoading} detailError={detailError} onToggle={() => { setDetail(null); setDetailError(null); setExpanded(expanded === item.request_id ? null : item.request_id); }} />)}</div>;
+  const renderCards = (items: Card[]) => <div className="grid gap-3 lg:grid-cols-2">{items.map((card) => card.kind === "logical"
+    ? <GroupCard key={card.item.key} item={card.item} expanded={expandedGroup === card.item.key} onToggle={() => setExpandedGroup(expandedGroup === card.item.key ? null : card.item.key)} />
+    : <RequestCard key={card.item.request_id} item={card.item} expanded={expanded === card.item.request_id} detail={detail} detailLoading={detailLoading} detailError={detailError} onToggle={() => { setDetail(null); setDetailError(null); setExpanded(expanded === card.item.request_id ? null : card.item.request_id); }} />)}</div>;
 
   return <main className="mx-auto max-w-7xl space-y-7 px-4 py-7 text-slate-950 md:px-6">
     <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-3xl font-black">Plex Monitor</h1><p className="mt-1 text-sm text-slate-600">Follow each request from submission to verified Plex placement.</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={() => setShowForm((value) => !value)} className="rounded-md bg-blue-700 px-4 py-2 text-sm font-bold text-white hover:bg-blue-800">{showForm ? "Close form" : "Add Download"}</button><button type="button" disabled={manualRefreshing} onClick={() => void refresh(true, true)} className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-bold disabled:opacity-50">{manualRefreshing ? "Refreshing…" : "Refresh"}</button></div></div>

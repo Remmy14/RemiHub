@@ -13,6 +13,11 @@ export type DownloadFile = {
   extraction_status: string | null;
   package_id: number | string | null;
   job_id: number | string | null;
+  enabled?: boolean | null;
+  package_name?: string | null;
+  package_child_count?: number | null;
+  logical_group_key?: string | null;
+  logical_group_name?: string | null;
   save_to?: string | null;
 };
 
@@ -44,6 +49,8 @@ export type DownloadRequest = {
   download_speed: number | null;
   eta: number | null;
   truncated: boolean;
+  inventory_incomplete?: boolean;
+  jd2_unavailable?: boolean;
   extraction_status: string[];
   files: DownloadFile[];
   file_count: number | null;

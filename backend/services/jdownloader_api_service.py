@@ -90,6 +90,7 @@ def query_links(list_name: str, job_ids: list[int], start_at: int = 0, max_resul
         "eta": True,
         "status": True,
         "finished": True,
+        "enabled": True,
         "extractionStatus": True,
         "packageUUID": True,
     })
@@ -104,6 +105,7 @@ def query_packages(package_ids: list[int], start_at: int = 0, max_results: int =
     data = _call("downloadsV2/queryPackages", {
         "packageUUIDs": package_ids, "startAt": start_at, "maxResults": max_results,
         "uuid": True,
+        "name": True, "childCount": True,
         "status": True, "bytesLoaded": True, "bytesTotal": True,
         "extractionStatus": True,
         "saveTo": True,

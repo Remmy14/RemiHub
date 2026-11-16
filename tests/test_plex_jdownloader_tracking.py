@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, patch
 
 import requests
@@ -16,6 +16,17 @@ from backend.services import jdownloader_api_service as jd2, plex_service
 
 
 class JDownloaderClientTests(unittest.TestCase):
+    def test_queries_request_verified_optional_metadata(self):
+        with patch.object(jd2, "_call", side_effect=[[], []]) as call:
+            jd2.query_links("downloadsV2", [42])
+            jd2.query_packages([900])
+        link_query = call.call_args_list[0].args[1]
+        package_query = call.call_args_list[1].args[1]
+        self.assertTrue(link_query["enabled"])
+        self.assertTrue(link_query["packageUUID"])
+        self.assertTrue(package_query["name"])
+        self.assertTrue(package_query["childCount"])
+
     def test_extraction_calls_use_local_contract(self):
         with patch.object(jd2, "_call", side_effect=[[], []]) as call:
             self.assertEqual(jd2.get_extraction_queue(), [])
@@ -39,6 +50,8 @@ class JDownloaderClientTests(unittest.TestCase):
         self.assertEqual(args[0], "http://127.0.0.1:3128/linkgrabberv2/addLinks")
         self.assertTrue(kwargs["json"]["params"][0]["assignJobID"])
         self.assertTrue(kwargs["json"]["params"][0]["autostart"])
+        self.assertEqual(kwargs["json"]["params"][0]["packageName"],
+                         "RemiHub Automated Download - TV")
         self.assertEqual(kwargs["json"]["params"][0]["destinationFolder"], "/mnt/plex-pool/Temp/TV")
         self.assertFalse(kwargs["allow_redirects"])
 
@@ -151,6 +164,380 @@ class MonitoringTests(unittest.TestCase):
         return {"id": uuid.uuid4(), "name": "Show", "category": "TV",
                 "requested_at": datetime(2026, 10, 28), "jd2_job_id": job_id,
                 "submission_outcome": outcome}
+
+    def test_logical_archive_keys_distinguish_sets_inside_one_package(self):
+        keys = []
+        for part in range(1, 19):
+            key, title = plex_service._logical_group({
+                "id": part, "package_id": 900, "name": f"Movie.part{part:02}.rar"
+            }, f"request-{part % 5}")
+            keys.append(key)
+            self.assertEqual(title, "Movie")
+        self.assertEqual(len(set(keys)), 1)
+        other, _ = plex_service._logical_group({
+            "id": 19, "package_id": 900, "name": "Other.part01.rar"
+        }, "request-1")
+        self.assertNotEqual(keys[0], other)
+        different_package, _ = plex_service._logical_group({
+            "id": 20, "package_id": 901, "name": "Movie.part01.rar"
+        }, "request-1")
+        self.assertNotEqual(keys[0], different_package)
+
+    def test_ambiguous_names_and_missing_package_do_not_merge(self):
+        first = plex_service._logical_group({"id": 1, "package_id": 900,
+                                               "name": "Film A.mkv"}, "request-1")
+        second = plex_service._logical_group({"id": 2, "package_id": 900,
+                                                "name": "Film B.mkv"}, "request-1")
+        self.assertNotEqual(first[0], second[0])
+        subtitle = plex_service._logical_group({"id": 6, "package_id": 900,
+                                                  "name": "Film A.srt"}, "request-2")
+        self.assertEqual(first[0], subtitle[0])
+        without_package = plex_service._logical_group({"id": 3, "package_id": None,
+                                                        "name": "Movie.part03.rar"}, "request-1")
+        self.assertEqual(without_package[0], "request:request-1:archive:movie")
+        episode_one = plex_service._logical_group({"id": 4, "package_id": 900,
+                                                    "name": "Show.S01E01.mkv"}, "request-1")
+        episode_two = plex_service._logical_group({"id": 5, "package_id": 900,
+                                                    "name": "Show.S01E02.mkv"}, "request-1")
+        self.assertNotEqual(episode_one[0], episode_two[0])
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_missing_job_uuid_uses_only_persisted_link_identity(self, query):
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else [
+            {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+             "bytesLoaded": 20, "bytesTotal": 100, "finished": False},
+            {"uuid": 8, "packageUUID": 900, "name": "Unowned.part01.rar",
+             "bytesLoaded": 20, "bytesTotal": 100, "finished": False},
+        ]
+        files, truncated = plex_service._query_job_files([42], known_link_jobs={"7": 42})
+        self.assertFalse(truncated)
+        self.assertEqual([item["id"] for item in files[42]], [7])
+        self.assertEqual(files[42][0]["job_id"], 42)
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_linkgrabber_uuid_with_explicit_job_updates_jobless_download_progress(self, query):
+        def fetch(source, *_):
+            if source == "linkgrabberv2":
+                return [{"uuid": 7, "jobUUID": 42, "name": "Movie.part01.rar"}]
+            return [{"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                     "bytesLoaded": 100, "bytesTotal": 100, "finished": True}]
+
+        query.side_effect = fetch
+        files, truncated = plex_service._query_job_files([42])
+        self.assertFalse(truncated)
+        self.assertEqual(len(files[42]), 1)
+        self.assertEqual(files[42][0]["source"], "downloads")
+        self.assertEqual(files[42][0]["bytes_downloaded"], 100)
+        self.assertTrue(files[42][0]["finished"])
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_three_conflicting_tracking_jobs_never_claim_jobless_link(self, query):
+        tracking = {str(job): {"links": [{"link_id": 7, "jd2_job_id": job}]}
+                    for job in (41, 42, 43)}
+        owners = plex_service._known_link_jobs(tracking)
+        self.assertIn("7", owners)
+        self.assertIsNone(owners["7"])
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else [
+            {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+             "bytesLoaded": 20, "bytesTotal": 100, "finished": False},
+        ]
+        files, truncated = plex_service._query_job_files([41, 42, 43], known_link_jobs=owners)
+        self.assertFalse(truncated)
+        self.assertTrue(all(not files[job] for job in (41, 42, 43)))
+
+    def test_discovery_includes_older_unresolved_and_active_jobs(self):
+        old = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        rows = [self.row(job_id=job) for job in (41, 42, 43)]
+        for row in rows:
+            row["requested_at"] = old
+        tracking = {
+            str(rows[0]["id"]): {"links": []},
+            str(rows[1]["id"]): {"links": [{"finished": False}]},
+            str(rows[2]["id"]): {"links": [{"finished": True}]},
+        }
+        self.assertEqual(plex_service._discovery_jobs(rows, tracking), [41, 42])
+        for row, unresolved, active in zip(rows, (True, False, False), (False, True, False)):
+            row["needs_discovery"] = unresolved
+            row["has_unfinished_links"] = active
+        self.assertEqual(plex_service._discovery_jobs(rows), [41, 42])
+
+    def test_older_discovery_rotates_with_a_bounded_probe_window(self):
+        rows = [self.row(job_id=job) for job in range(100, 112)]
+        for row in rows:
+            row["requested_at"] = datetime(2025, 1, 1, tzinfo=timezone.utc)
+            row["needs_discovery"] = True
+        start = datetime(2026, 11, 15, tzinfo=timezone.utc)
+        first = plex_service._discovery_jobs(rows, now=start)
+        second = plex_service._discovery_jobs(rows, now=start + timedelta(seconds=30))
+        self.assertEqual(len(first), plex_service.MAX_DISCOVERY_JOBS)
+        self.assertEqual(len(second), plex_service.MAX_DISCOVERY_JOBS)
+        self.assertNotEqual(set(first), set(second))
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links")
+    def test_unowned_jobless_links_are_not_claimed_from_filter_alone(self, query, read):
+        row = self.row()
+        row["requested_at"] = datetime.now(timezone.utc)
+        read.return_value = [row]
+        links = [{"uuid": part, "packageUUID": 900, "name": f"Movie.part{part:02}.rar",
+                  "bytesLoaded": 20, "bytesTotal": 100, "speed": 10,
+                  "status": "Downloading", "finished": False} for part in range(1, 6)]
+
+        def filtered(source, ids, start, max_results=200):
+            if source == "linkgrabberv2" or start:
+                return []
+            return links if ids == [42] else []
+
+        query.side_effect = filtered
+        item = plex_service.get_downloads()["data"][0]
+        self.assertEqual(item["files"], [])
+        self.assertIsNone(item["percentage_complete"])
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links")
+    def test_unowned_jobless_multipart_links_stay_unassigned_with_empty_linkgrabber(self, query, read):
+        row = self.row()
+        read.return_value = [row]
+        links = [{"uuid": part, "packageUUID": 900,
+                  "name": f"Movie.part{part:02}.rar", "bytesLoaded": 20,
+                  "bytesTotal": 100, "speed": 10, "finished": False}
+                 for part in range(1, 6)]
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else links
+        plex_service.jd2.query_packages.return_value = [{
+            "uuid": 900, "name": "RemiHub Automated Download - TV",
+            "childCount": 5, "saveTo": "/mnt/plex-pool/Temp/TV",
+        }]
+        item = plex_service.get_downloads()["data"][0]
+        self.assertEqual(item["files"], [])
+        self.assertIsNone(item["percentage_complete"])
+        self.assertEqual(plex_service.sync_link_inventory.call_args.args[1], [])
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links")
+    def test_shared_package_without_per_link_owner_stays_unassigned(self, query, read):
+        rows = [self.row(job_id=job) for job in range(41, 46)]
+        read.return_value = rows
+        links = [{"uuid": part, "packageUUID": 900,
+                  "name": f"Movie.part{part:02}.rar", "bytesLoaded": 20,
+                  "bytesTotal": 100, "speed": 10, "finished": False}
+                 for part in range(1, 6)]
+        # Manual or otherwise unowned links cannot be assigned from a shared
+        # package, even when a query returns them for several RemiHub jobs.
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else links
+        plex_service.jd2.query_packages.return_value = [{
+            "uuid": 900, "name": "RemiHub Automated Download - TV",
+            "childCount": 5, "saveTo": "/mnt/plex-pool/Temp/TV",
+        }]
+        summaries = plex_service.get_downloads()["data"]
+        self.assertEqual(len(summaries), 5)
+        self.assertTrue(all(not summary["files"] for summary in summaries))
+        self.assertTrue(all(summary["percentage_complete"] is None for summary in summaries))
+        self.assertEqual(plex_service.sync_link_inventory.call_count, 5)
+        self.assertTrue(all(call.args[1] == []
+                            for call in plex_service.sync_link_inventory.call_args_list))
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links")
+    def test_remihub_multipart_jobs_group_and_sync_their_own_links(self, query, read):
+        rows = [self.row(job_id=job) for job in range(41, 48)]
+        read.return_value = rows
+        links = [{"uuid": part, "jobUUID": 40 + part, "packageUUID": 900,
+                  "name": f"Movie.part{part:02}.rar", "bytesLoaded": 20,
+                  "bytesTotal": 100, "speed": 10, "finished": False}
+                 for part in range(1, 6)]
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else links
+        plex_service.jd2.query_packages.return_value = [{
+            "uuid": 900, "name": "RemiHub Automated Download - TV",
+            "childCount": 5, "saveTo": "/mnt/plex-pool/Temp/TV",
+        }]
+        summaries = plex_service.get_downloads()["data"]
+        self.assertEqual(len(summaries), 7)
+        self.assertEqual([summary["files"][0]["id"] for summary in summaries[:5]],
+                         [1, 2, 3, 4, 5])
+        self.assertEqual(len({summary["files"][0]["logical_group_key"]
+                              for summary in summaries[:5]}), 1)
+        self.assertTrue(all(summary["percentage_complete"] == 20 for summary in summaries[:5]))
+        self.assertTrue(all(not summary["files"] for summary in summaries[5:]))
+        self.assertEqual([call.args[1][0]["id"] for call in
+                          plex_service.sync_link_inventory.call_args_list[:5]],
+                         [1, 2, 3, 4, 5])
+        self.assertTrue(all(call.args[1] == [] for call in
+                            plex_service.sync_link_inventory.call_args_list[5:]))
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_mixed_job_jobless_links_never_inherit_package_owner(self, query):
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else [
+            {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar", "finished": False},
+            {"uuid": 8, "packageUUID": 900, "name": "Other.part01.rar", "finished": False},
+            {"uuid": 9, "jobUUID": 42, "packageUUID": 900,
+             "name": "Movie.part02.rar", "finished": False},
+            {"uuid": 10, "jobUUID": 43, "packageUUID": 900,
+             "name": "Other.part02.rar", "finished": False},
+        ]
+        plex_service.jd2.query_packages.return_value = [{
+            "uuid": 900, "name": "RemiHub Automated Download - TV [request-42]", "childCount": 4,
+        }]
+        files, _ = plex_service._query_job_files([42, 43], include_packages=True)
+        self.assertEqual([file["id"] for file in files[42]], [9])
+        self.assertEqual([file["id"] for file in files[43]], [10])
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_filtered_explicit_job_uuid_can_resolve_jobless_global_link(self, query):
+        link = {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                "bytesLoaded": 20, "bytesTotal": 100, "finished": False}
+        calls = [0]
+
+        def fetch(source, ids, start, max_results=200):
+            if source == "linkgrabberv2" or start:
+                return []
+            calls[0] += 1
+            return [link] if calls[0] == 1 else [{**link, "jobUUID": 42}]
+
+        query.side_effect = fetch
+        files, truncated = plex_service._query_job_files([42], discover_job_ids=[42])
+        self.assertFalse(truncated)
+        self.assertEqual([file["id"] for file in files[42]], [7])
+        self.assertEqual(files[42][0]["job_id"], 42)
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_monitor_refresh_can_discover_initial_jobless_link(self, query):
+        from contextlib import contextmanager
+        row = self.row()
+        row["requested_at"] = datetime.now(timezone.utc)
+        link = {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                "bytesLoaded": 20, "bytesTotal": 100, "finished": False}
+        calls = [0]
+
+        def fetch(source, ids, start, max_results=200):
+            if source == "linkgrabberv2" or start:
+                return []
+            calls[0] += 1
+            return [link] if calls[0] == 1 else [{**link, "jobUUID": 42}]
+
+        query.side_effect = fetch
+        cursor = MagicMock()
+        cursor.description = [(key,) for key in (*row.keys(), "needs_discovery", "has_unfinished_links")]
+        cursor.fetchall.side_effect = [[(*row.values(), True, False)], []]
+
+        @contextmanager
+        def transaction():
+            yield cursor
+
+        with patch.object(plex_service, "_transaction", transaction):
+            plex_service.refresh_link_inventory()
+        self.assertEqual(plex_service.sync_link_inventory.call_args.args[1][0]["id"], 7)
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_monitor_updates_tracked_part_and_discovers_later_jobless_part(self, query):
+        from contextlib import contextmanager
+        row = self.row()
+        row["requested_at"] = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        phase = [0]
+        calls = [0]
+
+        def fetch(source, ids, start, max_results=200):
+            if source == "linkgrabberv2" or start:
+                return []
+            calls[0] += 1
+            links = [{"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                      "bytesLoaded": 100 if phase[0] else 20, "bytesTotal": 100,
+                      "finished": bool(phase[0])}]
+            if phase[0]:
+                links.append({"uuid": 8, "packageUUID": 900, "name": "Movie.part02.rar",
+                              "bytesLoaded": 100, "bytesTotal": 100, "finished": True})
+                if calls[0] > 1:
+                    links[-1]["jobUUID"] = 42
+            return links
+
+        query.side_effect = fetch
+        cursor = MagicMock()
+        cursor.description = [(key,) for key in (*row.keys(), "needs_discovery", "has_unfinished_links")]
+
+        @contextmanager
+        def transaction():
+            cursor.fetchall.side_effect = [[(*row.values(), False, True)], [(7, 42)]]
+            yield cursor
+
+        with patch.object(plex_service, "_transaction", transaction):
+            plex_service.refresh_link_inventory()
+            first = plex_service.sync_link_inventory.call_args.args[1]
+            self.assertEqual([(file["id"], file["finished"]) for file in first], [(7, False)])
+            phase[0] = 1
+            calls[0] = 0
+            plex_service.refresh_link_inventory()
+            second = plex_service.sync_link_inventory.call_args.args[1]
+        self.assertEqual({(file["id"], file["finished"]) for file in second},
+                         {(7, True), (8, True)})
+        self.assertTrue(any(call.args[1] == [42] for call in query.call_args_list))
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_unverified_filter_cannot_claim_jobless_links(self, query):
+        link = {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                "bytesLoaded": 20, "bytesTotal": 100, "finished": False}
+        query.side_effect = lambda source, ids, start, max_results=200: (
+            [] if source == "linkgrabberv2" or start else [link])
+        files, _ = plex_service._query_job_files([42], discover_job_ids=[42])
+        self.assertEqual(files[42], [])
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_jobless_link_seen_under_multiple_filters_is_ambiguous(self, query):
+        link = {"uuid": 7, "packageUUID": 900, "name": "Movie.part01.rar",
+                "bytesLoaded": 20, "bytesTotal": 100, "finished": False}
+        query.side_effect = lambda source, ids, start, max_results=200: (
+            [] if source == "linkgrabberv2" or ids == [2**63 - 1] or start else [link])
+        files, _ = plex_service._query_job_files([42, 43], discover_job_ids=[42, 43])
+        self.assertEqual(files[42], [])
+        self.assertEqual(files[43], [])
+
+    def test_contradictory_byte_counts_hide_percentage(self):
+        row = self.row()
+        files = [plex_service._file({"uuid": 1, "name": "Movie.part01.rar",
+                                      "bytesLoaded": 30, "bytesTotal": 0,
+                                      "finished": False}, "downloads")]
+        summary = plex_service._summary(row, files)
+        self.assertIsNone(summary["percentage_complete"])
+        self.assertIsNone(summary["total_bytes"])
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links", return_value=[])
+    def test_persisted_links_remain_groupable_without_live_job_uuid(self, _query, read):
+        read.return_value = [self.row()]
+        links = [{"link_id": part, "jd2_job_id": 42, "package_id": 900,
+                  "name": f"Movie.part{part:02}.rar", "kind": "archive",
+                  "finished": False, "extraction_status": None} for part in range(1, 6)]
+        with patch.object(plex_service, "read_tracking", return_value={
+            "links": links, "processed": [], "event": None,
+        }):
+            item = plex_service.get_downloads()["data"][0]
+        self.assertEqual(len(item["files"]), 5)
+        self.assertEqual({file["source"] for file in item["files"]}, {"persisted"})
+        self.assertEqual(len({file["logical_group_key"] for file in item["files"]}), 1)
+        self.assertIsNone(item["total_bytes"])
+
+    @patch.object(plex_service, "_read_requests")
+    @patch.object(plex_service.jd2, "query_links")
+    def test_partial_live_inventory_keeps_persisted_links_without_claiming_completion(self, query, read):
+        read.return_value = [self.row()]
+        links = [{"link_id": part, "jd2_job_id": 42, "package_id": 900,
+                  "name": f"Movie.part{part:02}.rar", "kind": "archive",
+                  "finished": True, "extraction_status": None} for part in range(1, 3)]
+        query.side_effect = lambda source, *_: [] if source == "linkgrabberv2" else [
+            {"uuid": 1, "jobUUID": 42, "packageUUID": 900,
+             "name": "Movie.part01.rar", "bytesLoaded": 100, "bytesTotal": 100,
+             "finished": True}]
+        with patch.object(plex_service, "read_tracking", return_value={
+            "links": links, "processed": [], "event": None,
+        }):
+            item = plex_service.get_downloads()["data"][0]
+        self.assertEqual(len(item["files"]), 2)
+        self.assertEqual({file["source"] for file in item["files"]}, {"downloads", "persisted"})
+        self.assertTrue(item["inventory_incomplete"])
+        self.assertEqual(item["state"], "unavailable")
+        self.assertIsNone(item["bytes_downloaded"])
+        self.assertIsNone(item["total_bytes"])
+        self.assertIsNone(item["percentage_complete"])
+        self.assertIsNone(item["download_speed"])
+        self.assertIsNone(item["eta"])
 
     @patch.object(plex_service, "_read_requests")
     @patch.object(plex_service.jd2, "query_links")
