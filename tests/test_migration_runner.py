@@ -37,6 +37,13 @@ HISTORICAL_MIGRATIONS = [
 
 
 class MigrationDiscoveryTests(unittest.TestCase):
+    def test_adventures_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0023_adventures_foundation.up.sql"
+        down = MIGRATIONS_DIR / "0023_adventures_foundation.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
     def test_plex_jdownloader_tracking_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0017_plex_jdownloader_tracking.up.sql"
         down = MIGRATIONS_DIR / "0017_plex_jdownloader_tracking.down.sql"
@@ -69,9 +76,9 @@ class MigrationDiscoveryTests(unittest.TestCase):
         latest = migrations[-1]
         self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
         self.assertIsNotNone(latest.down_path)
-        self.assertEqual((latest.version, latest.name), ("0022", "review_decisions"))
-        self.assertEqual(latest.up_path.name, "0022_review_decisions.up.sql")
-        self.assertEqual(latest.down_path.name, "0022_review_decisions.down.sql")
+        self.assertEqual((latest.version, latest.name), ("0023", "adventures_foundation"))
+        self.assertEqual(latest.up_path.name, "0023_adventures_foundation.up.sql")
+        self.assertEqual(latest.down_path.name, "0023_adventures_foundation.down.sql")
         self.assertTrue(latest.up_path.is_file())
         self.assertTrue(latest.down_path.is_file())
         rollback_sql = (MIGRATIONS_DIR / "0021_agent_codex_usage.down.sql").read_text(encoding="utf-8")

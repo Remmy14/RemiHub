@@ -15,6 +15,7 @@ from starlette.staticfiles import StaticFiles
 
 # Local Imports
 from backend.services.race import race_service
+from backend.services import adventures_media
 from backend.config import resolve_environment_file_path
 from backend.core.auth import AuthMode, get_auth_mode, get_current_principal
 from backend.database.database import get_db_conn, put_db_conn
@@ -41,6 +42,7 @@ from backend.routers import (
         spotify,
         vehicles,
         blue_jackets,
+        adventures,
     )
 from backend.tasks import (
         swimming_pool_monitor,
@@ -82,7 +84,9 @@ async def lifespan(app: FastAPI):
         )
 
     # Start background tasks
+    adventures_cleanup_task = None
     if not TEST_MODE:
+        adventures_cleanup_task = asyncio.create_task(adventures_media.cleanup_loop())
         # 1 - Kick off our Race Day family pool monitor
         asyncio.create_task(race_service.update_leaderboard_loop())
 
@@ -106,7 +110,12 @@ async def lifespan(app: FastAPI):
             threading.Thread(target=thread, daemon=True).start()
 
     yield
-    # (Optional) Cleanup tasks go here
+    if adventures_cleanup_task is not None:
+        adventures_cleanup_task.cancel()
+        try:
+            await adventures_cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 # Create the API and add the routers
 app = FastAPI(lifespan=lifespan)
@@ -149,6 +158,7 @@ protected_routers = [
     spotify.router,
     vehicles.router,
     blue_jackets.router,
+    adventures.router,
 ]
 
 for router in protected_routers:
