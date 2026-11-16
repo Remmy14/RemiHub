@@ -24,30 +24,32 @@ pinned to another base and does not publish this launcher. Do not repurpose it.
 
 ## Check and publication
 
-After source review, run `bash install-sandbox.sh --check` from this directory.
-The default is read-only. It verifies the source digest and existing target
+After source review, run `bash check-sandbox.sh` from this directory.
+The command is read-only and accepts no arguments. It verifies the source digest and existing target
 identity/permissions, and fails on a mismatch. Future infrastructure activation
 must include this check; ordinary application releases neither install this
 file nor authorize changing it.
 
-Only an explicitly approved operator procedure may run `--install`. It accepts
-only the known pre-repair predecessor and retains a private rollback copy. It
-refuses unknown/newer files, symlinks, hardlinked targets and unexpected target
-ownership/mode. On the currently repaired server it is an idempotent check and
-performs no writes. This is not a universal installer or a source-parity runner.
+There is no installation or restoration command in this source adoption. The
+previous preparation's mutating installer was removed after independent review
+identified check/replace races and insufficient backup verification. In the
+current installation no replacement is needed: the target already has the exact
+reviewed bytes. Repeating the check does not change any files or services.
 
-Before any real replacement: verify no active implementation jobs; independently
-review exact source/script; approve the maintenance window and backup/rollback;
-secure the reviewed package as root-owned and not writable by the worker; verify
-installation-directory ownership/ACLs; apply through the operator procedure;
-then run the disposable PostgreSQL/containment regression in the worker context.
-Do not stop/restart production application services for this file-only repair.
+A mismatch is a stop condition, not permission to copy this file over a newer
+runtime. Any future byte replacement requires a separate independently reviewed
+operator procedure addressing deployment admission, privileged concurrent writers,
+secure package/directory/ACL ownership, verified backups, atomic publication,
+postchecks and exact-current rollback safeguards. This commit does not supply or
+authorize that procedure. Historical root installers can still overwrite files
+if an administrator explicitly replays them; they must not be used for this
+adoption. A diagnostic check cannot enforce root administrator behavior.
 
-Rollback is an operator-authorized atomic restore of the exact saved file after
-checking the current target still equals the installed repair. Restoring the
-predecessor reintroduces the PostgreSQL failure; never restore it just to make a
-hash match. Retain history and backups. A Git-source rollback alone must not
-silently downgrade the runtime validator.
+After source promotion, retain candidate and rollback refs. If adoption must be
+withdrawn, use a separately reviewed forward source revert. Never restore the
+broken predecessor merely to match historical source or reset branches backward.
+The installed working validator, deployed application bytes, frontend assets and
+running services remain unchanged by source adoption.
 
 ## Security and regression
 
