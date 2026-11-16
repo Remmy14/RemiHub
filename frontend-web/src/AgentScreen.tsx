@@ -296,6 +296,7 @@ function CardSummaryRow({
   usageLoaded,
   usageCurrent,
   selected,
+  statusFirst = false,
   onSelect,
 }: {
   card: AgentCardSummary;
@@ -303,6 +304,7 @@ function CardSummaryRow({
   usageLoaded: boolean;
   usageCurrent: boolean;
   selected: boolean;
+  statusFirst?: boolean;
   onSelect: () => void;
 }) {
   return (
@@ -313,6 +315,11 @@ function CardSummaryRow({
       onClick={onSelect}
       type="button"
     >
+      {statusFirst && (
+        <div className="mb-2 whitespace-nowrap">
+          <StatusChip status={card.status} />
+        </div>
+      )}
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="break-words text-base font-black text-slate-950">
@@ -322,7 +329,7 @@ function CardSummaryRow({
             {card.description}
           </p>
         </div>
-        <StatusChip status={card.status} />
+        {!statusFirst && <StatusChip status={card.status} />}
       </div>
 
       <div className="mt-3 flex flex-wrap gap-2">
@@ -420,6 +427,7 @@ function CardList({
             {historicalCards.map((card) => (
               <CardSummaryRow
                 card={card}
+                statusFirst
                 usage={usageSummary?.token_accounting.by_card.find((item) => item.card_id === card.id)?.total_tokens ?? null}
                 usageLoaded={usageSummary !== null}
                 usageCurrent={usageCurrent}
