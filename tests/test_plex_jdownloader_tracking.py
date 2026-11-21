@@ -798,6 +798,165 @@ class MonitoringTests(unittest.TestCase):
                     plex_service.cleanup_download(str(uuid.uuid4()))
         call.assert_not_called()
 
+
+class EmptyDiscoveryReconciliationTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self):
+            self.event = None
+            self.events = []
+            self.has_links = False
+            self.has_files = False
+            self.result = None
+
+        def execute(self, sql, params):
+            if "INSERT INTO public.plex_download_events" in sql:
+                self.event = (*params[1:], datetime.now(timezone.utc))
+                self.events.append(self.event)
+            elif "SELECT id FROM public.plex_download_requests" in sql:
+                self.result = (params[0],)
+            elif "SELECT EXISTS" in sql:
+                self.result = (self.has_links, self.has_files)
+            elif "SELECT state, detail, occurred_at" in sql:
+                self.result = self.event
+            elif "SELECT state, detail" in sql:
+                self.result = self.event[:2] if self.event else None
+            else:
+                raise AssertionError(sql)
+
+        def fetchone(self):
+            return self.result
+
+    def setUp(self):
+        from contextlib import contextmanager
+        self.cursor = self.Cursor()
+
+        @contextmanager
+        def transaction():
+            yield self.cursor
+
+        self.transaction_patch = patch.object(plex_service, "_transaction", transaction)
+        self.transaction_patch.start()
+        self.row = {"id": uuid.uuid4(), "name": "Show", "category": "TV",
+                    "requested_at": datetime.now(timezone.utc) - timedelta(days=8),
+                    "jd2_job_id": 42, "submission_outcome": "succeeded"}
+
+    def tearDown(self):
+        self.transaction_patch.stop()
+
+    def mature_first_observation(self):
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(self.cursor.event[0:2],
+                         ("discovering", plex_service.EMPTY_DISCOVERY_DETAIL))
+        self.cursor.event = (*self.cursor.event[:2],
+                             datetime.now(timezone.utc) - timedelta(hours=1))
+
+    @patch.object(plex_service, "_query_job_files", return_value=({42: []}, False))
+    def test_stale_empty_request_becomes_terminal_once_and_stays_visible(self, query):
+        self.mature_first_observation()
+        plex_service.record_request_lifecycle(str(self.row["id"]), "discovering")
+        self.assertEqual(len(self.cursor.events), 1)
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(self.cursor.event[:2],
+                         ("failed", plex_service.UNRESOLVED_DISCOVERY_DETAIL))
+        summary = plex_service._summary(self.row, [], tracking={
+            "links": [], "processed": [], "event": {
+                "state": self.cursor.event[0], "detail": self.cursor.event[1]}})
+        self.assertEqual(summary["state"], "failed")
+        self.assertEqual(summary["failure"], plex_service.UNRESOLVED_DISCOVERY_DETAIL)
+        plex_service.record_request_lifecycle(str(self.row["id"]), "failed")
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(len(self.cursor.events), 2)
+        query.assert_called_once()
+
+    @patch.object(plex_service, "_query_job_files")
+    def test_temporary_api_error_does_not_confirm_empty_discovery(self, query):
+        self.mature_first_observation()
+        query.side_effect = jd2.JDownloaderError("JDownloader API timed out", ambiguous=True)
+        with self.assertRaises(jd2.JDownloaderError):
+            plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(len(self.cursor.events), 1)
+
+    @patch.object(plex_service, "_query_job_files")
+    def test_delayed_discovery_restarts_normal_download_lifecycle(self, query):
+        self.mature_first_observation()
+        file = plex_service._file({"uuid": 7, "jobUUID": 42, "name": "Show.mkv",
+                                   "bytesLoaded": 0, "bytesTotal": 100,
+                                   "speed": 0, "finished": False}, "downloads")
+        query.return_value = ({42: [file]}, False)
+        self.assertEqual(plex_service._reconcile_empty_discovery(self.row, {})[0]["id"], 7)
+        self.assertEqual(len(self.cursor.events), 1)
+        self.assertEqual(plex_service._summary(self.row, [file])["state"], "queued")
+
+    @patch.object(plex_service, "_query_job_files", return_value=({42: []}, True))
+    def test_incomplete_recheck_cannot_confirm_empty_discovery(self, query):
+        self.mature_first_observation()
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(len(self.cursor.events), 1)
+
+    def test_recent_or_already_tracked_request_does_not_start_empty_clock(self):
+        self.row["requested_at"] = datetime.now(timezone.utc)
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(self.cursor.events, [])
+        self.row["requested_at"] -= timedelta(days=8)
+        self.cursor.has_links = True
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertEqual(self.cursor.events, [])
+
+    @patch.object(plex_service, "_query_job_files", return_value=({42: []}, False))
+    def test_duplicate_only_without_jd2_evidence_is_not_called_duplicate(self, query):
+        self.mature_first_observation()
+        plex_service._reconcile_empty_discovery(self.row, {})
+        self.assertIn("outcome could not be verified", self.cursor.event[1])
+        self.assertNotIn("duplicate", self.cursor.event[1].lower())
+
+    @patch.object(plex_service.jd2, "query_links")
+    def test_truncated_large_job_does_not_starve_stale_empty_job(self, query):
+        large = {**self.row, "id": uuid.uuid4(), "jd2_job_id": 41}
+        columns = [*self.row.keys(), "needs_discovery", "has_unfinished_links"]
+
+        class MonitorCursor(self.Cursor):
+            description = [(column,) for column in columns]
+
+            def execute(self, sql, params=None):
+                if "SELECT requests.id" in sql:
+                    self.rows = [(*large.values(), False, True),
+                                 (*self_request.values(), True, False)]
+                elif "SELECT link_id, jd2_job_id FROM public.plex_download_links" in sql:
+                    self.rows = []
+                else:
+                    super().execute(sql, params)
+
+            def fetchall(self):
+                return self.rows
+
+        self_request = self.row
+        self.cursor = MonitorCursor()
+        saturated = [{"uuid": index, "jobUUID": 41, "name": f"part{index}.rar"}
+                     for index in range(jd2.MAX_QUERY_RESULTS)]
+        individual_incomplete = [True]
+        query.side_effect = lambda source, jobs, start, max_results=200: (
+            saturated if source == "linkgrabberv2" and
+            (jobs == [41, 42] or (jobs == [42] and individual_incomplete[0])) else [])
+
+        def tracking(request_id):
+            event = self.cursor.event
+            return {"links": [], "processed": [], "event": (
+                {"state": event[0], "detail": event[1], "occurred_at": event[2]}
+                if event and request_id == str(self.row["id"]) else None)}
+
+        with patch.object(plex_service, "read_tracking", side_effect=tracking), \
+             patch.object(plex_service, "sync_link_inventory") as sync:
+            plex_service.refresh_link_inventory()
+            self.assertIsNone(self.cursor.event)
+            sync.assert_not_called()
+            individual_incomplete[0] = False
+            plex_service.refresh_link_inventory()
+        self.assertEqual(self.cursor.event[:2],
+                         ("discovering", plex_service.EMPTY_DISCOVERY_DETAIL))
+        self.assertEqual(len(self.cursor.events), 1)
+        self.assertEqual(sync.call_args.args[0]["id"], self.row["id"])
+        self.assertTrue(any(call.args[1] == [42] for call in query.call_args_list))
+
     def test_restart_recovery_requires_destination_and_original_size(self):
         from contextlib import contextmanager
         from unittest.mock import MagicMock

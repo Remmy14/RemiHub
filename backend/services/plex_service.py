@@ -20,6 +20,31 @@ MAX_DOWNLOAD_PAGE = 25
 MAX_JD2_PAGES = 5
 MAX_DISCOVERY_JOBS = 10
 DISCOVERY_AGE = timedelta(days=7)
+# JD2's queried link lists do not expose per-job crawl completion or duplicates.
+# A successful addLinks response only means that JD2 accepted a job ID. After
+# this grace period, require two complete empty observations before reporting
+# unresolved discovery. These are application policy, not claims about JD2.
+EMPTY_DISCOVERY_DETAIL = "JD2 link inventory was empty; awaiting confirmation"
+UNRESOLVED_DISCOVERY_DETAIL = (
+    "No links were found after repeated JD2 checks; discovery outcome could not be verified. "
+    "Check JDownloader before submitting again."
+)
+
+
+def _discovery_duration(name: str, default: float, minimum: float) -> timedelta:
+    try:
+        hours = float(os.getenv(name, str(default)))
+    except ValueError:
+        hours = default
+    if not math.isfinite(hours):
+        hours = default
+    return timedelta(hours=min(max(hours, minimum), 24 * 30))
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 MEDIA_SUFFIXES = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv"}
 ARCHIVE_SUFFIXES = {".rar", ".zip", ".7z"}
 
@@ -343,6 +368,8 @@ def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
     links = tracking["links"]
     processed = tracking["processed"]
     event = tracking["event"]
+    if event and event["state"] == "failed" and event.get("detail") == UNRESOLVED_DISCOVERY_DETAIL and not files and not links:
+        state = "failed"
     if not files and links and not unavailable:
         state = "download_complete" if all(link["finished"] for link in links) else "queued"
     if any(link["kind"] == "archive" for link in links):
@@ -407,7 +434,8 @@ def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
                                         if item["state"] == "completed"), None),
         "completed_at": (event["occurred_at"].isoformat() if event and event["state"] == "completed"
                          and event.get("occurred_at") else None),
-        "failure": next((item["error"] for item in processed if item["state"] == "failed"), None),
+        "failure": next((item["error"] for item in processed if item["state"] == "failed"), None)
+                   or (event.get("detail") if event and state == "failed" else None),
         "cleanup_eligible": False,
         "cleanup_reason": "JD2 link-only removal is disabled pending semantic verification",
         "jd2_entries_removed": bool(event and event["state"] == "jd2_entries_removed"),
@@ -419,7 +447,8 @@ def _summary(row: dict, files: list[dict], *, unavailable: bool = False,
 
 def _query_job_files(job_ids: list[int], *, include_packages: bool = False,
                      known_link_jobs: dict[str, int | None] | None = None,
-                     discover_job_ids: list[int] | None = None) -> tuple[dict[int, list[dict]], bool]:
+                     discover_job_ids: list[int] | None = None,
+                     require_complete_ownership: bool = False) -> tuple[dict[int, list[dict]], bool]:
     by_job = {job_id: {} for job_id in job_ids}
     package_by_file = {}
     unclaimed_downloads: dict[str, dict] = {}
@@ -495,7 +524,9 @@ def _query_job_files(job_ids: list[int], *, include_packages: bool = False,
                 if link.get("packageUUID") is not None:
                     package_by_file[(job_id, key)] = link["packageUUID"]
         except jd2.JDownloaderError:
-            pass  # Unavailable positive evidence leaves links unassociated.
+            if require_complete_ownership:
+                raise  # A failed ownership probe cannot certify an empty inventory.
+            pass  # Keep existing live status for links whose ownership is known.
     if include_packages:
         package_ids = list(dict.fromkeys(package_by_file.values()))
         if package_ids:
@@ -727,15 +758,111 @@ def refresh_link_inventory():
             job_ids, include_packages=True, known_link_jobs=ownership,
             discover_job_ids=_discovery_jobs(batch))
         if truncated:
+            # A large job can exhaust the shared 1,000-link page cap and hide
+            # another job's empty result. Probe only old, linkless jobs on their
+            # own; each probe has the same fixed page bound. A truncated or
+            # failed individual probe cannot advance the empty clock.
+            eligible = []
+            grace = _discovery_duration("REMIHUB_JD2_EMPTY_DISCOVERY_HOURS", 168, 1)
+            now = datetime.now(timezone.utc)
+            for row in batch:
+                requested = row.get("requested_at")
+                if (row["submission_outcome"] == "succeeded" and row["needs_discovery"]
+                        and isinstance(requested, datetime) and now - _utc(requested) >= grace):
+                    eligible.append(row)
+            for row in eligible:
+                try:
+                    checked, incomplete = _query_job_files(
+                        [row["jd2_job_id"]], include_packages=True, known_link_jobs=ownership,
+                        discover_job_ids=[row["jd2_job_id"]], require_complete_ownership=True)
+                except jd2.JDownloaderError:
+                    continue
+                if incomplete:
+                    continue
+                files = checked.get(row["jd2_job_id"], [])
+                if not files:
+                    try:
+                        files = _reconcile_empty_discovery(row, ownership)
+                    except jd2.JDownloaderError:
+                        continue
+                sync_link_inventory(row, files)
+                record = read_tracking(str(row["id"]))
+                merged, incomplete = _merge_observed_files(files, record["links"])
+                summary = _summary(row, merged, inventory_incomplete=incomplete, tracking=record)
+                record_request_lifecycle(str(row["id"]), summary["state"])
             continue
         for row in batch:
             files = files_by_job.get(row["jd2_job_id"], [])
+            if row["submission_outcome"] == "succeeded" and not files:
+                files = _reconcile_empty_discovery(row, ownership)
             sync_link_inventory(row, files)
             if row["submission_outcome"] is not None:
                 record = read_tracking(str(row["id"]))
                 merged, incomplete = _merge_observed_files(files, record["links"])
                 summary = _summary(row, merged, inventory_incomplete=incomplete, tracking=record)
                 record_request_lifecycle(str(row["id"]), summary["state"])
+
+
+def _reconcile_empty_discovery(row: dict, ownership: dict[str, int | None]) -> list[dict]:
+    """Bound an unresolvable empty job using two clean observations.
+
+    Empty query results cannot establish that a crawl finished or was a duplicate.
+    The existing monitor is the only caller; API reads never start the clock.
+    """
+    requested = row.get("requested_at")
+    if not isinstance(requested, datetime):
+        return []
+    now = datetime.now(timezone.utc)
+    grace = _discovery_duration("REMIHUB_JD2_EMPTY_DISCOVERY_HOURS", 168, 1)
+    confirmation = _discovery_duration("REMIHUB_JD2_EMPTY_CONFIRM_HOURS", 0.5, 1 / 12)
+    if now - _utc(requested) < grace:
+        return []
+    request_id = str(row["id"])
+    with _transaction() as cur:
+        cur.execute("SELECT id FROM public.plex_download_requests WHERE id = %s FOR UPDATE", (request_id,))
+        if cur.fetchone() is None:
+            return []
+        cur.execute("""SELECT EXISTS (SELECT 1 FROM public.plex_download_links WHERE request_id = %s),
+                              EXISTS (SELECT 1 FROM public.plex_download_files WHERE request_id = %s)""",
+                    (request_id, request_id))
+        has_links, has_files = cur.fetchone()
+        if has_links or has_files:
+            return []
+        cur.execute("""SELECT state, detail, occurred_at FROM public.plex_download_events
+                       WHERE request_id = %s AND file_id IS NULL ORDER BY id DESC LIMIT 1""", (request_id,))
+        event = cur.fetchone()
+        if event and event[0] in {"completed", "failed"}:
+            return []
+        if not event or event[0] != "discovering" or event[1] != EMPTY_DISCOVERY_DETAIL:
+            _append_request_event(cur, request_id, "discovering", EMPTY_DISCOVERY_DETAIL)
+            return []
+        if now - _utc(event[2]) < confirmation:
+            return []
+
+    # Recheck this job immediately before declaring it unresolved. An API error,
+    # incomplete page, or ownership uncertainty is not an empty observation.
+    checked, truncated = _query_job_files(
+        [row["jd2_job_id"]], include_packages=True, known_link_jobs=ownership,
+        discover_job_ids=[row["jd2_job_id"]], require_complete_ownership=True)
+    if truncated:
+        return []
+    files = checked.get(row["jd2_job_id"], [])
+    if files:
+        return files
+    with _transaction() as cur:
+        cur.execute("SELECT id FROM public.plex_download_requests WHERE id = %s FOR UPDATE", (request_id,))
+        if cur.fetchone() is None:
+            return []
+        cur.execute("""SELECT EXISTS (SELECT 1 FROM public.plex_download_links WHERE request_id = %s),
+                              EXISTS (SELECT 1 FROM public.plex_download_files WHERE request_id = %s)""",
+                    (request_id, request_id))
+        if any(cur.fetchone()):
+            return []
+        cur.execute("""SELECT state, detail FROM public.plex_download_events
+                       WHERE request_id = %s AND file_id IS NULL ORDER BY id DESC LIMIT 1""", (request_id,))
+        if cur.fetchone() == ("discovering", EMPTY_DISCOVERY_DETAIL):
+            _append_request_event(cur, request_id, "failed", UNRESOLVED_DISCOVERY_DETAIL)
+    return []
 
 
 def read_tracking(request_id: str) -> dict:
@@ -767,6 +894,16 @@ def _append_request_event(cur, request_id: str, state: str, detail: str | None =
 
 def record_request_lifecycle(request_id: str, state: str):
     with _transaction() as cur:
+        cur.execute("SELECT id FROM public.plex_download_requests WHERE id = %s FOR UPDATE", (request_id,))
+        if cur.fetchone() is None:
+            return
+        cur.execute("""SELECT state, detail FROM public.plex_download_events
+                       WHERE request_id = %s AND file_id IS NULL ORDER BY id DESC LIMIT 1""", (request_id,))
+        latest = cur.fetchone()
+        if latest == (state, EMPTY_DISCOVERY_DETAIL):
+            return
+        if latest == ("failed", UNRESOLVED_DISCOVERY_DETAIL) and state in {"discovering", "failed", "unavailable"}:
+            return
         _append_request_event(cur, request_id, state)
 
 
