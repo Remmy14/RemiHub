@@ -17,6 +17,15 @@ class JDownloaderError(Exception):
         self.ambiguous = ambiguous
 
 
+class JDownloaderProbeError(JDownloaderError):
+    """A sanitized reason for a failed, read-only local API probe."""
+
+    def __init__(self, reason: str, *, status_code: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status_code
+
+
 def _timeout() -> float:
     try:
         value = float(os.getenv("REMIHUB_JD2_TIMEOUT_SECONDS", "3"))
@@ -143,3 +152,34 @@ def get_version():
     if version is None or version == "":
         raise JDownloaderError("JDownloader API did not report a version")
     return version
+
+
+def probe_version() -> int:
+    """Check the observed local version resource without changing JD2 state."""
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(
+                f"{API_ROOT}/jd/version", timeout=_timeout(), allow_redirects=False,
+            )
+            if 300 <= response.status_code < 400:
+                raise JDownloaderProbeError("redirect")
+            if response.status_code != 200:
+                raise JDownloaderProbeError("http_error", status_code=response.status_code)
+            payload = response.json()
+    except requests.Timeout as exc:
+        raise JDownloaderProbeError("timeout") from exc
+    except requests.ConnectionError as exc:
+        raise JDownloaderProbeError("connection_failure") from exc
+    except requests.exceptions.InvalidURL as exc:
+        raise JDownloaderProbeError("protocol_error") from exc
+    except ValueError as exc:
+        raise JDownloaderProbeError("invalid_response") from exc
+    except requests.RequestException as exc:
+        raise JDownloaderProbeError("protocol_error") from exc
+
+    if (not isinstance(payload, dict) or payload.get("error") is not None
+            or not isinstance(payload.get("data"), int)
+            or isinstance(payload["data"], bool) or payload["data"] <= 0):
+        raise JDownloaderProbeError("invalid_response")
+    return payload["data"]

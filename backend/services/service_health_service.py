@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 from pathlib import Path
 import os
 import pwd
@@ -19,6 +20,9 @@ from backend.models.health_models import (
     HealthSystemdMetadata,
     ServiceHealthSnapshotResponse,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -1412,19 +1416,30 @@ def inspect_jdownloader_process() -> HealthDependencyCheck:
 
 def inspect_jdownloader_api() -> HealthDependencyCheck:
     try:
-        jd2.get_version()
-    except jd2.JDownloaderError:
+        jd2.probe_version()
+    except jd2.JDownloaderProbeError as exc:
+        logger.warning(
+            "JDownloader local API health probe failed: reason=%s status_code=%s",
+            exc.reason, exc.status_code,
+        )
+    except Exception as exc:
+        logger.warning(
+            "JDownloader local API health probe failed: reason=unexpected_error type=%s",
+            type(exc).__name__,
+        )
+    else:
         return HealthDependencyCheck(
             id="jdownloader-local-api", name="JDownloader Local API",
-            kind=HealthComponentKind.PROCESS, status=HealthStatus.DEGRADED,
-            message="JDownloader localhost API is unavailable",
-            expected="api_reachable", observed="unavailable",
+            kind=HealthComponentKind.PROCESS, status=HealthStatus.HEALTHY,
+            message="JDownloader localhost API is reachable",
+            expected="api_reachable", observed="reachable",
         )
+
     return HealthDependencyCheck(
         id="jdownloader-local-api", name="JDownloader Local API",
-        kind=HealthComponentKind.PROCESS, status=HealthStatus.HEALTHY,
-        message="JDownloader localhost API is reachable",
-        expected="api_reachable", observed="reachable",
+        kind=HealthComponentKind.PROCESS, status=HealthStatus.DEGRADED,
+        message="JDownloader localhost API is unavailable",
+        expected="api_reachable", observed="unavailable",
     )
 
 

@@ -16,6 +16,72 @@ from backend.services import jdownloader_api_service as jd2, plex_service
 
 
 class JDownloaderClientTests(unittest.TestCase):
+    def probe_session(self, *, payload=None, status_code=200, failure=None):
+        response = Mock(status_code=status_code)
+        if isinstance(payload, Exception):
+            response.json.side_effect = payload
+        else:
+            response.json.return_value = payload
+        session = MagicMock()
+        session.__enter__.return_value = session
+        if failure is not None:
+            session.get.side_effect = failure
+        else:
+            session.get.return_value = response
+        return session
+
+    def test_version_probe_accepts_observed_response_and_reuses_client_settings(self):
+        session = self.probe_session(payload={"data": 48637})
+        with patch.object(requests, "Session", return_value=session), \
+             patch.object(jd2, "_timeout", return_value=2.5):
+            self.assertEqual(jd2.probe_version(), 48637)
+        self.assertFalse(session.trust_env)
+        session.get.assert_called_once_with(
+            "http://127.0.0.1:3128/jd/version", timeout=2.5,
+            allow_redirects=False,
+        )
+        session.post.assert_not_called()
+
+    def test_version_probe_classifies_connection_refused_and_timeout(self):
+        for failure, reason in (
+            (requests.ConnectionError("connection refused"), "connection_failure"),
+            (requests.Timeout("timed out"), "timeout"),
+        ):
+            with self.subTest(reason=reason):
+                session = self.probe_session(failure=failure)
+                with patch.object(requests, "Session", return_value=session):
+                    with self.assertRaises(jd2.JDownloaderProbeError) as caught:
+                        jd2.probe_version()
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertNotIn(str(failure), str(caught.exception))
+
+    def test_version_probe_rejects_malformed_and_unexpected_responses(self):
+        for payload in (
+            ValueError("malformed JSON"), {}, {"data": None},
+            {"data": "48637"}, {"data": True}, {"data": 0},
+            {"error": "bad", "data": 48637}, [48637],
+        ):
+            with self.subTest(payload=payload):
+                session = self.probe_session(payload=payload)
+                with patch.object(requests, "Session", return_value=session):
+                    with self.assertRaises(jd2.JDownloaderProbeError) as caught:
+                        jd2.probe_version()
+                self.assertEqual(caught.exception.reason, "invalid_response")
+
+    def test_version_probe_rejects_redirect_http_and_protocol_errors(self):
+        for session, reason, status in (
+            (self.probe_session(status_code=302), "redirect", None),
+            (self.probe_session(status_code=503), "http_error", 503),
+            (self.probe_session(failure=requests.exceptions.InvalidURL("bad URL")),
+             "protocol_error", None),
+        ):
+            with self.subTest(reason=reason, status=status):
+                with patch.object(requests, "Session", return_value=session):
+                    with self.assertRaises(jd2.JDownloaderProbeError) as caught:
+                        jd2.probe_version()
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(caught.exception.status_code, status)
+
     def test_queries_request_verified_optional_metadata(self):
         with patch.object(jd2, "_call", side_effect=[[], []]) as call:
             jd2.query_links("downloadsV2", [42])
@@ -789,16 +855,33 @@ class EndpointCompatibilityTests(unittest.TestCase):
 
 
 class JDownloaderHealthTests(unittest.TestCase):
-    @patch("backend.services.service_health_service.jd2.get_version", return_value="2.0")
-    def test_api_reachable(self, _get_version):
+    @patch("backend.services.service_health_service.jd2.probe_version", return_value=48637)
+    def test_api_reachable(self, probe):
         from backend.services import service_health_service as health
-        self.assertEqual(health.inspect_jdownloader_api().status.value, "healthy")
+        check = health.inspect_jdownloader_api()
+        self.assertEqual(check.status.value, "healthy")
+        self.assertEqual(check.observed, "reachable")
+        probe.assert_called_once_with()
 
-    @patch("backend.services.service_health_service.jd2.get_version",
-           side_effect=jd2.JDownloaderError("offline"))
-    def test_api_unavailable(self, _get_version):
+    @patch("backend.services.service_health_service.jd2.probe_version")
+    def test_api_unavailable_and_diagnostics_are_sanitized(self, probe):
         from backend.services import service_health_service as health
-        self.assertEqual(health.inspect_jdownloader_api().status.value, "degraded")
+        for error, reason in (
+            (jd2.JDownloaderProbeError("connection_failure"), "connection_failure"),
+            (jd2.JDownloaderProbeError("timeout"), "timeout"),
+            (jd2.JDownloaderProbeError("invalid_response"), "invalid_response"),
+            (jd2.JDownloaderProbeError("protocol_error"), "protocol_error"),
+            (RuntimeError("secret response content"), "unexpected_error"),
+        ):
+            with self.subTest(reason=reason):
+                probe.side_effect = error
+                with self.assertLogs(health.logger, level="WARNING") as logs:
+                    check = health.inspect_jdownloader_api()
+                self.assertEqual(check.status.value, "degraded")
+                self.assertEqual(check.observed, "unavailable")
+                self.assertEqual(check.message, "JDownloader localhost API is unavailable")
+                self.assertIn(f"reason={reason}", logs.output[0])
+                self.assertNotIn("secret response content", logs.output[0])
 
     def test_current_paths_and_enablement_target(self):
         from backend.services import service_health_service as health
