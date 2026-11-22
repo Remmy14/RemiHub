@@ -11,15 +11,24 @@ from backend.core.auth import require_admin_principal, require_current_principal
 from backend.models.finance_models import (
     FinanceAccountUpdate,
     FinanceHistoryPoint,
+    FinanceHealthResponse,
     FinanceSummary,
     ManualAccountCreate,
     ManualAccountPatch,
 )
 from backend.services import finance_service
+from backend.services import finance_health_service
 from backend.services import manual_finance_service as manual_service
 
 
 router = APIRouter(prefix="/finance", tags=["Finance"])
+
+
+@router.get("/preflight", response_model=FinanceHealthResponse,
+            dependencies=[Depends(require_admin_principal)])
+def get_preflight():
+    """Assess stored Finance evidence without collecting or changing data."""
+    return {"success": True, "data": finance_health_service.assess_finance_health()}
 
 
 def _manual_error(exc: Exception):

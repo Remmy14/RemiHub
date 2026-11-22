@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import re
 from typing import Literal
@@ -47,6 +47,62 @@ class FinanceAccountUpdate(BaseModel):
     asset_category: str | None = None
     display_name: str | None = None
     display_order: int | None = None
+
+
+HealthState = Literal["HEALTHY", "WARNING", "BLOCKED", "UNKNOWN"]
+ReadinessState = Literal["READY", "WARNING", "BLOCKED", "UNKNOWN"]
+FreshnessState = Literal["CURRENT", "STALE", "UNKNOWN"]
+
+
+class FinanceHealthIssue(BaseModel):
+    code: str
+    description: str
+    action: str | None = None
+
+
+class FinanceAccountHealth(BaseModel):
+    account_id: str
+    display_name: str
+    category: str | None = None
+    source_type: Literal["plaid", "manual", "vehicle", "valuation"]
+    included_in_net_worth: bool
+    health: HealthState
+    freshness: FreshnessState
+    last_successful_update: datetime | date | None = None
+    issues: list[FinanceHealthIssue]
+    explanation: str
+    recommended_action: str | None = None
+
+
+class FinanceHealthCounts(BaseModel):
+    healthy: int
+    warning: int
+    blocked: int
+    unknown: int
+
+
+class FinanceSnapshotReadiness(BaseModel):
+    readiness: ReadinessState
+    snapshot_month: date
+    blocking_conditions: list[FinanceHealthIssue]
+    warnings: list[FinanceHealthIssue]
+    explanation: str
+
+
+class FinanceHealthAssessment(BaseModel):
+    readiness: ReadinessState
+    assessed_at: datetime
+    data_as_of: datetime | None = None
+    sufficient_evidence: bool
+    counts: FinanceHealthCounts
+    actionable_issues: list[FinanceHealthIssue]
+    accounts: list[FinanceAccountHealth]
+    snapshot: FinanceSnapshotReadiness
+
+
+class FinanceHealthResponse(BaseModel):
+    success: Literal[True]
+    data: FinanceHealthAssessment
 
 
 MANUAL_CATEGORIES = frozenset({
