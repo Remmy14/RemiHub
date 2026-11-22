@@ -237,6 +237,36 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertFalse(self.store.notifications)
         self.assertTrue(any(row["active"] for row in self.store.issues.values()))
 
+    def test_cached_only_success_keeps_confirmed_item_auth_issue(self):
+        self.evidence = sample_evidence(snapshot=False)
+        item = self.evidence["items"][0]
+        item.update(connection_status="AUTH_REQUIRED", verification_outcome="AUTH_REQUIRED",
+                    verification_method="item_get", verification_attempted_at=NOW,
+                    verification_failure_at=NOW)
+        key = "plaid_connection:item-1:PLAID_REAUTH_REQUIRED"
+        self.run_monitor()
+        self.assertTrue(self.store.issues[key]["active"])
+
+        # The cached accounts/get check succeeded, but it did not verify Item
+        # status. Persistence retains the earlier confirmed authentication state.
+        item.update(verification_outcome="VERIFIED", verification_method="accounts_get",
+                    verification_attempted_at=NOW + timedelta(hours=1),
+                    verification_succeeded_at=NOW + timedelta(hours=1),
+                    inventory_status="AVAILABLE", available_account_ids=["plaid-1"])
+        assessment = health.assess_evidence(
+            self.evidence, now=NOW + timedelta(hours=1),
+            completeness_check=lambda _p, _v: [])
+        self.assertEqual(assessment["accounts"][0]["health"], "BLOCKED")
+        self.assertEqual(assessment["accounts"][0]["verification"]["connection_status"], "AUTH_REQUIRED")
+        self.run_monitor(NOW + timedelta(hours=1))
+        self.assertTrue(self.store.issues[key]["active"])
+
+        item.update(connection_status="VERIFIED", verification_method="item_get+accounts_get",
+                    verification_attempted_at=NOW + timedelta(hours=2),
+                    verification_succeeded_at=NOW + timedelta(hours=2))
+        self.run_monitor(NOW + timedelta(hours=2))
+        self.assertFalse(self.store.issues[key]["active"])
+
     def test_manual_issues_resolve_independently_and_reopen(self):
         self.evidence["manual"] = [{
             "id": "manual-1", "label": "Savings", "asset_category": "cash",
@@ -431,7 +461,18 @@ class FinanceMonitorTests(unittest.TestCase):
         self.evidence["snapshot"]["created_at"] = NOW - timedelta(days=9)
         self.evidence["items"][0]["last_success_at"] = NOW - timedelta(hours=1)
         self.run_monitor()
-        self.assertIn("PLAID_DATA_STALE", {row["code"] for row in self.store.issues.values()})
+        self.assertNotIn("PLAID_DATA_STALE", {row["code"] for row in self.store.issues.values()})
+
+    def test_legacy_stale_issue_closes_without_recovery_or_reminder(self):
+        key = "plaid:account-1:PLAID_DATA_STALE"
+        self.store.issues[key] = dict(issue_key=key, source_type="plaid",
+            source_id="account-1", code="PLAID_DATA_STALE", severity="warning",
+            active=True, occurrence=1, opened_at=NOW - timedelta(days=9),
+            last_seen_at=NOW - timedelta(days=1), resolved_at=None, notified=False)
+        self.run_monitor()
+        self.assertFalse(self.store.issues[key]["active"])
+        self.assertFalse(any(row["kind"] == "resolved" for row in self.store.events.values()))
+        self.assertFalse(self.store.notifications)
 
     def test_unverified_item_staleness_does_not_create_account_alert(self):
         self.evidence = sample_evidence(snapshot=False)
@@ -599,20 +640,37 @@ class FinanceMonitorTests(unittest.TestCase):
     def test_worker_checks_before_and_after_unchanged_snapshot_call(self):
         calls = []
         worker = health.worker
+        from backend.services import finance_verification_service as verification
 
         def snapshot(**_kwargs):
             calls.append("snapshot")
             return {"success": False, "skipped": False,
                     "snapshot_month": "2027-03-01", "status": "blocked_incomplete"}
 
-        with patch.object(monitor, "assess_and_notify",
+        with patch.object(verification, "verify_enabled_items",
+                          side_effect=lambda: calls.append("verify")), \
+             patch.object(monitor, "assess_and_notify",
                           side_effect=lambda **kwargs: calls.append(
                               "post" if kwargs.get("after_collection") else "pre")), \
              patch.object(worker, "create_monthly_finance_snapshot", side_effect=snapshot), \
              patch.object(worker.time, "sleep", side_effect=StopIteration):
             with self.assertRaises(StopIteration):
                 worker.run_finance_worker()
-        self.assertEqual(calls, ["pre", "snapshot", "post"])
+        self.assertEqual(calls, ["verify", "pre", "snapshot", "post"])
+
+    def test_failed_verification_does_not_block_snapshot(self):
+        calls = []
+        worker = health.worker
+        from backend.services import finance_verification_service as verification
+        with patch.object(verification, "verify_enabled_items", side_effect=RuntimeError("offline")), \
+             patch.object(monitor, "assess_and_notify", return_value=False), \
+             patch.object(worker, "create_monthly_finance_snapshot",
+                          side_effect=lambda **_kwargs: calls.append("snapshot") or
+                          {"success": False, "skipped": False, "status": "blocked_incomplete"}), \
+             patch.object(worker.time, "sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                worker.run_finance_worker()
+        self.assertEqual(calls, ["snapshot"])
 
     def test_existing_snapshot_notice_targets_admin_without_amount(self):
         worker = health.worker
@@ -646,7 +704,7 @@ class FinanceConnectionOwnershipTests(unittest.TestCase):
              patch.object(health, "_read_rows", side_effect=rows):
             evidence = health.read_evidence(conn=conn)
         self.assertFalse(evidence["errors"])
-        self.assertEqual(used, [conn] * 4)
+        self.assertEqual(used, [conn] * 5)
 
     def test_evidence_failure_on_owned_transaction_propagates(self):
         with patch.object(health.finance_service, "get_finance_accounts",

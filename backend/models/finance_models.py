@@ -60,6 +60,19 @@ class FinanceHealthIssue(BaseModel):
     action: str | None = None
 
 
+class FinanceConnectionVerification(BaseModel):
+    connection_status: Literal["VERIFIED", "AUTH_REQUIRED", "UNKNOWN"]
+    inventory_status: Literal["AVAILABLE", "MISSING", "UNKNOWN"]
+    item_inventory_status: Literal["AVAILABLE", "MISSING", "UNKNOWN"] = "UNKNOWN"
+    attempted_at: datetime | None = None
+    succeeded_at: datetime | None = None
+    method: str | None = None
+    outcome: Literal["VERIFIED", "AUTH_REQUIRED", "TRANSIENT", "UNKNOWN"]
+    live_balance_tested: bool
+    cached_balance_status: Literal["VALID", "INVALID", "UNKNOWN"]
+    collection_readiness: Literal["CACHED_INVENTORY_AVAILABLE", "BLOCKED", "UNKNOWN"]
+
+
 class FinanceAccountHealth(BaseModel):
     account_id: str
     display_name: str
@@ -69,6 +82,8 @@ class FinanceAccountHealth(BaseModel):
     health: HealthState
     freshness: FreshnessState
     last_successful_update: datetime | date | None = None
+    last_monthly_balance_collection: datetime | None = None
+    verification: FinanceConnectionVerification | None = None
     issues: list[FinanceHealthIssue]
     explanation: str
     recommended_action: str | None = None

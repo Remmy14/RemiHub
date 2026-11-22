@@ -37,6 +37,13 @@ HISTORICAL_MIGRATIONS = [
 
 
 class MigrationDiscoveryTests(unittest.TestCase):
+    def test_finance_connection_verification_migration_passes_deployment_policy(self):
+        up = MIGRATIONS_DIR / "0026_finance_connection_verification.up.sql"
+        down = MIGRATIONS_DIR / "0026_finance_connection_verification.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
     def test_adventures_migration_passes_deployment_policy(self):
         up = MIGRATIONS_DIR / "0023_adventures_foundation.up.sql"
         down = MIGRATIONS_DIR / "0023_adventures_foundation.down.sql"
@@ -73,14 +80,20 @@ class MigrationDiscoveryTests(unittest.TestCase):
             [migration.version for migration in migrations],
             sorted(migration.version for migration in migrations),
         )
-        latest = migrations[-1]
-        self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
-        self.assertIsNotNone(latest.down_path)
-        self.assertEqual((latest.version, latest.name), ("0025", "finance_health_monitor"))
-        self.assertEqual(latest.up_path.name, "0025_finance_health_monitor.up.sql")
-        self.assertEqual(latest.down_path.name, "0025_finance_health_monitor.down.sql")
-        self.assertTrue(latest.up_path.is_file())
-        self.assertTrue(latest.down_path.is_file())
+        self.assertGreater(migrations[-1].version, HISTORICAL_MIGRATIONS[-1][0])
+        by_version = {migration.version: migration for migration in migrations}
+        for version, name in (("0025", "finance_health_monitor"),
+                              ("0026", "finance_connection_verification")):
+            with self.subTest(version=version):
+                migration = by_version[version]
+                self.assertEqual(migration.name, name)
+                self.assertEqual(migration.up_path.name, f"{version}_{name}.up.sql")
+                self.assertIsNotNone(migration.down_path)
+                self.assertEqual(migration.down_path.name, f"{version}_{name}.down.sql")
+                self.assertTrue(migration.up_path.is_file())
+                self.assertTrue(migration.down_path.is_file())
+        self.assertLess([migration.version for migration in migrations].index("0025"),
+                        [migration.version for migration in migrations].index("0026"))
         rollback_sql = (MIGRATIONS_DIR / "0021_agent_codex_usage.down.sql").read_text(encoding="utf-8")
         self.assertIn("DROP TABLE IF EXISTS agent.codex_quota_snapshots", rollback_sql)
         self.assertIn("DROP TABLE IF EXISTS agent.codex_stage_configuration", rollback_sql)

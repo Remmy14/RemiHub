@@ -19,9 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Defaults are intentionally source-specific. Existing Finance INI configuration
 # can override them without requiring new settings or a migration.
-DEFAULT_FRESHNESS_DAYS = {"plaid": 7, "manual": 90, "vehicle": 180}
+DEFAULT_FRESHNESS_DAYS = {"manual": 90, "vehicle": 180}
 CONFIG_KEYS = {
-    "plaid": "health_plaid_freshness_days",
     "manual": "health_manual_review_days",
     "vehicle": "health_vehicle_review_days",
 }
@@ -55,8 +54,15 @@ def read_evidence(*, conn=None) -> dict:
     sources = {
         "accounts": lambda: finance_service.get_finance_accounts(conn=conn),
         "items": lambda: _read_rows("""
-            SELECT id, label, enabled, last_success_at, last_error
-            FROM finance_plaid_items
+            SELECT i.id, i.label, i.enabled, i.last_success_at, i.last_error,
+                   i.updated_at, v.attempted_at AS verification_attempted_at,
+                   v.succeeded_at AS verification_succeeded_at,
+                   v.method AS verification_method, v.outcome AS verification_outcome,
+                   v.connection_status, v.inventory_status,
+                   v.available_account_ids, v.missing_account_ids, v.invalid_balance_ids,
+                   v.failure_at AS verification_failure_at, v.live_balance_tested
+            FROM finance_plaid_items i
+            LEFT JOIN public.finance_plaid_verification v ON v.plaid_item_id = i.id::text
         """, conn=conn),
         "manual": lambda: _read_rows("""
             SELECT id, label, asset_category, current_value, as_of_date,
@@ -66,6 +72,15 @@ def read_evidence(*, conn=None) -> dict:
         "snapshot": lambda: _read_rows("""
             SELECT id, snapshot_month, status, created_at
             FROM finance_snapshots ORDER BY snapshot_month DESC LIMIT 1
+        """, conn=conn),
+        "last_collections": lambda: _read_rows("""
+            SELECT DISTINCT ON (si.source_account_id) si.source_account_id,
+                   s.created_at AS collected_at, s.snapshot_month AS collected_month
+            FROM finance_snapshot_items si
+            JOIN finance_snapshots s ON s.id = si.snapshot_id
+            WHERE si.source = 'plaid' AND s.status = 'success'
+              AND si.include_in_net_worth = true
+            ORDER BY si.source_account_id, s.created_at DESC
         """, conn=conn),
     }
     for name, load in sources.items():
@@ -140,7 +155,7 @@ def _date(value) -> date | None:
 
 def _result(*, identifier: str, name: str, category: str | None, source: str,
             included: bool, health: str, freshness: str, last_update,
-            issues: list[dict]) -> dict:
+            issues: list[dict], verification: dict | None = None) -> dict:
     return {
         "account_id": identifier, "display_name": name, "category": category,
         "source_type": source, "included_in_net_worth": included,
@@ -148,6 +163,8 @@ def _result(*, identifier: str, name: str, category: str | None, source: str,
         "last_successful_update": last_update, "issues": issues,
         "explanation": issues[0]["description"] if issues else "Available evidence is current and no known issue exists.",
         "recommended_action": next((issue["action"] for issue in issues if issue["action"]), None),
+        "last_monthly_balance_collection": last_update if source == "plaid" else None,
+        "verification": verification,
     }
 
 
@@ -208,6 +225,8 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
     items = evidence.get("items")
     accounts = evidence.get("accounts")
     manual = evidence.get("manual")
+    last_collections = {row.get("source_account_id"): row
+                        for row in evidence.get("last_collections") or []}
     enabled_by_label: dict[str, list[dict]] = {}
     for item in items or []:
         if item.get("enabled"):
@@ -225,31 +244,93 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
         included = bool(account.get("include_in_net_worth"))
         matches = enabled_by_label.get(account.get("institution_label"), [])
         connection = matches[0] if len(matches) == 1 else None
-        connection_success = _datetime(connection.get("last_success_at")) if connection else None
-        last_success = None
+        collection = last_collections.get(account.get("source_account_id"))
+        last_success = _datetime(collection.get("collected_at")) if collection else None
+        collected_month = _date(collection.get("collected_month")) if collection else None
         if snapshot_success and account.get("source_account_id") in plaid_snapshot and snapshot_created:
             # The successful snapshot proves this account was collected, even
             # when legacy item metadata has no per-connection timestamp.
             last_success = snapshot_created
-        # An item can succeed during discovery while a specific included
-        # account has not supplied a usable balance. Item success therefore
-        # cannot make account freshness CURRENT. It can only establish that
-        # the connection itself is stale when no account proof exists.
-        if last_success:
-            freshness = "STALE" if now - last_success > timedelta(days=policy["plaid"]) else "CURRENT"
-        elif connection_success and now - connection_success > timedelta(days=policy["plaid"]):
-            freshness = "STALE"
-        else:
-            freshness = "UNKNOWN"
+            collected_month = month
+        # Monthly collection age is information, not an actionable failure.
+        freshness = ("CURRENT" if collected_month == month else "STALE") if last_success else "UNKNOWN"
+        # Cached inventory cannot resolve a confirmed collection login error.
+        collection_auth_error = bool(connection and "ITEM_LOGIN_REQUIRED" in str(connection.get("last_error") or "").upper())
+        item_status_cleared_auth = bool(
+            connection and connection.get("verification_outcome") == "VERIFIED" and
+            connection.get("connection_status") == "VERIFIED" and
+            "item_get" in str(connection.get("verification_method") or "") and
+            _datetime(connection.get("verification_succeeded_at")) and
+            _datetime(connection.get("updated_at")) and
+            _datetime(connection.get("verification_succeeded_at")) > _datetime(connection.get("updated_at"))
+        )
+        unresolved_auth_error = collection_auth_error and not item_status_cleared_auth
+        verification = None
+        if connection:
+            account_id = account.get("source_account_id")
+            available_ids = connection.get("available_account_ids") or []
+            missing_ids = connection.get("missing_account_ids") or []
+            invalid_cached_balance = account_id in (connection.get("invalid_balance_ids") or [])
+            transient = connection.get("verification_outcome") == "TRANSIENT"
+            attempted = _datetime(connection.get("verification_attempted_at"))
+            expired = bool(attempted and now - attempted > timedelta(hours=12))
+            item_inventory_status = ("UNKNOWN" if (transient or expired) and connection.get("inventory_status") == "AVAILABLE"
+                                     else connection.get("inventory_status") or "UNKNOWN")
+            account_inventory_status = ("MISSING" if account_id in missing_ids else
+                                        "AVAILABLE" if not (transient or expired) and
+                                        connection.get("verification_outcome") == "VERIFIED" and
+                                        account_id in available_ids else "UNKNOWN")
+            collection_cleared_auth = bool(
+                connection.get("connection_status") == "AUTH_REQUIRED" and
+                not connection.get("last_error") and attempted and
+                _datetime(connection.get("last_success_at")) and
+                _datetime(connection.get("last_success_at")) > attempted)
+            verification = {
+                "connection_status": ("AUTH_REQUIRED" if unresolved_auth_error else
+                                      "UNKNOWN" if collection_cleared_auth else
+                                      "UNKNOWN" if (transient or expired) and connection.get("connection_status") == "VERIFIED"
+                                      else connection.get("connection_status") or "UNKNOWN"),
+                "inventory_status": account_inventory_status,
+                "item_inventory_status": item_inventory_status,
+                "attempted_at": connection.get("verification_attempted_at"),
+                "succeeded_at": connection.get("verification_succeeded_at"),
+                "method": connection.get("verification_method"),
+                "outcome": connection.get("verification_outcome") or "UNKNOWN",
+                "live_balance_tested": bool(connection.get("live_balance_tested")),
+                "collection_readiness": "UNKNOWN",
+                "cached_balance_status": ("INVALID" if invalid_cached_balance
+                                          else "VALID" if not expired and connection.get("verification_outcome") == "VERIFIED"
+                                          and account_inventory_status == "AVAILABLE" else "UNKNOWN"),
+            }
+            if (verification["connection_status"] != "AUTH_REQUIRED" and
+                    verification["inventory_status"] == "AVAILABLE" and
+                    verification["cached_balance_status"] == "VALID"):
+                verification["collection_readiness"] = "CACHED_INVENTORY_AVAILABLE"
+            elif (verification["connection_status"] == "AUTH_REQUIRED" or
+                  verification["inventory_status"] == "MISSING" or
+                  verification["cached_balance_status"] == "INVALID"):
+                verification["collection_readiness"] = "BLOCKED"
         issues = []
-        health = "HEALTHY"
+        health = "UNKNOWN"
         if included and items is not None and not matches:
             issues.append(_issue("PLAID_CONNECTION_MISSING", "Required account has no enabled Plaid connection.", "Review missing account or reconnect the institution."))
             health = "BLOCKED"
         elif len(matches) > 1 or not account.get("source_account_id") or not account.get("institution_label"):
             issues.append(_issue("PLAID_OWNERSHIP_UNKNOWN", "Account connection ownership cannot be established.", "Review account inventory."))
             health = "UNKNOWN"
-        elif connection and connection.get("last_error"):
+        elif connection and verification["connection_status"] == "AUTH_REQUIRED":
+            issues.append(_issue("PLAID_REAUTH_REQUIRED", "Plaid connection requires reauthorization.", "Reauthorize Plaid connection."))
+            health = "BLOCKED" if included else "WARNING"
+        elif connection and account.get("source_account_id") in (connection.get("missing_account_ids") or []):
+            issues.append(_issue("PLAID_ACCOUNT_MISSING", "Required account was absent from verified cached inventory.", "Review missing account."))
+            health = "BLOCKED" if included else "WARNING"
+        elif connection and account.get("source_account_id") in (connection.get("invalid_balance_ids") or []):
+            issues.append(_issue("PLAID_BALANCE_MISSING", "Required account has an invalid cached balance.", "Review balance collection."))
+            health = "BLOCKED" if included else "WARNING"
+        elif connection and connection.get("last_error") and (
+                not connection.get("verification_attempted_at") or
+                (_datetime(connection.get("updated_at")) is not None and
+                 _datetime(connection.get("updated_at")) > _datetime(connection.get("verification_attempted_at")))):
             # The stored field is free-form text; expose only a safe classification.
             if "ITEM_LOGIN_REQUIRED" in str(connection["last_error"]).upper():
                 issues.append(_issue("PLAID_REAUTH_REQUIRED", "Plaid connection requires reauthorization.", "Reauthorize Plaid connection."))
@@ -271,28 +352,25 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
                 except ValueError:
                     issues.append(_issue("PLAID_BALANCE_MISSING", "Required account balance is missing or invalid.", "Refresh account data."))
                     health = "BLOCKED"
-        elif health == "HEALTHY" and account.get("source_account_id") not in plaid_snapshot:
-            issues.append(_issue("PLAID_ACCOUNT_UNVERIFIED", "Stored data does not verify this account's current balance or presence.", "Refresh account data when available."))
-            health = "UNKNOWN"
-        if freshness == "STALE":
-            description = ("Verified account collection is older than its freshness policy."
-                           if last_success else "Plaid connection has not succeeded within its freshness policy.")
-            issues.append(_issue("PLAID_DATA_STALE", description, "Refresh account data."))
-            if health == "HEALTHY" or (health == "UNKNOWN" and
-                                       all(issue["code"] == "PLAID_ACCOUNT_UNVERIFIED" for issue in issues[:-1])):
-                health = "WARNING"
-        elif freshness == "UNKNOWN" and health == "HEALTHY":
-            issues.append(_issue("PLAID_FRESHNESS_UNKNOWN", "Account collection freshness cannot be established from stored evidence.", "Review connection history."))
-            health = "UNKNOWN"
+        if health == "UNKNOWN" and not issues and connection:
+            if (verification["connection_status"] == "VERIFIED" and
+                    verification["inventory_status"] == "AVAILABLE" and
+                    verification["outcome"] == "VERIFIED" and
+                    account.get("source_account_id") not in (connection.get("invalid_balance_ids") or []) and
+                    account.get("source_account_id") in (connection.get("available_account_ids") or [])):
+                health = "HEALTHY"
+            else:
+                issues.append(_issue("PLAID_VERIFICATION_UNKNOWN", "Connection or account availability has not been verified.", None))
         if health == "BLOCKED" and included:
             blockers.extend(issue for issue in issues if issue["code"] in {
                 "PLAID_CONNECTION_MISSING", "PLAID_REAUTH_REQUIRED", "PLAID_ACCOUNT_MISSING", "PLAID_BALANCE_MISSING"})
         elif health in ("WARNING", "UNKNOWN"):
-            warnings.extend(issues)
+            warnings.extend(issue for issue in issues if issue["code"] != "PLAID_VERIFICATION_UNKNOWN")
         results.append(_result(identifier=identifier, name=name,
                                category=account.get("asset_category") or account.get("type"),
                                source="plaid", included=included, health=health,
-                               freshness=freshness, last_update=last_success, issues=issues))
+                               freshness=freshness, last_update=last_success, issues=issues,
+                               verification=verification))
 
     for asset in manual or []:
         identifier = str(asset.get("id") or "unknown-manual-account")

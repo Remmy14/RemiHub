@@ -25,7 +25,7 @@ CRITICAL_CODES = frozenset({
     "MANUAL_VALUE_MISSING", "VALUATION_VALUE_MISSING",
 })
 WARNING_CODES = frozenset({
-    "PLAID_DATA_STALE", "MANUAL_REVIEW_DUE", "VALUATION_FALLBACK_INVALID",
+    "MANUAL_REVIEW_DUE", "VALUATION_FALLBACK_INVALID",
 })
 
 
@@ -99,9 +99,6 @@ def _actionable(assessment: dict, evidence: dict) -> dict[str, dict]:
             code = issue["code"]
             if code not in CRITICAL_CODES | WARNING_CODES:
                 continue
-            if code == "PLAID_DATA_STALE" and not account["last_successful_update"]:
-                # Item-wide Plaid success is not account collection evidence.
-                continue
             source_type = account["source_type"]
             source_id = str(account["account_id"])
             if code == "PLAID_REAUTH_REQUIRED":
@@ -124,6 +121,9 @@ def _verified_resolution(issue: dict, assessment: dict, evidence: dict) -> tuple
     Another issue on the same account must neither prevent a confirmed fix nor
     make an uncertain condition look recovered. Exclusion closes silently.
     """
+    if issue["code"] == "PLAID_DATA_STALE":
+        # Retired age policy; this does not imply collection recovery.
+        return True, False
     if issue["source_type"] == "plaid_connection":
         connection = next((row for row in evidence.get("items") or []
                            if str(row.get("id")) == issue["source_id"]), None)
@@ -167,6 +167,10 @@ def _verified_resolution(issue: dict, assessment: dict, evidence: dict) -> tuple
                         } for problem in account["issues"])):
                     return True, False
             return True, True
+        if connection.get("connection_status") == "VERIFIED":
+            verified_at = finance_health_service._datetime(connection.get("verification_succeeded_at"))
+            if verified_at and verified_at > issue["opened_at"]:
+                return True, True
         success = finance_health_service._datetime(connection.get("last_success_at"))
         return bool(not connection.get("last_error") and success and
                     success > issue["opened_at"]), True
@@ -204,8 +208,21 @@ def _verified_resolution(issue: dict, assessment: dict, evidence: dict) -> tuple
         return True, True
     if code == "MANUAL_REVIEW_DUE":
         return account["freshness"] == "CURRENT", True
-    if code in {"PLAID_ACCOUNT_MISSING", "PLAID_BALANCE_MISSING",
-                "PLAID_DATA_STALE", "VALUATION_VALUE_MISSING"}:
+    if code in {"PLAID_ACCOUNT_MISSING", "PLAID_BALANCE_MISSING"} and account.get("verification"):
+        verified = account["verification"]
+        success = finance_health_service._datetime(verified.get("succeeded_at"))
+        owner = next((row for row in evidence.get("accounts") or []
+                      if str(row.get("id")) == issue["source_id"]), None)
+        connection = next((row for row in evidence.get("items") or []
+                           if owner and row.get("enabled") and
+                           row.get("label") == owner.get("institution_label")), None)
+        account_id = owner.get("source_account_id") if owner else None
+        recovered = bool(connection and account_id in (connection.get("available_account_ids") or [])
+                         and (code == "PLAID_ACCOUNT_MISSING" or
+                              account_id not in (connection.get("invalid_balance_ids") or [])))
+        if recovered and verified.get("outcome") == "VERIFIED" and success and success > issue["opened_at"]:
+            return True, True
+    if code in {"PLAID_ACCOUNT_MISSING", "PLAID_BALANCE_MISSING", "VALUATION_VALUE_MISSING"}:
         last_update = finance_health_service._datetime(account.get("last_successful_update"))
         return bool(account["freshness"] == "CURRENT" and last_update
                     and last_update > issue["opened_at"]), True
@@ -225,7 +242,6 @@ ISSUE_CATEGORIES = {
     "MANUAL_VALUE_MISSING": "missing balances",
     "VALUATION_VALUE_MISSING": "missing valuations",
     "VALUATION_FALLBACK_INVALID": "missing valuations",
-    "PLAID_DATA_STALE": "stale collection evidence",
     "MANUAL_REVIEW_DUE": "manual account reviews",
 }
 
@@ -280,6 +296,13 @@ def _summary(assessment: dict, problems: dict) -> dict:
         "counts": assessment["counts"],
         "actionable_count": len(problems),
         "insufficient_evidence": assessment["readiness"] == "UNKNOWN",
+        "verification": [
+            {"account_id": row["account_id"], **{
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in row["verification"].items()}}
+            for row in assessment["accounts"]
+            if row["source_type"] == "plaid" and row.get("verification")
+        ],
     }
 
 

@@ -1538,6 +1538,12 @@ def run_finance_worker():
     logger.info("Starting Finance Worker")
 
     while True:
+        try:
+            from backend.services.finance_verification_service import verify_enabled_items
+            verify_enabled_items()
+        except Exception:
+            logger.exception("Finance lightweight verification failed")
+
         # Monitoring uses stored evidence and New York calendar dates. The
         # snapshot below intentionally retains its existing server-local date.
         try:
