@@ -76,9 +76,9 @@ class MigrationDiscoveryTests(unittest.TestCase):
         latest = migrations[-1]
         self.assertGreater(latest.version, HISTORICAL_MIGRATIONS[-1][0])
         self.assertIsNotNone(latest.down_path)
-        self.assertEqual((latest.version, latest.name), ("0024", "autographs_v2"))
-        self.assertEqual(latest.up_path.name, "0024_autographs_v2.up.sql")
-        self.assertEqual(latest.down_path.name, "0024_autographs_v2.down.sql")
+        self.assertEqual((latest.version, latest.name), ("0025", "finance_health_monitor"))
+        self.assertEqual(latest.up_path.name, "0025_finance_health_monitor.up.sql")
+        self.assertEqual(latest.down_path.name, "0025_finance_health_monitor.down.sql")
         self.assertTrue(latest.up_path.is_file())
         self.assertTrue(latest.down_path.is_file())
         rollback_sql = (MIGRATIONS_DIR / "0021_agent_codex_usage.down.sql").read_text(encoding="utf-8")

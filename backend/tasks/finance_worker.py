@@ -1456,36 +1456,39 @@ def send_finance_snapshot_notification(result: dict) -> None:
         return
     snapshot_month = result.get("snapshot_month")
     status = result.get("status")
-    net_worth = result.get("net_worth")
     errors = result.get("errors") or []
-
-    try:
-        net_worth_text = f"${float(net_worth):,.2f}"
-    except (TypeError, ValueError):
-        net_worth_text = "unknown"
 
     if status == "partial_success":
         title = "Monthly Finance Snapshot Created with Warnings"
         body = (
             f"New snapshot for {snapshot_month} is available. "
-            f"Net worth: {net_worth_text}. "
             f"{len(errors)} account update issue(s) occurred."
         )
     else:
         title = "New Monthly Finance Snapshot Available"
-        body = (
-            f"New snapshot for {snapshot_month} is available. "
-            f"Net worth: {net_worth_text}."
-        )
+        body = f"New snapshot for {snapshot_month} is available."
 
-    notice = Notification(
-        title=title,
-        body=body,
-        module="Finance",
-    )
-
-    logger.info("Sending finance notification: %s - %s", notice.title, notice.body)
-    insert_notification(notice)
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM public.remihub_users
+                WHERE role = 'admin' AND is_active = true ORDER BY id
+            """)
+            recipients = [str(row[0]) for row in cur.fetchall()]
+        for user_id in recipients:
+            insert_notification(Notification(
+                title=title, body=body, module="Finance",
+                data={"type": "finance_snapshot", "action": "view_finance",
+                      "destination": "finance", "user_id": user_id,
+                      "snapshot_month": str(snapshot_month)},
+            ), conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
 
 def preview_monthly_finance_snapshot_items() -> str:
     plaid_items, plaid_errors = collect_plaid_snapshot_items()
@@ -1535,6 +1538,14 @@ def run_finance_worker():
     logger.info("Starting Finance Worker")
 
     while True:
+        # Monitoring uses stored evidence and New York calendar dates. The
+        # snapshot below intentionally retains its existing server-local date.
+        try:
+            from backend.services.finance_monitor_service import assess_and_notify
+            assess_and_notify()
+        except Exception:
+            logger.exception("Finance pre-collection health assessment failed")
+
         try:
             now = datetime.now()
             logger.info("Checking finance snapshot status for %s", now.date())
@@ -1574,6 +1585,15 @@ def run_finance_worker():
 
         except Exception as exc:
             logger.exception("Error running finance worker: %s", exc)
+
+        # Collection writers commit their item errors and snapshot results
+        # independently. A changed evidence fingerprint permits a same-day
+        # follow-up even if the collection failed or raised.
+        try:
+            from backend.services.finance_monitor_service import assess_and_notify
+            assess_and_notify(after_collection=True)
+        except Exception:
+            logger.exception("Finance post-collection health assessment failed")
 
         # Safe to check periodically because create_monthly_finance_snapshot()
         # is idempotent for the current month when force=False.

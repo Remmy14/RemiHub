@@ -97,7 +97,7 @@ class FinanceRouterContractTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(finance.router, dependencies=[Depends(get_current_principal)])
         expected = {
-            ("/finance/preflight", "GET"),
+            ("/finance/preflight", "GET"), ("/finance/monitoring", "GET"),
             ("/finance/summary", "GET"), ("/finance/history", "GET"),
             ("/finance/accounts", "GET"), ("/finance/accounts/{account_id}", "PATCH"),
             ("/finance/manual-accounts", "GET"), ("/finance/manual-accounts", "POST"),
@@ -111,11 +111,12 @@ class FinanceRouterContractTests(unittest.TestCase):
             for method in route.methods & {"GET", "POST", "PATCH"}:
                 actual.add((route.path, method))
             dependencies = {dependency.call for dependency in route.dependant.dependencies}
-            guard = require_admin_principal if ("/manual-accounts" in route.path or route.path == "/finance/preflight") else require_current_principal
+            guard = require_admin_principal if ("/manual-accounts" in route.path or route.path in {"/finance/preflight", "/finance/monitoring"}) else require_current_principal
             self.assertIn(guard, dependencies, route.path)
         self.assertEqual(actual, expected)
         schema = app.openapi()
         self.assertEqual(schema["paths"]["/finance/summary"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/FinanceSummary")
+        self.assertEqual(schema["paths"]["/finance/monitoring"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/FinanceMonitorResponse")
         self.assertIn("ManualAccountCreate", schema["components"]["schemas"])
         self.assertIn("ManualAccountPatch", schema["components"]["schemas"])
 

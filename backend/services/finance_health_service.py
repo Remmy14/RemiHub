@@ -168,7 +168,8 @@ def _worker_account_failure(connection: dict, account_id: str | None) -> dict | 
 
 
 def assess_evidence(evidence: dict, *, now: datetime | None = None,
-                    config: dict | None = None, completeness_check=None) -> dict:
+                    config: dict | None = None, completeness_check=None,
+                    calendar_date: date | None = None) -> dict:
     """Classify supplied stored evidence. Safe for callers outside HTTP.
 
     `completeness_check` is the worker's existing read-only completeness
@@ -180,7 +181,8 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
     now = now.astimezone(timezone.utc)
     policy = _policy(config)
     completeness_check = completeness_check or worker._complete_snapshot_items
-    month = worker.get_snapshot_month(now.date())
+    assessment_date = calendar_date or now.date()
+    month = worker.get_snapshot_month(assessment_date)
     snapshot = evidence.get("snapshot")
     snapshot_current = bool(snapshot and _date(snapshot.get("snapshot_month")) == month)
     snapshot_success = snapshot_current and snapshot.get("status") == "success"
@@ -285,7 +287,7 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
         identifier = str(asset.get("id") or "unknown-manual-account")
         source = "vehicle" if asset.get("asset_category") == "vehicle" else "manual"
         as_of = _date(asset.get("as_of_date"))
-        freshness = "UNKNOWN" if as_of is None or as_of > now.date() else ("STALE" if (now.date() - as_of).days > policy[source] else "CURRENT")
+        freshness = "UNKNOWN" if as_of is None or as_of > assessment_date else ("STALE" if (assessment_date - as_of).days > policy[source] else "CURRENT")
         included = bool(asset.get("include_in_net_worth"))
         issues = []
         health = "HEALTHY"

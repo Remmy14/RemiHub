@@ -12,12 +12,14 @@ from backend.models.finance_models import (
     FinanceAccountUpdate,
     FinanceHistoryPoint,
     FinanceHealthResponse,
+    FinanceMonitorResponse,
     FinanceSummary,
     ManualAccountCreate,
     ManualAccountPatch,
 )
 from backend.services import finance_service
 from backend.services import finance_health_service
+from backend.services import finance_monitor_service
 from backend.services import manual_finance_service as manual_service
 
 
@@ -29,6 +31,13 @@ router = APIRouter(prefix="/finance", tags=["Finance"])
 def get_preflight():
     """Assess stored Finance evidence without collecting or changing data."""
     return {"success": True, "data": finance_health_service.assess_finance_health()}
+
+
+@router.get("/monitoring", response_model=FinanceMonitorResponse,
+            dependencies=[Depends(require_admin_principal)])
+def get_monitoring():
+    """Latest persisted automatic health assessment and bounded event history."""
+    return {"success": True, "data": finance_monitor_service.get_monitoring_status()}
 
 
 def _manual_error(exc: Exception):

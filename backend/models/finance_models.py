@@ -105,6 +105,40 @@ class FinanceHealthResponse(BaseModel):
     data: FinanceHealthAssessment
 
 
+class FinanceMonitorIssue(BaseModel):
+    issue_key: str
+    source_type: str
+    source_id: str
+    code: str
+    severity: Literal["critical", "warning"]
+    occurrence: int
+    opened_at: datetime
+    last_seen_at: datetime
+
+
+class FinanceMonitorEvent(BaseModel):
+    event_type: Literal["opened", "resolved", "reminder", "suppressed"]
+    issue_key: str | None = None
+    target_month: date | None = None
+    days_before: int | None = None
+    created_at: datetime
+
+
+class FinanceMonitorStatus(BaseModel):
+    assessed_on: date | None = None
+    assessed_at: datetime | None = None
+    readiness: ReadinessState | None = None
+    previous_readiness: ReadinessState | None = None
+    summary: dict
+    outstanding_issues: list[FinanceMonitorIssue]
+    history: list[FinanceMonitorEvent]
+
+
+class FinanceMonitorResponse(BaseModel):
+    success: Literal[True]
+    data: FinanceMonitorStatus
+
+
 MANUAL_CATEGORIES = frozenset({
     "cash", "brokerage", "retirement", "hsa", "education",
     "home", "vehicle", "other", "liability",
