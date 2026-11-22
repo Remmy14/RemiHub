@@ -31,41 +31,50 @@ def _issue(code: str, description: str, action: str | None = None) -> dict:
     return {"code": code, "description": description, "action": action}
 
 
-def _read_rows(sql: str, params: tuple = ()) -> list[dict]:
-    conn = get_db_conn()
+def _read_rows(sql: str, params: tuple = (), *, conn=None) -> list[dict]:
+    owned = conn is None
+    if owned:
+        conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             columns = [column[0] for column in cur.description]
             return [dict(zip(columns, row)) for row in cur.fetchall()]
     finally:
-        put_db_conn(conn)
+        if owned:
+            put_db_conn(conn)
 
 
-def read_evidence() -> dict:
-    """Fetch independent evidence sources so one unavailable table is reported."""
+def read_evidence(*, conn=None) -> dict:
+    """Fetch stored evidence, reusing the monitoring transaction when supplied.
+
+    Standalone preflight retains independent source errors. A failure on a
+    caller-owned connection must instead abort that transaction immediately.
+    """
     evidence = {"errors": []}
     sources = {
-        "accounts": finance_service.get_finance_accounts,
+        "accounts": lambda: finance_service.get_finance_accounts(conn=conn),
         "items": lambda: _read_rows("""
             SELECT id, label, enabled, last_success_at, last_error
             FROM finance_plaid_items
-        """),
+        """, conn=conn),
         "manual": lambda: _read_rows("""
             SELECT id, label, asset_category, current_value, as_of_date,
                    updated_at, include_in_net_worth, active, valuation_key
             FROM finance_manual_assets WHERE active = true
-        """),
+        """, conn=conn),
         "snapshot": lambda: _read_rows("""
             SELECT id, snapshot_month, status, created_at
             FROM finance_snapshots ORDER BY snapshot_month DESC LIMIT 1
-        """),
+        """, conn=conn),
     }
     for name, load in sources.items():
         try:
             evidence[name] = load()
         except Exception:
             logger.exception("Finance health evidence read failed: source=%s", name)
+            if conn is not None:
+                raise
             evidence[name] = None
             evidence["errors"].append(_issue("EVIDENCE_UNAVAILABLE", f"{name} evidence is unavailable.", "Retry preflight or investigate storage."))
     snapshot = evidence["snapshot"]
@@ -78,9 +87,11 @@ def read_evidence() -> dict:
                        asset_category, include_in_net_worth
                 FROM finance_snapshot_items WHERE snapshot_id = %s
                   AND include_in_net_worth = true
-            """, (evidence["snapshot"]["id"],))
+            """, (evidence["snapshot"]["id"],), conn=conn)
         except Exception:
             logger.exception("Finance health snapshot items read failed")
+            if conn is not None:
+                raise
             evidence["errors"].append(_issue("EVIDENCE_UNAVAILABLE", "Snapshot item evidence is unavailable.", "Retry preflight or investigate storage."))
     return evidence
 

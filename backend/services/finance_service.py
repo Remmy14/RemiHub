@@ -169,8 +169,11 @@ def get_finance_history(limit: int = 24) -> list[dict]:
         put_db_conn(conn)
 
 
-def get_finance_accounts() -> list[dict]:
-    conn = get_db_conn()
+def get_finance_accounts(*, conn=None) -> list[dict]:
+    """Read accounts using a caller's transaction when one is supplied."""
+    owned = conn is None
+    if owned:
+        conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -196,7 +199,8 @@ def get_finance_accounts() -> list[dict]:
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     finally:
-        put_db_conn(conn)
+        if owned:
+            put_db_conn(conn)
 
 
 def update_finance_account(

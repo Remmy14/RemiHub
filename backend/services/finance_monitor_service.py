@@ -217,46 +217,53 @@ def _verified_resolution(issue: dict, assessment: dict, evidence: dict) -> tuple
     return False, False
 
 
-def _notice(problem: dict, *, kind: str, user_id: str, after_collection: bool) -> Notification:
-    critical = problem["severity"] == "critical"
-    if kind == "resolved":
-        title = "Finance issue resolved"
-        body = "A previously reported Finance issue has been resolved. Review Finance for any remaining problems."
-        priority = 0
-    elif critical:
-        title = "Finance account needs attention"
-        body = ("A problem was found during the monthly collection. Review your Finance accounts."
-                if after_collection else
-                "Current account evidence needs attention before the next monthly collection.")
-        priority = 1
-    else:
-        title = "Finance account review needed"
-        body = "Current account evidence suggests a review before the next monthly collection."
-        priority = 0
-    return Notification(title=title, body=body, module="Finance", priority=priority,
-                        data={"type": "finance_health", "action": "view_finance",
-                              "destination": "finance", "issue_code": problem["code"],
-                              "source_type": problem["source_type"],
-                              "source_id": problem["source_id"], "user_id": user_id,
-                              "evidence_phase": ("collection_attempt" if after_collection
-                                                 else "advance")})
+ISSUE_CATEGORIES = {
+    "PLAID_CONNECTION_MISSING": "connections",
+    "PLAID_REAUTH_REQUIRED": "connections",
+    "PLAID_ACCOUNT_MISSING": "missing accounts",
+    "PLAID_BALANCE_MISSING": "missing balances",
+    "MANUAL_VALUE_MISSING": "missing balances",
+    "VALUATION_VALUE_MISSING": "missing valuations",
+    "VALUATION_FALLBACK_INVALID": "missing valuations",
+    "PLAID_DATA_STALE": "stale collection evidence",
+    "MANUAL_REVIEW_DUE": "manual account reviews",
+}
+
+
+def _affected_account_count(evidence: dict, active: dict[str, dict]) -> int:
+    """Count affected included accounts, including shared Plaid connections."""
+    affected = {(row["source_type"], row["source_id"])
+                for row in active.values() if row["source_type"] != "plaid_connection"}
+    items = {str(row.get("id")): row for row in evidence.get("items") or []}
+    for row in active.values():
+        if row["source_type"] != "plaid_connection":
+            continue
+        item = items.get(row["source_id"])
+        dependents = [account for account in evidence.get("accounts") or []
+                      if item and account.get("source") == "plaid"
+                      and account.get("include_in_net_worth")
+                      and account.get("institution_label") == item.get("label")]
+        if dependents:
+            affected.update(("plaid", str(account["id"])) for account in dependents)
+        else:
+            affected.add(("plaid_connection", row["source_id"]))
+    return len(affected)
 
 
 def _reminder_notice(*, user_id: str, days_before: int, target: date,
-                     assessment: dict, problems: dict) -> Notification:
-    critical = sum(row["severity"] == "critical" for row in problems.values())
-    warnings = len(problems) - critical
-    if critical:
-        body = f"{critical} current Finance account problem(s) may affect the upcoming collection."
-    elif warnings:
-        body = f"{warnings} Finance account(s) need review before the upcoming collection."
-    elif assessment["readiness"] == "BLOCKED":
-        body = "Current snapshot evidence has a verified blocker; the upcoming collection is not yet verified."
-    else:
-        body = "Current evidence cannot confirm readiness for the upcoming collection."
+                     assessment: dict, evidence: dict, problems: dict) -> Notification:
+    count = _affected_account_count(evidence, problems)
+    categories = sorted({ISSUE_CATEGORIES.get(row["code"], "account reviews")
+                         for row in problems.values()})
+    noun = "account" if count == 1 else "accounts"
+    body = (f"{count} financial {noun} need attention before your "
+            f"{target.strftime('%B')} snapshot. Concerns: {', '.join(categories)}. "
+            "Open Finance to review them.")
+    if assessment["readiness"] == "UNKNOWN":
+        body += " Some evidence requires verification."
+    critical = any(row["severity"] == "critical" for row in problems.values())
     return Notification(
-        title=("Finance snapshot preparation" if days_before == 3
-               else "Finance snapshot readiness warning"),
+        title="Finance snapshot preparation",
         body=body, module="Finance", priority=1 if critical else 0,
         data={"type": "finance_health_reminder", "action": "view_finance",
               "destination": "finance", "user_id": user_id,
@@ -303,11 +310,12 @@ def assess_and_notify(*, now: datetime | None = None,
             state = cur.fetchone()
         if state is None:
             raise RuntimeError("Finance monitoring migration is not installed")
-        evidence = finance_health_service.read_evidence()
+        evidence = finance_health_service.read_evidence(conn=conn)
         if evidence["errors"]:
             raise RuntimeError("Finance health evidence read failed")
         evidence_hash = _fingerprint(evidence)
-        if state[0] == local_day and state[1] == evidence_hash:
+        interval = reminder_interval(local_day)
+        if state[0] == local_day and state[1] == evidence_hash and (interval is None or after_collection):
             conn.commit()
             return False
         assessment = finance_health_service.assess_evidence(
@@ -319,8 +327,7 @@ def assess_and_notify(*, now: datetime | None = None,
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM public.finance_health_monitor_issues FOR UPDATE")
             previous = {row["issue_key"]: row for row in _rows(cur)}
-        admins = _admin_ids(conn)
-        opened_critical = False
+        active = {key: old for key, old in previous.items() if old["active"]}
         for key, problem in problems.items():
             old = previous.get(key)
             if old and old["active"]:
@@ -329,41 +336,25 @@ def assess_and_notify(*, now: datetime | None = None,
                         UPDATE public.finance_health_monitor_issues
                         SET last_seen_at = %s WHERE issue_key = %s
                     """, (instant, key))
-                # An admin may have been added after an unnotified occurrence.
                 occurrence = old["occurrence"]
-                need_notice = not old["notified"]
             else:
                 occurrence = old["occurrence"] + 1 if old else 1
-                need_notice = True
                 with conn.cursor() as cur:
                     cur.execute("""
                         INSERT INTO public.finance_health_monitor_issues
                             (issue_key, source_type, source_id, code, severity,
-                             active, occurrence, opened_at, last_seen_at, resolved_at, notified)
-                        VALUES (%s, %s, %s, %s, %s, true, %s, %s, %s, NULL, false)
+                             active, occurrence, opened_at, last_seen_at, resolved_at)
+                        VALUES (%s, %s, %s, %s, %s, true, %s, %s, %s, NULL)
                         ON CONFLICT (issue_key) DO UPDATE SET
                             severity = EXCLUDED.severity, active = true,
                             occurrence = EXCLUDED.occurrence, opened_at = EXCLUDED.opened_at,
-                            last_seen_at = EXCLUDED.last_seen_at, resolved_at = NULL,
-                            notified = false
+                            last_seen_at = EXCLUDED.last_seen_at, resolved_at = NULL
                     """, (key, problem["source_type"], problem["source_id"],
                           problem["code"], problem["severity"], occurrence,
                           instant, instant))
-            if need_notice:
-                for user_id in admins:
-                    event_key = f"issue:{key}:{occurrence}:opened:{user_id}"
-                    if _event(conn, key=event_key, kind="opened", issue_key=key,
-                              user_id=user_id,
-                              notice=_notice(problem, kind="opened", user_id=user_id,
-                                             after_collection=after_collection)):
-                        if problem["severity"] == "critical":
-                            opened_critical = True
-                if admins:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE public.finance_health_monitor_issues
-                            SET notified = true WHERE issue_key = %s
-                        """, (key,))
+                _event(conn, key=f"issue:{key}:{occurrence}:opened",
+                       kind="opened", issue_key=key)
+            active[key] = problem
         for key, old in previous.items():
             if not old["active"] or key in problems:
                 continue
@@ -375,34 +366,22 @@ def assess_and_notify(*, now: datetime | None = None,
                     UPDATE public.finance_health_monitor_issues
                     SET active = false, resolved_at = %s WHERE issue_key = %s
                 """, (instant, key))
-            if recovered and old["notified"]:
-                for user_id in admins:
-                    _event(conn, key=f"issue:{key}:{old['occurrence']}:resolved:{user_id}",
-                           kind="resolved", issue_key=key, user_id=user_id,
-                           notice=_notice(old, kind="resolved", user_id=user_id,
-                                          after_collection=after_collection))
-        interval = reminder_interval(local_day)
-        if interval is not None and not after_collection:
+            active.pop(key, None)
+            if recovered:
+                _event(conn, key=f"issue:{key}:{old['occurrence']}:resolved",
+                       kind="resolved", issue_key=key)
+        if interval is not None and not after_collection and active:
             target = upcoming_month(local_day)
             window_key = f"reminder:{target.isoformat()}:{interval}"
-            if opened_critical or (not problems and assessment["readiness"] in {"READY", "WARNING"}):
-                _event(conn, key=window_key, kind="suppressed",
-                       target_month=target, days_before=interval)
-            else:
-                # A global event marks the window processed, including a run
-                # without currently active admin recipients.
-                if _event(conn, key=window_key, kind="reminder",
-                          target_month=target, days_before=interval):
-                    for user_id in admins:
-                        _event(conn, key=f"{window_key}:{user_id}", kind="reminder",
-                               target_month=target, days_before=interval,
-                               user_id=user_id,
-                               notice=_reminder_notice(user_id=user_id,
-                                                       days_before=interval,
-                                                       target=target,
-                                                       assessment=assessment,
-                                                       problems=problems))
-        summary = _summary(assessment, problems)
+            for user_id in _admin_ids(conn):
+                _event(conn, key=f"{window_key}:{user_id}", kind="reminder",
+                       target_month=target, days_before=interval,
+                       user_id=user_id,
+                       notice=_reminder_notice(user_id=user_id,
+                                               days_before=interval, target=target,
+                                               assessment=assessment, evidence=evidence,
+                                               problems=active))
+        summary = _summary(assessment, active)
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE public.finance_health_monitor_state

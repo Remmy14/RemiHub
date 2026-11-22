@@ -7,7 +7,9 @@ import sys
 import threading
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from psycopg2.pool import PoolError
 
 
 original_db = sys.modules.get("backend.database.database")
@@ -44,6 +46,14 @@ def sample_evidence(*, error=None, account_present=True, snapshot=True):
                             "include_in_net_worth": True}] if snapshot else None,
         "errors": [],
     }
+
+
+def review_asset(index):
+    return {"id": f"manual-{index}", "label": f"Private {index}",
+            "asset_category": "cash", "current_value": 987654.32,
+            "as_of_date": date(2026, 1, 1), "updated_at": NOW,
+            "include_in_net_worth": True, "active": True,
+            "valuation_key": None}
 
 
 class Store:
@@ -183,7 +193,7 @@ class FinanceMonitorTests(unittest.TestCase):
         self.patches = [
             patch.object(monitor, "get_db_conn", self.store.connection),
             patch.object(monitor, "put_db_conn", lambda _conn: None),
-            patch.object(health, "read_evidence", lambda: copy.deepcopy(self.evidence)),
+            patch.object(health, "read_evidence", lambda *, conn=None: copy.deepcopy(self.evidence)),
             patch.object(health.worker, "_complete_snapshot_items", lambda _p, _v: []),
             patch.object(health.worker, "_configured_valuation_keys", lambda: set()),
         ]
@@ -197,7 +207,7 @@ class FinanceMonitorTests(unittest.TestCase):
 
     def test_daily_restart_and_healthy_no_all_clear(self):
         self.assertTrue(self.run_monitor())
-        self.assertFalse(self.run_monitor())
+        self.run_monitor()
         self.assertFalse(self.store.notifications)
         self.assertEqual(self.store.state["assessed_on"], date(2027, 2, 26))
         self.assertTrue(self.run_monitor(NOW + timedelta(days=1)))
@@ -213,19 +223,19 @@ class FinanceMonitorTests(unittest.TestCase):
         self.evidence["items"][0]["last_error"] = None
         self.evidence["items"][0]["last_success_at"] = NOW + timedelta(days=1, hours=1)
         self.run_monitor(NOW + timedelta(days=1, hours=2), after_collection=True)
-        self.assertEqual(len(self.store.notifications), 2)
-        self.assertIn("resolved", self.store.notifications[1]["title"].lower())
+        self.assertEqual(len(self.store.notifications), 1)
+        self.assertTrue(any(row["kind"] == "resolved" for row in self.store.events.values()))
         self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
         self.run_monitor(NOW + timedelta(days=2))
-        self.assertEqual(len(self.store.notifications), 3)
+        self.assertEqual(len(self.store.notifications), 2)  # scheduled one-day follow-up
         self.assertEqual(next(iter(self.store.issues.values()))["occurrence"], 2)
 
-    def test_post_collection_failure_has_distinct_context(self):
+    def test_post_collection_failure_tracks_issue_without_push(self):
         self.run_monitor()
         self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
         self.run_monitor(NOW + timedelta(minutes=5), after_collection=True)
-        self.assertEqual(self.store.notifications[-1]["data"]["evidence_phase"],
-                         "collection_attempt")
+        self.assertFalse(self.store.notifications)
+        self.assertTrue(any(row["active"] for row in self.store.issues.values()))
 
     def test_manual_issues_resolve_independently_and_reopen(self):
         self.evidence["manual"] = [{
@@ -247,8 +257,7 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertFalse(self.store.issues[value_key]["active"])
         self.assertTrue(self.store.issues[review_key]["active"])
         self.assertEqual(self.store.issues[value_key]["occurrence"], 1)
-        self.assertEqual(sum(n["data"].get("issue_code") == "MANUAL_VALUE_MISSING"
-                             for n in self.store.notifications), 2)
+        self.assertEqual(len(self.store.notifications), 1)
 
         self.evidence["manual"][0]["current_value"] = None
         self.run_monitor(NOW + timedelta(hours=2))
@@ -326,8 +335,7 @@ class FinanceMonitorTests(unittest.TestCase):
         self.run_monitor(NOW + timedelta(hours=3))
         self.assertTrue(self.store.issues[key]["active"])
         self.assertEqual(self.store.issues[key]["occurrence"], 2)
-        self.assertEqual(self.store.notifications[-1]["data"]["issue_code"],
-                         "PLAID_REAUTH_REQUIRED")
+        self.assertEqual(len(self.store.notifications), notices)
 
     def test_disabled_item_replaced_with_verified_account_collection(self):
         self.evidence = sample_evidence(error="ITEM_LOGIN_REQUIRED")
@@ -345,12 +353,10 @@ class FinanceMonitorTests(unittest.TestCase):
         self.run_monitor(NOW + timedelta(hours=3), after_collection=True)
 
         self.assertFalse(self.store.issues[key]["active"])
-        self.assertEqual(len(self.store.notifications), 2)
-        self.assertIn("resolved", self.store.notifications[-1]["title"].lower())
-        self.assertEqual(self.store.notifications[-1]["data"]["issue_code"],
-                         "PLAID_REAUTH_REQUIRED")
-        self.assertFalse(self.run_monitor(NOW + timedelta(hours=4)))
-        self.assertEqual(len(self.store.notifications), 2)
+        self.assertEqual(len(self.store.notifications), 1)
+        self.assertTrue(any(row["kind"] == "resolved" for row in self.store.events.values()))
+        self.run_monitor(NOW + timedelta(hours=4))
+        self.assertEqual(len(self.store.notifications), 1)
 
     def test_replacement_connection_success_alone_is_not_account_recovery(self):
         self.evidence = sample_evidence(error="ITEM_LOGIN_REQUIRED")
@@ -365,8 +371,7 @@ class FinanceMonitorTests(unittest.TestCase):
         self.run_monitor(NOW + timedelta(hours=2))
         self.assertFalse(self.store.issues[key]["active"])
         self.assertEqual(len(self.store.notifications), 1)
-        self.assertEqual(sum(notice["data"].get("issue_code") == "PLAID_REAUTH_REQUIRED"
-                             for notice in self.store.notifications), 1)
+        self.assertEqual(len(self.store.notifications), 1)
 
     def test_unknown_provider_error_is_not_urgent(self):
         self.evidence["items"][0]["last_error"] = "temporary provider outage"
@@ -419,14 +424,14 @@ class FinanceMonitorTests(unittest.TestCase):
             with self.subTest(detail=detail):
                 self.evidence = sample_evidence(error=prefix + detail, snapshot=False)
                 self.run_monitor()
-                self.assertEqual(self.store.notifications[-1]["data"]["issue_code"], expected)
+                self.assertIn(expected, {row["code"] for row in self.store.issues.values()})
                 self.assertEqual(self.store.notifications[-1]["priority"], 1)
 
     def test_recent_item_success_does_not_make_account_fresh(self):
         self.evidence["snapshot"]["created_at"] = NOW - timedelta(days=9)
         self.evidence["items"][0]["last_success_at"] = NOW - timedelta(hours=1)
         self.run_monitor()
-        self.assertEqual(self.store.notifications[0]["data"]["issue_code"], "PLAID_DATA_STALE")
+        self.assertIn("PLAID_DATA_STALE", {row["code"] for row in self.store.issues.values()})
 
     def test_unverified_item_staleness_does_not_create_account_alert(self):
         self.evidence = sample_evidence(snapshot=False)
@@ -443,22 +448,138 @@ class FinanceMonitorTests(unittest.TestCase):
                                     "include_in_net_worth": True,
                                     "active": True, "valuation_key": None}]
         self.run_monitor()
-        self.assertEqual(len(self.store.notifications), 2)  # warning and summary
+        self.assertEqual(len(self.store.notifications), 1)
         self.assertEqual(self.store.notifications[-1]["data"]["target_month"], "2027-03-01")
-        self.assertFalse(self.run_monitor())
+        self.run_monitor()
         self.run_monitor(datetime(2027, 2, 28, 15, tzinfo=timezone.utc))
-        self.assertEqual(len(self.store.notifications), 3)
+        self.assertEqual(len(self.store.notifications), 2)
         self.assertEqual(self.store.notifications[-1]["data"]["days_before"], "1")
         for notice in self.store.notifications:
             self.assertNotIn("Savings", notice["body"])
             self.assertNotIn("10", notice["body"])
 
-    def test_critical_alert_suppresses_equivalent_reminder(self):
+    def test_critical_issue_generates_one_consolidated_reminder(self):
         self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
         self.run_monitor()
         self.assertEqual(len(self.store.notifications), 1)
-        self.assertEqual(self.store.events["reminder:2027-03-01:3"]["kind"],
-                         "suppressed")
+        self.assertEqual(self.store.notifications[0]["data"]["type"],
+                         "finance_health_reminder")
+        self.assertEqual(self.store.events[f"reminder:2027-03-01:3:{ADMIN}"]["kind"],
+                         "reminder")
+
+    def test_fifteen_first_run_issues_get_only_scheduled_summaries(self):
+        self.evidence["manual"] = [review_asset(index) for index in range(15)]
+        self.run_monitor(NOW - timedelta(days=1))
+        self.assertEqual(len([row for row in self.store.issues.values() if row["active"]]), 15)
+        self.assertFalse(self.store.notifications)
+
+        self.run_monitor()
+        self.assertEqual(len(self.store.notifications), 1)
+        notice = self.store.notifications[0]
+        self.assertIn("15 financial accounts", notice["body"])
+        self.assertIn("manual account reviews", notice["body"])
+        self.assertEqual(notice["data"]["type"], "finance_health_reminder")
+        self.assertNotIn("Private", str(notice))
+        self.assertNotIn("987654", str(notice))
+        self.assertNotIn("issue_code", notice["data"])
+        for _ in range(4):
+            self.run_monitor()
+        self.assertEqual(len(self.store.notifications), 1)
+
+        self.run_monitor(NOW + timedelta(days=2))
+        self.assertEqual(len(self.store.notifications), 2)
+        self.assertIn("15 financial accounts", self.store.notifications[1]["body"])
+        self.assertEqual(self.store.notifications[1]["data"]["days_before"], "1")
+        self.run_monitor(NOW + timedelta(days=3))
+        self.assertEqual(len(self.store.notifications), 2)
+
+    def test_shared_plaid_connection_counts_each_affected_account_once(self):
+        self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
+        for index in range(2, 5):
+            account = copy.deepcopy(self.evidence["accounts"][0])
+            account.update(id=f"account-{index}", source_account_id=f"plaid-{index}")
+            self.evidence["accounts"].append(account)
+        self.run_monitor()
+        self.assertIn("4 financial accounts", self.store.notifications[0]["body"])
+        self.assertIn("connections", self.store.notifications[0]["body"])
+        self.assertEqual(sum(row["code"] == "PLAID_REAUTH_REQUIRED"
+                             for row in self.store.issues.values()), 1)
+
+    def test_followup_reflects_resolved_and_new_accounts(self):
+        self.evidence["manual"] = [review_asset(index) for index in range(3)]
+        self.run_monitor()
+        self.assertIn("3 financial accounts", self.store.notifications[0]["body"])
+        self.evidence["manual"][0]["as_of_date"] = date(2027, 2, 28)
+        self.evidence["manual"].append(review_asset(3))
+        self.run_monitor(NOW + timedelta(days=2))
+        self.assertEqual(len(self.store.notifications), 2)
+        self.assertIn("3 financial accounts", self.store.notifications[1]["body"])
+        self.assertFalse(self.store.issues["manual:manual-0:MANUAL_REVIEW_DUE"]["active"])
+        self.assertTrue(self.store.issues["manual:manual-3:MANUAL_REVIEW_DUE"]["active"])
+
+    def test_all_resolved_skips_followup(self):
+        self.evidence["manual"] = [review_asset(0)]
+        self.run_monitor()
+        self.evidence["manual"][0]["as_of_date"] = date(2027, 2, 28)
+        self.run_monitor(NOW + timedelta(days=2))
+        self.assertEqual(len(self.store.notifications), 1)
+        self.assertFalse(self.store.issues["manual:manual-0:MANUAL_REVIEW_DUE"]["active"])
+
+    def test_legacy_global_event_does_not_suppress_recipient_reminder(self):
+        self.evidence["manual"] = [review_asset(0)]
+        self.store.events["reminder:2027-03-01:3"] = {"kind": "suppressed"}
+        self.run_monitor()
+        self.assertEqual(len(self.store.notifications), 1)
+
+    def test_new_admin_during_window_gets_only_own_reminder(self):
+        self.evidence["manual"] = [review_asset(0)]
+        second_admin = "22222222-2222-4222-8222-222222222222"
+        self.run_monitor()
+        self.store.admins.append(second_admin)
+        self.run_monitor()
+        self.assertEqual(len(self.store.notifications), 2)
+        self.assertEqual({row["data"]["user_id"] for row in self.store.notifications},
+                         {ADMIN, second_admin})
+        self.assertFalse(any(row["data"].get("issue_code")
+                             for row in self.store.notifications))
+
+    def test_after_collection_assessment_does_not_consume_reminder_window(self):
+        self.evidence["manual"] = [review_asset(0)]
+        self.run_monitor(after_collection=True)
+        self.assertFalse(self.store.notifications)
+        self.run_monitor()
+        self.assertEqual(len(self.store.notifications), 1)
+
+    def test_unknown_readiness_without_actionable_issue_has_no_reminder(self):
+        self.evidence = sample_evidence(snapshot=False)
+        self.run_monitor()
+        self.assertEqual(self.store.state["readiness"], "UNKNOWN")
+        self.assertFalse(self.store.notifications)
+
+    def test_monitor_returns_connection_on_success_and_failure(self):
+        returned = []
+        with patch.object(monitor, "put_db_conn", side_effect=returned.append):
+            self.run_monitor()
+            self.assertEqual(len(returned), 1)
+            self.evidence["errors"] = [{"code": "EVIDENCE_UNAVAILABLE"}]
+            with self.assertRaises(RuntimeError):
+                self.run_monitor(NOW + timedelta(days=1))
+        self.assertEqual(len(returned), 2)
+        self.assertEqual(self.store.rollbacks, 1)
+
+    def test_worker_continues_snapshot_when_monitor_pool_is_busy(self):
+        calls = []
+        worker = health.worker
+        with patch.object(monitor, "assess_and_notify",
+                          side_effect=[PoolError("pool busy"), None]), \
+             patch.object(worker, "create_monthly_finance_snapshot",
+                          side_effect=lambda **_kwargs: calls.append("snapshot") or
+                          {"success": False, "skipped": False,
+                           "snapshot_month": "2027-03-01", "status": "blocked_incomplete"}), \
+             patch.object(worker.time, "sleep", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                worker.run_finance_worker()
+        self.assertEqual(calls, ["snapshot"])
 
     def test_month_lengths_and_new_york_boundary(self):
         self.assertEqual(monitor.reminder_interval(date(2027, 2, 26)), 3)
@@ -469,6 +590,11 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertIsNone(monitor.reminder_interval(date(2027, 3, 1)))
         self.assertEqual(datetime(2027, 3, 1, 0, tzinfo=timezone.utc)
                          .astimezone(monitor.NEW_YORK).date(), date(2027, 2, 28))
+        self.assertEqual(monitor.reminder_interval(date(2026, 11, 28)), 3)
+        self.assertEqual(monitor.reminder_interval(date(2026, 11, 30)), 1)
+        self.assertEqual(monitor.upcoming_month(date(2026, 12, 31)),
+                         date(2027, 1, 1))
+        self.assertIsNone(monitor.reminder_interval(date(2026, 12, 1)))
 
     def test_worker_checks_before_and_after_unchanged_snapshot_call(self):
         calls = []
@@ -501,6 +627,70 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertEqual(notice["data"]["user_id"], ADMIN)
         self.assertNotIn("123456", notice["body"])
         self.assertNotIn("net worth", notice["body"].lower())
+
+
+class FinanceConnectionOwnershipTests(unittest.TestCase):
+    def test_evidence_uses_supplied_connection_for_every_source(self):
+        conn = object()
+        used = []
+
+        def accounts(*, conn=None):
+            used.append(conn)
+            return []
+
+        def rows(sql, params=(), *, conn=None):
+            used.append(conn)
+            return []
+
+        with patch.object(health.finance_service, "get_finance_accounts", side_effect=accounts), \
+             patch.object(health, "_read_rows", side_effect=rows):
+            evidence = health.read_evidence(conn=conn)
+        self.assertFalse(evidence["errors"])
+        self.assertEqual(used, [conn] * 4)
+
+    def test_evidence_failure_on_owned_transaction_propagates(self):
+        with patch.object(health.finance_service, "get_finance_accounts",
+                          side_effect=RuntimeError("read failed")):
+            with self.assertRaises(RuntimeError):
+                health.read_evidence(conn=object())
+
+    def test_account_reader_does_not_borrow_or_return_supplied_connection(self):
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.description = [("id",)]
+        cursor.fetchall.return_value = [("account-1",)]
+        with patch.object(health.finance_service, "get_db_conn",
+                          side_effect=AssertionError("nested pool checkout")), \
+             patch.object(health.finance_service, "put_db_conn") as release:
+            rows = health.finance_service.get_finance_accounts(conn=conn)
+        self.assertEqual(rows, [{"id": "account-1"}])
+        release.assert_not_called()
+
+    def test_generic_evidence_reader_does_not_borrow_supplied_connection(self):
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.description = [("id",)]
+        cursor.fetchall.return_value = [("item-1",)]
+        with patch.object(health, "get_db_conn",
+                          side_effect=AssertionError("nested pool checkout")), \
+             patch.object(health, "put_db_conn") as release:
+            rows = health._read_rows("SELECT id FROM finance_plaid_items", conn=conn)
+        self.assertEqual(rows, [{"id": "item-1"}])
+        release.assert_not_called()
+
+    def test_owned_readers_return_connection_after_query_failure(self):
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError("read failed")
+        with patch.object(health, "get_db_conn", return_value=conn), \
+             patch.object(health, "put_db_conn") as health_release, \
+             patch.object(health.finance_service, "get_db_conn", return_value=conn), \
+             patch.object(health.finance_service, "put_db_conn") as finance_release:
+            with self.assertRaises(RuntimeError):
+                health._read_rows("SELECT id FROM finance_plaid_items")
+            with self.assertRaises(RuntimeError):
+                health.finance_service.get_finance_accounts()
+        health_release.assert_called_once_with(conn)
+        finance_release.assert_called_once_with(conn)
 
 
 if __name__ == "__main__":
