@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 import { financeApi } from "./api/financeApi";
+import FinanceHealthScreen from "./FinanceHealthScreen";
 import type {
   FinanceAccount, FinanceHistoryPoint, ManualAccount,
   ManualAccountCreate, SnapshotItem,
@@ -163,7 +164,7 @@ function HistoryChart({ points }: { points: FinanceHistoryPoint[] }) {
   </div>;
 }
 
-function Dashboard() {
+function Dashboard({ isAdmin }: { isAdmin: boolean }) {
   const summary = useLoad(financeApi.summary, []);
   const history = useLoad(() => financeApi.history(), []);
   if (summary.loading && !summary.value) return <Panel>Loading financial summary…</Panel>;
@@ -185,6 +186,7 @@ function Dashboard() {
       <Panel><h2 className="mb-2 text-lg font-bold">Asset categories</h2>{assets.length ? assets.map((category) => <div className="flex justify-between gap-3 py-2 text-sm" key={category.asset_category}><span>{label(category.asset_category)}</span><strong>{money(category.value)}</strong></div>) : <p className="text-sm text-slate-600">No asset categories in this snapshot.</p>}</Panel>
       <Panel><h2 className="mb-2 text-lg font-bold">Liabilities</h2>{liabilities.length ? liabilities.map((category) => <div className="flex justify-between gap-3 py-2 text-sm" key={category.asset_category}><span>{label(category.asset_category)}</span><strong>{money(category.value)}</strong></div>) : <p className="text-sm text-slate-600">No liability categories in this snapshot.</p>}</Panel>
     </div>
+    {isAdmin && <Panel><h2 className="mb-1 text-lg font-bold">Account health</h2><p className="text-sm text-slate-600">Review current account evidence before the next monthly snapshot.</p><a href={`${base}/health`} className="mt-2 inline-block text-sm font-bold text-blue-700 hover:underline">Open Account Health →</a></Panel>}
     <Panel><h2 className="mb-3 text-lg font-bold">Net worth history</h2>{history.loading && !history.value ? "Loading history…" : history.value ? <HistoryChart points={history.value} /> : <Notice kind="error">{history.error}</Notice>}<a href={`${base}/history`} className="mt-3 inline-block text-sm font-bold text-blue-700 hover:underline">View full history</a></Panel>
     <div className="grid gap-4 lg:grid-cols-2"><Panel><h2 className="text-lg font-bold">Included assets</h2><SnapshotItems items={current.items.filter((item) => item.asset_category !== "liability")} /></Panel><Panel><h2 className="text-lg font-bold">Included liabilities</h2><SnapshotItems items={current.items.filter((item) => item.asset_category === "liability")} /></Panel></div>
   </div>;
@@ -334,7 +336,8 @@ export default function FinanceScreen() {
   const [roleError, setRoleError] = useState<string | null>(null);
   useEffect(() => { void financeApi.role().then((user) => setRole(user.role)).catch((caught) => setRoleError(errorMessage(caught))); }, []);
   const manual = relative === "/manual" || relative.startsWith("/manual/");
+  const health = relative === "/health";
   const navigation = [{ title: "Dashboard", href: base }, { title: "History", href: `${base}/history` }, { title: "Accounts", href: `${base}/accounts` }];
-  if (role === "admin") navigation.push({ title: "Manual accounts", href: `${base}/manual` });
-  return <main className="mx-auto max-w-7xl space-y-5 px-4 py-8"><header><h1 className="text-3xl font-black">Finance</h1><p className="mt-1 text-sm text-slate-600">Backend-published financial snapshots and account records</p></header><nav aria-label="Finance" className="flex flex-wrap gap-2">{navigation.map((entry) => <a key={entry.href} href={entry.href} aria-current={path === entry.href ? "page" : undefined} className={`rounded-lg px-3 py-2 text-sm font-semibold ${path === entry.href ? "bg-slate-950 text-white" : "bg-white text-slate-700 hover:bg-slate-200"}`}>{entry.title}</a>)}</nav>{roleError && <Notice kind="error">{roleError}</Notice>}{manual && role === null && !roleError && <Panel>Checking administrator access…</Panel>}{manual && role !== null && role !== "admin" && <Notice kind="error">Administrator access is required to manage manual accounts.</Notice>}{manual && role === "admin" && (relative === "/manual" ? <ManualList /> : <ManualEditor id={relative === "/manual/new" ? undefined : decodeURIComponent(relative.slice("/manual/".length))} />)}{!manual && (relative === "/history" ? <History /> : relative === "/accounts" ? <Accounts /> : relative.startsWith("/accounts/") ? <AccountDetail id={decodeURIComponent(relative.slice("/accounts/".length))} /> : <Dashboard />)}</main>;
+  if (role === "admin") navigation.push({ title: "Account Health", href: `${base}/health` }, { title: "Manual accounts", href: `${base}/manual` });
+  return <main className="mx-auto max-w-7xl space-y-5 px-4 py-8"><header><h1 className="text-3xl font-black">Finance</h1><p className="mt-1 text-sm text-slate-600">Backend-published financial snapshots and account records</p></header><nav aria-label="Finance" className="flex flex-wrap gap-2">{navigation.map((entry) => <a key={entry.href} href={entry.href} aria-current={path === entry.href ? "page" : undefined} className={`rounded-lg px-3 py-2 text-sm font-semibold ${path === entry.href ? "bg-slate-950 text-white" : "bg-white text-slate-700 hover:bg-slate-200"}`}>{entry.title}</a>)}</nav>{roleError && <Notice kind="error">{roleError}</Notice>}{(manual || health) && role === null && !roleError && <Panel>Checking administrator access…</Panel>}{(manual || health) && role !== null && role !== "admin" && <Notice kind="error">Administrator access is required for this page.</Notice>}{health && role === "admin" && <FinanceHealthScreen />}{manual && role === "admin" && (relative === "/manual" ? <ManualList /> : <ManualEditor id={relative === "/manual/new" ? undefined : decodeURIComponent(relative.slice("/manual/".length))} />)}{!manual && !health && (relative === "/history" ? <History /> : relative === "/accounts" ? <Accounts /> : relative.startsWith("/accounts/") ? <AccountDetail id={decodeURIComponent(relative.slice("/accounts/".length))} /> : <Dashboard isAdmin={role === "admin"} />)}</main>;
 }

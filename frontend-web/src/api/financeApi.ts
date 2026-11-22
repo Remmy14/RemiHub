@@ -1,4 +1,5 @@
 import { apiRequest } from "./authenticatedApi";
+import { parseAssessment, parseMonitoring } from "../financeHealth";
 
 export type SnapshotItem = {
   source: string;
@@ -79,6 +80,8 @@ function data<T>(response: Envelope<T>): T {
 }
 
 export const financeApi = {
+  preflight: async () => parseAssessment(await apiRequest<unknown>("/finance/preflight", noStore)),
+  monitoring: async () => parseMonitoring(await apiRequest<unknown>("/finance/monitoring", noStore)),
   summary: () => apiRequest<FinanceSummary>("/finance/summary", noStore),
   history: (limit = 36) =>
     apiRequest<FinanceHistoryPoint[]>(`/finance/history?limit=${limit}`, noStore),
