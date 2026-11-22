@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { accountTotals, assessmentGuidance, correctiveAction, nextSnapshot, parseAssessment, parseMonitoring, snapshotOnlyConditions, sortedAccounts } from "../src/financeHealth.ts";
+import { accountTotals, assessmentGuidance, correctiveAction, HealthRefreshCoordinator, nextSnapshot, parseAssessment, parseMonitoring, refreshHealthData, snapshotOnlyConditions, sortedAccounts } from "../src/financeHealth.ts";
 
 const issue = (code = "MANUAL_REVIEW_DUE") => ({ code, description: "Review needed.", action: "Review value." });
 const account = (overrides = {}) => ({
@@ -61,6 +61,41 @@ test("zero account-level attention never turns WARNING or UNKNOWN into an all-cl
     assert.match(guidance.next, /Current collection cannot be verified/);
     assert.doesNotMatch(guidance.next, /no known account problems/);
   }
+});
+
+test("READY snapshot evidence still explains UNKNOWN account verification", () => {
+  const response = assessment([account({ health: "UNKNOWN", issues: [], source_type: "plaid" })], "READY");
+  const guidance = assessmentGuidance(parseAssessment(response));
+  assert.match(guidance.overview, /insufficient current verification evidence/);
+  assert.match(guidance.overview, /Future collection remains unverified/);
+  assert.doesNotMatch(guidance.overview, /no known account problems/);
+});
+
+test("post-verification refresh attempts every section and reports partial failure", async () => {
+  const called = [];
+  const refreshed = await refreshHealthData([
+    async () => { called.push("preflight"); return true; },
+    async () => { called.push("monitoring"); throw new Error("unavailable"); },
+    async () => { called.push("accounts"); return true; },
+    async () => { called.push("summary"); return true; },
+  ]);
+  assert.deepEqual(called, ["preflight", "monitoring", "accounts", "summary"]);
+  assert.equal(refreshed, false);
+  assert.equal(await refreshHealthData([async () => true, async () => true]), true);
+  assert.equal(await refreshHealthData([async () => false, async () => true]), false);
+});
+
+test("older refresh cannot clear staleness after a failing post-verification refresh", async () => {
+  const coordinator = new HealthRefreshCoordinator();
+  let releaseOlder;
+  const olderLoad = new Promise((resolve) => { releaseOlder = resolve; });
+  const states = [];
+  const older = coordinator.run([() => olderLoad], (allUpdated) => states.push(allUpdated));
+  const newer = coordinator.run([async () => false], (allUpdated) => states.push(allUpdated));
+  await newer;
+  releaseOlder(true);
+  await older;
+  assert.deepEqual(states, [false]);
 });
 
 test("rejects incomplete assessment instead of displaying an empty success", () => {

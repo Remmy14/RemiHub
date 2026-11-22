@@ -17,6 +17,26 @@ export class ApiForbiddenError extends Error {
   }
 }
 
+export class ApiCooldownError extends Error {
+  readonly retryAt: string | null;
+
+  constructor(retryAt: string | null) {
+    super("Please wait before starting another verification.");
+    this.name = "ApiCooldownError";
+    this.retryAt = retryAt;
+  }
+}
+
+export class ApiHttpError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiHttpError";
+    this.status = status;
+  }
+}
+
 type ApiRequestOptions = RequestInit & {
   authenticated?: boolean;
 };
@@ -55,6 +75,9 @@ export async function apiRequest<T>(
 
   const data = await response.json().catch(() => null);
   if (!response.ok) {
+    if (response.status === 429 && data?.detail?.code === "FINANCE_VERIFICATION_COOLDOWN") {
+      throw new ApiCooldownError(typeof data.detail.retry_at === "string" ? data.detail.retry_at : null);
+    }
     const detail =
       typeof data?.detail === "string"
         ? data.detail
@@ -64,7 +87,7 @@ export async function apiRequest<T>(
               .filter((message): message is string => typeof message === "string")
               .join("; ") || "Check the supplied values."
         : "RemiHub request failed.";
-    throw new Error(detail);
+    throw new ApiHttpError(detail, response.status);
   }
 
   return data as T;

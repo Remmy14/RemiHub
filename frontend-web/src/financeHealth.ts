@@ -1,12 +1,22 @@
 export type Readiness = "READY" | "WARNING" | "BLOCKED" | "UNKNOWN";
 export type Health = "HEALTHY" | "WARNING" | "BLOCKED" | "UNKNOWN";
 export type Issue = { code: string; description: string; action: string | null };
+export type AccountVerification = {
+  connection_status: "VERIFIED" | "AUTH_REQUIRED" | "UNKNOWN";
+  inventory_status: "AVAILABLE" | "MISSING" | "UNKNOWN";
+  item_inventory_status: "AVAILABLE" | "MISSING" | "UNKNOWN";
+  attempted_at: string | null; succeeded_at: string | null; method: string | null;
+  outcome: "VERIFIED" | "AUTH_REQUIRED" | "TRANSIENT" | "UNKNOWN";
+  live_balance_tested: boolean; cached_balance_status: "VALID" | "INVALID" | "UNKNOWN";
+  collection_readiness: "CACHED_INVENTORY_AVAILABLE" | "BLOCKED" | "UNKNOWN";
+};
 export type AccountHealth = {
   account_id: string; display_name: string; category: string | null;
   source_type: "plaid" | "manual" | "vehicle" | "valuation";
   included_in_net_worth: boolean; health: Health;
   freshness: "CURRENT" | "STALE" | "UNKNOWN";
-  last_successful_update: string | null; issues: Issue[];
+  last_successful_update: string | null; last_monthly_balance_collection?: string | null;
+  verification?: AccountVerification | null; issues: Issue[];
   explanation: string; recommended_action: string | null;
 };
 export type Assessment = {
@@ -37,6 +47,15 @@ const health = (value: unknown): value is Health => value === "HEALTHY" || readi
 const issue = (value: unknown): value is Issue => record(value) && string(value.code) &&
   string(value.description) && nullableString(value.action);
 const issues = (value: unknown): value is Issue[] => Array.isArray(value) && value.every(issue);
+const verification = (value: unknown): value is AccountVerification => record(value) &&
+  ["VERIFIED", "AUTH_REQUIRED", "UNKNOWN"].includes(String(value.connection_status)) &&
+  ["AVAILABLE", "MISSING", "UNKNOWN"].includes(String(value.inventory_status)) &&
+  ["AVAILABLE", "MISSING", "UNKNOWN"].includes(String(value.item_inventory_status)) &&
+  nullableString(value.attempted_at) && nullableString(value.succeeded_at) && nullableString(value.method) &&
+  ["VERIFIED", "AUTH_REQUIRED", "TRANSIENT", "UNKNOWN"].includes(String(value.outcome)) &&
+  typeof value.live_balance_tested === "boolean" &&
+  ["VALID", "INVALID", "UNKNOWN"].includes(String(value.cached_balance_status)) &&
+  ["CACHED_INVENTORY_AVAILABLE", "BLOCKED", "UNKNOWN"].includes(String(value.collection_readiness));
 
 export function parseAssessment(value: unknown): Assessment {
   if (!record(value) || value.success !== true || !record(value.data)) throw new Error("Preflight response is incomplete.");
@@ -52,7 +71,9 @@ export function parseAssessment(value: unknown): Assessment {
         ["plaid", "manual", "vehicle", "valuation"].includes(String(row.source_type)) &&
         typeof row.included_in_net_worth === "boolean" && health(row.health) &&
         ["CURRENT", "STALE", "UNKNOWN"].includes(String(row.freshness)) &&
-        nullableString(row.last_successful_update) && issues(row.issues) &&
+        nullableString(row.last_successful_update) &&
+        (row.last_monthly_balance_collection === undefined || nullableString(row.last_monthly_balance_collection)) &&
+        (row.verification === undefined || row.verification === null || verification(row.verification)) && issues(row.issues) &&
         string(row.explanation) && nullableString(row.recommended_action)) ||
       !record(snapshot) || !readiness(snapshot.readiness) || !string(snapshot.snapshot_month) ||
       !issues(snapshot.blocking_conditions) || !issues(snapshot.warnings) || !string(snapshot.explanation)) {
@@ -88,6 +109,23 @@ export function accountTotals(accounts: AccountHealth[]) {
     blocked: included.filter((account) => account.health === "BLOCKED").length,
     unknown: included.filter((account) => account.health === "UNKNOWN").length,
   };
+}
+
+export async function refreshHealthData(loaders: Array<() => Promise<boolean>>) {
+  const results = await Promise.allSettled(loaders.map((load) => load()));
+  return results.every((result) => result.status === "fulfilled" && result.value);
+}
+
+export class HealthRefreshCoordinator {
+  private generation = 0;
+
+  async run(loaders: Array<() => Promise<boolean>>, settled: (allUpdated: boolean) => void) {
+    const generation = ++this.generation;
+    const allUpdated = await refreshHealthData(loaders);
+    if (generation === this.generation) settled(allUpdated);
+  }
+
+  invalidate() { this.generation++; }
 }
 
 export function snapshotOnlyConditions(assessment: Assessment) {
@@ -129,8 +167,15 @@ export function assessmentGuidance(assessment: Assessment) {
       next: `${affected}Current evidence has a concern to review before the next snapshot. ${detail}`,
     };
   }
+  if (totals.unknown > 0) {
+    const detail = `${totals.unknown} included ${totals.unknown === 1 ? "account has" : "accounts have"} insufficient current verification evidence.`;
+    return {
+      overview: `Current-period snapshot evidence meets completeness rules. ${detail} Future collection remains unverified.`,
+      next: `${detail} Verify supported connections before the next collection; future success is not assured.`,
+    };
+  }
   return {
-    overview: "Current evidence shows no known account problems.",
+    overview: "Current-period snapshot evidence meets completeness rules. Future collection remains unverified.",
     next: "Current evidence shows no known account problems; future collection is not guaranteed.",
   };
 }

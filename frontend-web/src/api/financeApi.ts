@@ -1,5 +1,6 @@
 import { apiRequest } from "./authenticatedApi";
 import { parseAssessment, parseMonitoring } from "../financeHealth";
+import { parseVerification } from "../financeVerification";
 
 export type SnapshotItem = {
   source: string;
@@ -82,6 +83,12 @@ function data<T>(response: Envelope<T>): T {
 export const financeApi = {
   preflight: async () => parseAssessment(await apiRequest<unknown>("/finance/preflight", noStore)),
   monitoring: async () => parseMonitoring(await apiRequest<unknown>("/finance/monitoring", noStore)),
+  startVerification: async (signal: AbortSignal) => parseVerification(await apiRequest<unknown>(
+    "/finance/verification/run", { method: "POST", body: "{}", signal, cache: "no-store" },
+  )),
+  verificationRun: async (id: string, signal: AbortSignal) => parseVerification(await apiRequest<unknown>(
+    `/finance/verification/runs/${encodeURIComponent(id)}`, { signal, cache: "no-store" },
+  )),
   summary: () => apiRequest<FinanceSummary>("/finance/summary", noStore),
   history: (limit = 36) =>
     apiRequest<FinanceHistoryPoint[]>(`/finance/history?limit=${limit}`, noStore),
