@@ -543,6 +543,7 @@ class LightweightVerificationTests(unittest.TestCase):
         accounts = [{"source_account_id": account_id, "institution_label": "Bank",
                      "include_in_net_worth": True} for account_id in ("one", "two")]
         with patch.object(verification, "_claim", return_value=True), \
+             patch.object(verification, "_renew", return_value=True), \
              patch.object(verification, "_release") as release, \
              patch.object(verification, "_persist") as persist, \
              patch.object(worker, "get_enabled_plaid_items", return_value=[item]), \

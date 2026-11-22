@@ -3,7 +3,7 @@
 # 3rd Party Imports
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from backend.core.auth import require_admin_principal, require_current_principal
 
@@ -13,6 +13,8 @@ from backend.models.finance_models import (
     FinanceHistoryPoint,
     FinanceHealthResponse,
     FinanceMonitorResponse,
+    FinanceVerificationExecutionResponse,
+    FinanceVerificationRunRequest,
     FinanceSummary,
     ManualAccountCreate,
     ManualAccountPatch,
@@ -20,6 +22,7 @@ from backend.models.finance_models import (
 from backend.services import finance_service
 from backend.services import finance_health_service
 from backend.services import finance_monitor_service
+from backend.services import finance_manual_verification_service as manual_verification
 from backend.services import manual_finance_service as manual_service
 
 
@@ -38,6 +41,35 @@ def get_preflight():
 def get_monitoring():
     """Latest persisted automatic health assessment and bounded event history."""
     return {"success": True, "data": finance_monitor_service.get_monitoring_status()}
+
+
+@router.post("/verification/run", response_model=FinanceVerificationExecutionResponse,
+             status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(require_admin_principal)])
+def run_verification(request: FinanceVerificationRunRequest,
+                     background_tasks: BackgroundTasks):
+    """Queue one bounded manual run; request fields cannot select paid methods."""
+    outcome, data, owner = manual_verification.request_run()
+    if outcome == "cooldown":
+        raise HTTPException(status_code=429, detail={
+            "code": "FINANCE_VERIFICATION_COOLDOWN", "retry_at": data["retry_at"].isoformat()})
+    if outcome == "new":
+        background_tasks.add_task(manual_verification.run_manual,
+                                  UUID(data["execution_id"]), owner)
+    else:
+        background_tasks.add_task(manual_verification._recover_scheduled_handoff)
+    return {"success": True, "data": data}
+
+
+@router.get("/verification/runs/{run_id}",
+            response_model=FinanceVerificationExecutionResponse,
+            dependencies=[Depends(require_admin_principal)])
+def get_verification_run(run_id: UUID, background_tasks: BackgroundTasks):
+    data = manual_verification.get_run(run_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Finance verification run not found")
+    background_tasks.add_task(manual_verification._recover_scheduled_handoff)
+    return {"success": True, "data": data}
 
 
 def _manual_error(exc: Exception):

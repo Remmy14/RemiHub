@@ -307,7 +307,8 @@ def _summary(assessment: dict, problems: dict) -> dict:
 
 
 def assess_and_notify(*, now: datetime | None = None,
-                      after_collection: bool = False) -> bool:
+                      after_collection: bool = False,
+                      send_reminders: bool = True) -> bool:
     """Assess on first local cycle and whenever committed evidence changes.
 
     A failed source read is operational failure, not a healthy transition.
@@ -338,7 +339,8 @@ def assess_and_notify(*, now: datetime | None = None,
             raise RuntimeError("Finance health evidence read failed")
         evidence_hash = _fingerprint(evidence)
         interval = reminder_interval(local_day)
-        if state[0] == local_day and state[1] == evidence_hash and (interval is None or after_collection):
+        if state[0] == local_day and state[1] == evidence_hash and (
+                interval is None or after_collection or not send_reminders):
             conn.commit()
             return False
         assessment = finance_health_service.assess_evidence(
@@ -393,7 +395,7 @@ def assess_and_notify(*, now: datetime | None = None,
             if recovered:
                 _event(conn, key=f"issue:{key}:{old['occurrence']}:resolved",
                        kind="resolved", issue_key=key)
-        if interval is not None and not after_collection and active:
+        if send_reminders and interval is not None and not after_collection and active:
             target = upcoming_month(local_day)
             window_key = f"reminder:{target.isoformat()}:{interval}"
             for user_id in _admin_ids(conn):

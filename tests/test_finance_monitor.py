@@ -237,6 +237,16 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertFalse(self.store.notifications)
         self.assertTrue(any(row["active"] for row in self.store.issues.values()))
 
+    def test_manual_assessment_never_sends_or_consumes_scheduled_reminder(self):
+        self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
+        self.assertTrue(monitor.assess_and_notify(now=NOW, send_reminders=False))
+        self.assertFalse(self.store.notifications)
+        self.assertTrue(any(row["active"] for row in self.store.issues.values()))
+        self.assertTrue(self.run_monitor(NOW + timedelta(minutes=1)))
+        self.assertEqual(len(self.store.notifications), 1)
+        self.run_monitor(NOW + timedelta(minutes=2))
+        self.assertEqual(len(self.store.notifications), 1)
+
     def test_cached_only_success_keeps_confirmed_item_auth_issue(self):
         self.evidence = sample_evidence(snapshot=False)
         item = self.evidence["items"][0]

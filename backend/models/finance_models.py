@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 
 class FinanceSnapshotItem(BaseModel):
@@ -152,6 +152,29 @@ class FinanceMonitorStatus(BaseModel):
 class FinanceMonitorResponse(BaseModel):
     success: Literal[True]
     data: FinanceMonitorStatus
+
+
+class FinanceVerificationRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class FinanceVerificationExecution(BaseModel):
+    execution_id: str | None = None
+    trigger: Literal["manual", "scheduled"]
+    status: Literal["pending", "running", "completed", "partially_completed", "failed"]
+    requested_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    reused: bool = False
+    retry_at: datetime | None = None
+    summary: dict = Field(default_factory=dict)
+    results: dict = Field(default_factory=dict)
+    error_code: str | None = None
+
+
+class FinanceVerificationExecutionResponse(BaseModel):
+    success: Literal[True]
+    data: FinanceVerificationExecution
 
 
 MANUAL_CATEGORIES = frozenset({

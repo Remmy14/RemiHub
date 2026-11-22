@@ -1,4 +1,4 @@
-"""Bounded, verification-only Plaid checks in the existing Finance worker.
+"""Bounded, verification-only Plaid checks shared by scheduled and manual runs.
 
 Only cached inventory and Item status are checked. No account or snapshot writer
 is called, and a cached response never proves a fresh balance can be obtained.
@@ -22,12 +22,15 @@ logger = logging.getLogger(__name__)
 INTERVAL = timedelta(hours=5, minutes=30)
 LEASE = timedelta(minutes=20)
 REQUEST_TIMEOUT = 15
+MAX_RUN = timedelta(minutes=15)
 AUTH_CODES = frozenset({"ITEM_LOGIN_REQUIRED", "INVALID_ACCESS_TOKEN"})
 NEW_YORK = ZoneInfo("America/New_York")
 
 
 def _claim(now: datetime, owner: str, *, reminder_day: bool = False,
-           local_day: date | None = None) -> bool:
+           local_day: date | None = None,
+           replay_generation_out: dict | None = None,
+           require_pending: bool = False) -> bool:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
@@ -35,17 +38,47 @@ def _claim(now: datetime, owner: str, *, reminder_day: bool = False,
                 INSERT INTO public.finance_plaid_verification_lease (id)
                 VALUES (true) ON CONFLICT (id) DO NOTHING
             """)
-            cur.execute("""
+            claim_sql = """
                 UPDATE public.finance_plaid_verification_lease
-                SET owner = %s, expires_at = %s, started_at = %s
+                SET owner = %s, expires_at = %s, started_at = %s,
+                    run_trigger = 'scheduled', run_id = NULL,
+                    monitoring_pending = monitoring_pending OR scheduled_pending,
+                    monitoring_generation = monitoring_generation +
+                        CASE WHEN scheduled_pending THEN 1 ELSE 0 END,
+                    monitoring_retry_at = CASE WHEN scheduled_pending THEN %s
+                        ELSE monitoring_retry_at END
                 WHERE id = true AND (expires_at IS NULL OR expires_at <= %s)
-                  AND (started_at IS NULL OR started_at <= %s OR
+                  AND (NOT %s OR scheduled_pending)
+                  AND (scheduled_pending OR started_at IS NULL OR started_at <= %s OR
                        (%s AND (started_at AT TIME ZONE 'America/New_York')::date < %s))
-                RETURNING id
-            """, (owner, now + LEASE, now, now, now - INTERVAL,
-                  reminder_day, local_day))
-            claimed = cur.fetchone() is not None
+                RETURNING scheduled_pending, monitoring_generation
+            """
+            claim_args = (owner, now + LEASE, now, now + LEASE, now, require_pending,
+                          now - INTERVAL,
+                          reminder_day, local_day)
+            cur.execute(claim_sql, claim_args)
+            claim_row = cur.fetchone()
+            claimed = claim_row is not None
+            if not claimed:
+                # A due worker cycle that collides with a manual check is
+                # replayed after that check; manual work does not consume it.
+                cur.execute("""
+                    UPDATE public.finance_plaid_verification_lease
+                    SET scheduled_pending = true
+                    WHERE id = true AND run_trigger = 'manual'
+                      AND owner IS NOT NULL AND expires_at > %s
+                      AND (started_at IS NULL OR started_at <= %s OR
+                           (%s AND (started_at AT TIME ZONE 'America/New_York')::date < %s))
+                """, (now, now - INTERVAL, reminder_day, local_day))
+                if cur.rowcount == 0:
+                    # The manual owner may have released between the two
+                    # statements; retry once before leaving this worker cycle.
+                    cur.execute(claim_sql, claim_args)
+                    claim_row = cur.fetchone()
+                    claimed = claim_row is not None
         conn.commit()
+        if claim_row and claim_row[0] and replay_generation_out is not None:
+            replay_generation_out["generation"] = claim_row[1]
         return claimed
     except Exception:
         conn.rollback()
@@ -54,15 +87,24 @@ def _claim(now: datetime, owner: str, *, reminder_day: bool = False,
         put_db_conn(conn)
 
 
-def _release(owner: str) -> None:
+def _release(owner: str) -> bool:
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
+                SELECT scheduled_pending, run_trigger FROM public.finance_plaid_verification_lease
+                WHERE id = true AND owner = %s FOR UPDATE
+            """, (owner,))
+            row = cur.fetchone()
+            cur.execute("""
                 UPDATE public.finance_plaid_verification_lease
-                SET owner = NULL, expires_at = NULL WHERE id = true AND owner = %s
+                SET owner = NULL, expires_at = NULL, run_trigger = NULL, run_id = NULL,
+                    scheduled_pending = CASE WHEN run_trigger = 'scheduled'
+                        THEN false ELSE scheduled_pending END
+                WHERE id = true AND owner = %s
             """, (owner,))
         conn.commit()
+        return bool(row and row[0] and row[1] == "manual")
     except Exception:
         conn.rollback()
         raise
@@ -136,10 +178,39 @@ def _check_item(item: dict, expected: set[str], *, check_item_status: bool = Fal
     return result
 
 
-def _persist(item_id: str, result: dict, now: datetime) -> None:
+def _renew(owner: str) -> bool:
+    """Fence a live executor and extend its lease without holding it over I/O."""
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.finance_plaid_verification_lease
+                SET expires_at = clock_timestamp() + interval '20 minutes'
+                WHERE id = true AND owner = %s AND expires_at > clock_timestamp()
+                RETURNING id
+            """, (owner,))
+            active = cur.fetchone() is not None
+        conn.commit()
+        return active
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_db_conn(conn)
+
+
+def _persist(item_id: str, result: dict, now: datetime, *, owner: str | None = None) -> None:
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            if owner is not None:
+                cur.execute("""
+                    SELECT owner FROM public.finance_plaid_verification_lease
+                    WHERE id = true AND owner = %s AND expires_at > clock_timestamp()
+                    FOR UPDATE
+                """, (owner,))
+                if cur.fetchone() is None:
+                    raise RuntimeError("Finance verification lease lost")
             cur.execute("""
                 INSERT INTO public.finance_plaid_verification
                     (plaid_item_id, attempted_at, succeeded_at, method, outcome,
@@ -188,8 +259,81 @@ def _persist(item_id: str, result: dict, now: datetime) -> None:
         put_db_conn(conn)
 
 
-def verify_enabled_items(*, now: datetime | None = None) -> bool:
-    """Check each enabled Item once; a short DB lease spans provider calls."""
+def _run_items(owner: str, *, started_at: datetime, on_result=None) -> dict:
+    """Use the scheduled checker for both triggers; report only sanitized facts."""
+    items = worker.get_enabled_plaid_items()
+    configured = worker._get_configured_plaid_accounts()
+    check_item_status = str(worker.finance_config.get(
+        "health_plaid_item_get_enabled", "false")).lower() == "true"
+    by_label = {}
+    for item in items:
+        by_label.setdefault(item["label"], []).append(item)
+    evaluated_accounts = sum(
+        1 for account in configured if account["include_in_net_worth"]
+        and len(by_label.get(account["institution_label"], [])) == 1
+    )
+    results = []
+    for item in items:
+        if datetime.now(timezone.utc) >= started_at + MAX_RUN:
+            break
+        if not _renew(owner):
+            raise RuntimeError("Finance verification lease lost")
+        matching = by_label[item["label"]]
+        expected = {a["source_account_id"] for a in configured
+                    if a["include_in_net_worth"] and a["institution_label"] == item["label"]}
+        result = _check_item(item, expected if len(matching) == 1 else set(),
+                             check_item_status=check_item_status)
+        if len(matching) != 1:
+            result.update(outcome="UNKNOWN", inventory_status="UNKNOWN",
+                          available_account_ids=[], missing_account_ids=[])
+        checked_at = datetime.now(timezone.utc)
+        _persist(item["id"], result, checked_at, owner=owner)
+        if result["connection_status"] == "AUTH_REQUIRED":
+            issue_code, explanation, action = (
+                "PLAID_REAUTH_REQUIRED", "The connection requires authentication.",
+                "Reconnect this institution.")
+        elif result["missing_account_ids"]:
+            issue_code, explanation, action = (
+                "PLAID_ACCOUNT_MISSING", "An included account is absent from cached inventory.",
+                "Review the institution's account access.")
+        elif result["invalid_balance_ids"]:
+            issue_code, explanation, action = (
+                "PLAID_BALANCE_MISSING", "A cached balance is unavailable for an included account.",
+                "Review the account before the next snapshot.")
+        elif result["outcome"] in {"TRANSIENT", "UNKNOWN"}:
+            issue_code, explanation, action = (
+                None, "The permitted check could not establish current availability.",
+                "Retry after the cooldown or check the institution.")
+        else:
+            issue_code, explanation, action = (
+                None, "Cached account inventory was checked; live balance collection was not tested.",
+                None)
+        public = {
+            "connection_id": str(item["id"]), "label": str(item["label"]),
+            "outcome": result["outcome"], "connection_status": result["connection_status"],
+            "inventory_status": result["inventory_status"], "method": result["method"],
+            "verification_depth": "item_status_and_cached_inventory" if
+                "item_get" in result["method"] else "cached_inventory",
+            "checked_at": checked_at.isoformat(), "included_accounts": len(expected),
+            "available_accounts": len(expected & set(result["available_account_ids"])),
+            "missing_accounts": len(result["missing_account_ids"]),
+            "invalid_cached_balances": len(result["invalid_balance_ids"]),
+            "live_balance_tested": False,
+            "issue_code": issue_code, "explanation": explanation,
+            "recommended_action": action,
+        }
+        results.append(public)
+        if on_result is not None:
+            on_result(public, len(items))
+    return {"enabled_connections": len(items), "results": results,
+            "included_accounts": evaluated_accounts,
+            "complete": len(results) == len(items)}
+
+
+def verify_enabled_items(*, now: datetime | None = None,
+                         replay_generation_out: dict | None = None,
+                         require_pending: bool = False) -> bool:
+    """Check each enabled Item once; scheduled eligibility is independent of manual runs."""
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("verification clock must be timezone aware")
@@ -198,27 +342,15 @@ def verify_enabled_items(*, now: datetime | None = None) -> bool:
                       local_day.month % 12 + 1, 1)
     reminder_day = (next_month - local_day).days in (3, 1)
     owner = str(uuid4())
-    if not _claim(now, owner, reminder_day=reminder_day, local_day=local_day):
+    claim_options = ({"replay_generation_out": replay_generation_out}
+                     if replay_generation_out is not None else {})
+    if require_pending:
+        claim_options["require_pending"] = True
+    if not _claim(now, owner, reminder_day=reminder_day, local_day=local_day,
+                  **claim_options):
         return False
     try:
-        items = worker.get_enabled_plaid_items()
-        configured = worker._get_configured_plaid_accounts()
-        check_item_status = str(worker.finance_config.get(
-            "health_plaid_item_get_enabled", "false")).lower() == "true"
-        by_label = {}
-        for item in items:
-            by_label.setdefault(item["label"], []).append(item)
-        for item in items:
-            # Ambiguous labels cannot establish account ownership.
-            matching = by_label[item["label"]]
-            expected = {a["source_account_id"] for a in configured
-                        if a["include_in_net_worth"] and a["institution_label"] == item["label"]}
-            result = _check_item(item, expected if len(matching) == 1 else set(),
-                                 check_item_status=check_item_status)
-            if len(matching) != 1:
-                result.update(outcome="UNKNOWN", inventory_status="UNKNOWN",
-                              available_account_ids=[], missing_account_ids=[])
-            _persist(item["id"], result, now)
+        _run_items(owner, started_at=datetime.now(timezone.utc))
         return True
     finally:
         _release(owner)
