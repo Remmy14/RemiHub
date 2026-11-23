@@ -212,6 +212,37 @@ class FinanceMonitorTests(unittest.TestCase):
         self.assertEqual(self.store.state["assessed_on"], date(2027, 2, 26))
         self.assertTrue(self.run_monitor(NOW + timedelta(days=1)))
 
+    def test_cached_only_healthy_reassessment_is_silent_and_idempotent(self):
+        self.evidence = sample_evidence(snapshot=False)
+        item = self.evidence["items"][0]
+        item.update(connection_status="UNKNOWN", verification_outcome="VERIFIED",
+                    verification_method="accounts_get", inventory_status="AVAILABLE",
+                    available_account_ids=["plaid-1"], missing_account_ids=[],
+                    invalid_balance_ids=[], verification_attempted_at=NOW,
+                    verification_succeeded_at=NOW)
+        self.assertTrue(monitor.assess_and_notify(now=NOW, send_reminders=False))
+        self.assertEqual(self.store.state["summary"]["counts"]["healthy"], 1)
+        self.assertFalse(self.store.issues)
+        self.assertFalse(self.store.events)
+        self.assertFalse(self.store.notifications)
+        self.assertFalse(monitor.assess_and_notify(now=NOW, send_reminders=False))
+        self.assertFalse(self.store.events)
+
+        # A confirmed Item failure affects the same account despite cached inventory.
+        item.update(connection_status="AUTH_REQUIRED", verification_outcome="AUTH_REQUIRED",
+                    verification_method="item_get", verification_attempted_at=NOW + timedelta(minutes=1))
+        self.assertTrue(monitor.assess_and_notify(now=NOW + timedelta(minutes=1),
+                                                  send_reminders=False))
+        key = "plaid_connection:item-1:PLAID_REAUTH_REQUIRED"
+        self.assertTrue(self.store.issues[key]["active"])
+        self.assertEqual(self.store.issues[key]["occurrence"], 1)
+        self.assertFalse(self.store.notifications)
+        self.assertTrue(monitor.assess_and_notify(now=NOW + timedelta(days=1),
+                                                  send_reminders=False))
+        self.assertTrue(self.store.issues[key]["active"])
+        self.assertEqual(self.store.issues[key]["occurrence"], 1)
+        self.assertFalse(any(event["kind"] == "resolved" for event in self.store.events.values()))
+
     def test_new_persistent_recovered_and_reopened_reauth(self):
         self.evidence["items"][0]["last_error"] = "ITEM_LOGIN_REQUIRED"
         self.run_monitor()

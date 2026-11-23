@@ -12,6 +12,13 @@ The API reports each account's `inventory_status` and retains the Item-wide
 aggregate as `item_inventory_status`; a missing sibling does not block an
 available account's cached readiness. A cached-only success does not clear a
 previously confirmed Item authentication failure.
+An included account is `HEALTHY` when its recent successful `/accounts/get`
+verification found that account with a valid cached `balances.current` and no
+unresolved authentication, account, or collection concern applies. This does
+not require `/item/get`, live balance collection, or a new monthly snapshot.
+For cached-only checks, `connection_status` remains `UNKNOWN` while account
+health may be `HEALTHY`; `live_balance_tested` remains false. Monthly collection
+age and unchanged balances do not by themselves create account health warnings.
 
 The locally installed Plaid SDK describes `/accounts/get` as free and cached,
 and `/accounts/balance/get` as paid and real-time. No real-time balance request

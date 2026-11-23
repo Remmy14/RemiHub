@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from fastapi import Depends, FastAPI, HTTPException
 
 from backend.core.auth import AuthenticatedPrincipal, get_current_principal, require_admin_principal, require_current_principal
+from backend.models.finance_models import FinanceHealthResponse
 original_database = sys.modules.get("backend.database.database")
 fake_database = types.ModuleType("backend.database.database")
 fake_database.get_db_conn = lambda: None
@@ -141,14 +142,84 @@ class HealthAssessmentTests(unittest.TestCase):
         self.assertEqual(account["verification"]["collection_readiness"], "CACHED_INVENTORY_AVAILABLE")
         self.assertFalse(account["verification"]["live_balance_tested"])
 
+    def test_recent_cached_only_verification_is_healthy_without_snapshot(self):
+        data = evidence(snapshot=False)
+        data["items"][0].update(connection_status="UNKNOWN", inventory_status="AVAILABLE",
+                                 verification_outcome="VERIFIED", available_account_ids=["plaid-1"],
+                                 missing_account_ids=[], invalid_balance_ids=[],
+                                 verification_attempted_at=NOW, verification_succeeded_at=NOW,
+                                 verification_method="accounts_get", live_balance_tested=False)
+        result = assess(data)
+        account = result["accounts"][0]
+        self.assertEqual(account["health"], "HEALTHY")
+        self.assertEqual(account["issues"], [])
+        self.assertIsNone(account["recommended_action"])
+        self.assertNotIn("not been verified", account["explanation"])
+        self.assertEqual(result["counts"]["healthy"], 1)
+        self.assertEqual(account["freshness"], "UNKNOWN")  # No monthly collection occurred.
+        self.assertEqual(account["verification"]["outcome"], "VERIFIED")
+        self.assertEqual(account["verification"]["connection_status"], "UNKNOWN")
+        self.assertEqual(account["verification"]["inventory_status"], "AVAILABLE")
+        self.assertEqual(account["verification"]["cached_balance_status"], "VALID")
+        self.assertEqual(account["verification"]["collection_readiness"], "CACHED_INVENTORY_AVAILABLE")
+        self.assertEqual(account["verification"]["method"], "accounts_get")
+        self.assertFalse(account["verification"]["live_balance_tested"])
+        self.assertEqual(account["verification"]["succeeded_at"], NOW)
+
+        # A repeated monthly value is not a health warning.
+        data["snapshot"] = evidence()["snapshot"]
+        data["snapshot_items"] = evidence()["snapshot_items"]
+        self.assertEqual(assess(data)["accounts"][0]["health"], "HEALTHY")
+        self.assertEqual(assess(data)["accounts"][0]["issues"], [])
+
+    def test_cached_only_health_needs_recent_complete_successful_evidence(self):
+        data = evidence(snapshot=False)
+        item = data["items"][0]
+        item.update(connection_status="UNKNOWN", inventory_status="AVAILABLE",
+                    verification_outcome="VERIFIED", available_account_ids=["plaid-1"],
+                    verification_attempted_at=NOW, verification_succeeded_at=NOW,
+                    verification_method="accounts_get")
+        for change in (
+                {"verification_attempted_at": NOW - timedelta(hours=13),
+                 "verification_succeeded_at": NOW - timedelta(hours=13)},
+                {"verification_attempted_at": NOW, "verification_succeeded_at": None},
+                {"verification_attempted_at": NOW, "verification_succeeded_at": NOW,
+                 "verification_method": "item_get"},
+                {"verification_attempted_at": NOW, "verification_succeeded_at": NOW,
+                 "verification_method": "accounts_get", "verification_outcome": "TRANSIENT"}):
+            with self.subTest(change=change):
+                item.update(change)
+                account = assess(data)["accounts"][0]
+                self.assertEqual(account["health"], "UNKNOWN")
+                self.assertIn("PLAID_VERIFICATION_UNKNOWN", {issue["code"] for issue in account["issues"]})
+
+    def test_cached_only_success_does_not_hide_ownership_or_collection_warning(self):
+        data = evidence(snapshot=False)
+        item = data["items"][0]
+        item.update(connection_status="UNKNOWN", inventory_status="AVAILABLE",
+                    verification_outcome="VERIFIED", available_account_ids=["plaid-1"],
+                    verification_attempted_at=NOW, verification_succeeded_at=NOW,
+                    verification_method="accounts_get")
+        item["last_error"] = "Bank (connection item-1): temporary collection problem"
+        item["updated_at"] = NOW + timedelta(minutes=1)
+        account = assess(data)["accounts"][0]
+        self.assertEqual(account["health"], "WARNING")
+        self.assertIn("PLAID_COLLECTION_ERROR", {issue["code"] for issue in account["issues"]})
+
+        item["last_error"] = None
+        data["items"].append({"id": "item-2", "label": "Bank", "enabled": True})
+        account = assess(data)["accounts"][0]
+        self.assertEqual(account["health"], "UNKNOWN")
+        self.assertIn("PLAID_OWNERSHIP_UNKNOWN", {issue["code"] for issue in account["issues"]})
+
     def test_invalid_cached_balance_only_blocks_affected_account(self):
         data = evidence(snapshot=False)
         data["accounts"].append(plaid_account(id="account-2", source_account_id="plaid-2",
                                                name="Savings", display_name="Savings"))
-        data["items"][0].update(connection_status="VERIFIED", inventory_status="AVAILABLE",
+        data["items"][0].update(connection_status="UNKNOWN", inventory_status="AVAILABLE",
                                  verification_outcome="VERIFIED", available_account_ids=["plaid-1", "plaid-2"],
                                  invalid_balance_ids=["plaid-1"], verification_attempted_at=NOW,
-                                 verification_succeeded_at=NOW, verification_method="item_get+accounts_get")
+                                 verification_succeeded_at=NOW, verification_method="accounts_get")
         accounts = {account["account_id"]: account for account in assess(data)["accounts"]}
         self.assertEqual(accounts["account-1"]["verification"]["cached_balance_status"], "INVALID")
         self.assertEqual(accounts["account-1"]["verification"]["collection_readiness"], "BLOCKED")
@@ -160,11 +231,11 @@ class HealthAssessmentTests(unittest.TestCase):
     def test_missing_account_only_blocks_its_own_cached_readiness(self):
         data = evidence(snapshot=False)
         data["accounts"].append(plaid_account(id="account-2", source_account_id="plaid-2"))
-        data["items"][0].update(connection_status="VERIFIED", inventory_status="MISSING",
+        data["items"][0].update(connection_status="UNKNOWN", inventory_status="MISSING",
                                  verification_outcome="VERIFIED", available_account_ids=["plaid-2"],
                                  missing_account_ids=["plaid-1"], invalid_balance_ids=[],
                                  verification_attempted_at=NOW, verification_succeeded_at=NOW,
-                                 verification_method="item_get+accounts_get")
+                                 verification_method="accounts_get")
         accounts = {account["account_id"]: account for account in assess(data)["accounts"]}
         missing = accounts["account-1"]
         available = accounts["account-2"]
@@ -479,6 +550,18 @@ class PreflightRouteTests(unittest.TestCase):
         service.assert_called_once_with()
         self.assertIn("FinanceHealthResponse", app.openapi()["components"]["schemas"])
 
+    def test_preflight_response_accepts_cached_only_healthy_account(self):
+        data = evidence(snapshot=False)
+        data["items"][0].update(connection_status="UNKNOWN", inventory_status="AVAILABLE",
+                                 verification_outcome="VERIFIED", available_account_ids=["plaid-1"],
+                                 verification_attempted_at=NOW, verification_succeeded_at=NOW,
+                                 verification_method="accounts_get")
+        with patch.object(finance.finance_health_service, "assess_finance_health",
+                          return_value=assess(data)):
+            response = FinanceHealthResponse.model_validate(finance.get_preflight())
+        self.assertEqual(response.data.accounts[0].health, "HEALTHY")
+        self.assertEqual(response.data.accounts[0].verification.connection_status, "UNKNOWN")
+
 
 class LightweightVerificationTests(unittest.TestCase):
     def test_cached_result_persistence_preserves_confirmed_auth(self):
@@ -510,6 +593,35 @@ class LightweightVerificationTests(unittest.TestCase):
         self.assertEqual(result["connection_status"], "UNKNOWN")
         self.assertEqual(result["inventory_status"], "AVAILABLE")
         self.assertEqual(result["method"], "accounts_get")
+
+    def test_cached_balance_validator_accepts_zero_and_rejects_bad_values(self):
+        client = MagicMock()
+        item = {"environment": "sandbox", "access_token_encrypted": "encrypted"}
+        with patch.object(worker, "get_plaid_client", return_value=client), \
+             patch.object(worker, "decrypt_access_token", return_value="token"):
+            for value, invalid in ((0, []), (None, ["one"]),
+                                   (float("nan"), ["one"]), (float("inf"), ["one"])):
+                with self.subTest(value=value):
+                    client.accounts_get.return_value.to_dict.return_value = {
+                        "accounts": [{"account_id": "one", "balances": {"current": value}}]}
+                    result = verification._check_item(item, {"one"})
+                    self.assertEqual(result["outcome"], "VERIFIED")
+                    self.assertEqual(result["invalid_balance_ids"], invalid)
+                    if value == 0:
+                        data = evidence(snapshot=False)
+                        data["accounts"][0]["source_account_id"] = "one"
+                        data["items"][0].update(
+                            verification_outcome=result["outcome"],
+                            connection_status=result["connection_status"],
+                            inventory_status=result["inventory_status"],
+                            available_account_ids=result["available_account_ids"],
+                            invalid_balance_ids=result["invalid_balance_ids"],
+                            verification_method=result["method"],
+                            verification_attempted_at=NOW,
+                            verification_succeeded_at=NOW)
+                        self.assertEqual(assess(data)["accounts"][0]["health"], "HEALTHY")
+        client.item_get.assert_not_called()
+        client.accounts_balance_get.assert_not_called()
 
     def test_november_reminder_days_request_fresh_verification(self):
         for day, priority in ((27, False), (28, True), (29, False), (30, True)):

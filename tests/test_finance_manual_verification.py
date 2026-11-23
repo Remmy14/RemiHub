@@ -561,6 +561,52 @@ class SharedVerifierTests(TestCase):
                          "PLAID_REAUTH_REQUIRED")
         self.assertEqual(final["summary"]["connections_with_problems"], 1)
 
+    def test_manual_account_summary_uses_cached_only_healthy_assessment(self):
+        run_id = uuid4()
+        checked_at = datetime.now(timezone.utc)
+        row = {"connection_id": "item-1", "label": "Bank", "outcome": "VERIFIED",
+               "connection_status": "UNKNOWN", "inventory_status": "AVAILABLE",
+               "method": "accounts_get", "missing_accounts": 0,
+               "invalid_cached_balances": 0, "live_balance_tested": False}
+        stored = {"errors": [], "accounts": [{
+            "id": "account-1", "source": "plaid", "source_account_id": "plaid-1",
+            "institution_label": "Bank", "display_name": "Checking",
+            "include_in_net_worth": True}], "items": [{
+                "id": "item-1", "label": "Bank", "enabled": True,
+                "last_error": None, "connection_status": "UNKNOWN",
+                "inventory_status": "AVAILABLE", "available_account_ids": ["plaid-1"],
+                "missing_account_ids": [], "invalid_balance_ids": [],
+                "verification_outcome": "VERIFIED", "verification_method": "accounts_get",
+                "verification_attempted_at": checked_at,
+                "verification_succeeded_at": checked_at,
+            }], "manual": [], "snapshot": None, "snapshot_items": None}
+
+        def run(_owner, *, started_at, on_result):
+            on_result(row, 1)
+            return {"enabled_connections": 1, "included_accounts": 1,
+                    "results": [row], "complete": True}
+
+        assessed = manual.finance_health_service.assess_evidence(
+            stored, now=checked_at, config={}, completeness_check=lambda _p, _v: [])
+        with patch.object(manual, "_update", return_value=True) as update, \
+             patch.object(verification, "_run_items", side_effect=run), \
+             patch.object(verification, "_release", return_value=False), \
+             patch.object(manual.finance_monitor_service, "assess_and_notify") as monitor, \
+             patch.object(manual.finance_health_service, "assess_finance_health",
+                          return_value=assessed), \
+             patch.object(manual.finance_health_service, "read_evidence", return_value=stored), \
+             patch.object(verification.worker, "create_monthly_finance_snapshot") as snapshot:
+            manual.run_manual(run_id, "owner")
+        final = update.call_args.kwargs
+        self.assertEqual(final["results"]["accounts"][0]["health"], "HEALTHY")
+        self.assertEqual(final["results"]["accounts"][0]["issues"], [])
+        self.assertEqual(final["summary"]["accounts_with_actionable_issues"], 0)
+        self.assertEqual(final["summary"]["connections_with_problems"], 0)
+        self.assertEqual(final["results"]["accounts"][0]["verification"]["connection_status"],
+                         "UNKNOWN")
+        monitor.assert_called_once_with(send_reminders=False)
+        snapshot.assert_not_called()
+
     def test_partial_item_failure_reconciles_committed_evidence(self):
         run_id = uuid4()
         first = {"connection_id": "item-1", "label": "Bank", "outcome": "VERIFIED",

@@ -1,8 +1,8 @@
 """Read-only Finance health assessment from stored evidence.
 
-Plaid connection success is item-wide. Only a completed snapshot establishes
-which accounts and balances were actually collected; this service never calls
-Plaid, KBB, Zillow, or any Finance writer.
+Recent cached inventory verifies account-level collection readiness; a completed
+snapshot establishes which accounts and balances were actually collected. This
+service never calls Plaid, KBB, Zillow, or any Finance writer.
 """
 
 from collections import Counter
@@ -273,7 +273,9 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
             invalid_cached_balance = account_id in (connection.get("invalid_balance_ids") or [])
             transient = connection.get("verification_outcome") == "TRANSIENT"
             attempted = _datetime(connection.get("verification_attempted_at"))
-            expired = bool(attempted and now - attempted > timedelta(hours=12))
+            succeeded = _datetime(connection.get("verification_succeeded_at"))
+            expired = not (attempted and succeeded and attempted <= succeeded <= now
+                           and now - attempted <= timedelta(hours=12))
             item_inventory_status = ("UNKNOWN" if (transient or expired) and connection.get("inventory_status") == "AVAILABLE"
                                      else connection.get("inventory_status") or "UNKNOWN")
             account_inventory_status = ("MISSING" if account_id in missing_ids else
@@ -353,9 +355,10 @@ def assess_evidence(evidence: dict, *, now: datetime | None = None,
                     issues.append(_issue("PLAID_BALANCE_MISSING", "Required account balance is missing or invalid.", "Refresh account data."))
                     health = "BLOCKED"
         if health == "UNKNOWN" and not issues and connection:
-            if (verification["connection_status"] == "VERIFIED" and
-                    verification["inventory_status"] == "AVAILABLE" and
+            if ("accounts_get" in str(verification["method"] or "") and
+                    verification["collection_readiness"] == "CACHED_INVENTORY_AVAILABLE" and
                     verification["outcome"] == "VERIFIED" and
+                    verification["cached_balance_status"] == "VALID" and
                     account.get("source_account_id") not in (connection.get("invalid_balance_ids") or []) and
                     account.get("source_account_id") in (connection.get("available_account_ids") or [])):
                 health = "HEALTHY"
