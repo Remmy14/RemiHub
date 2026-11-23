@@ -1,64 +1,77 @@
-# Manually closed card workspace cleanup
+# Manual Close Card authorizes permanent workspace discard
 
-The administrator's existing Close Card API is the sole card-status transition.
-The helper has fixed read-only SQL and no card-close call or database write.
-Deployment/implementation/review completion, timers and age never close cards.
-A persisted Closed status plus an exact user-attributed card.closed event is
-required. Closure is independent of cleanup success. There is no new daemon.
+Only the authenticated administrator's existing Close Card action can close a
+card. The cleanup helper never closes/cancels cards and its fixed SQL is READ
+ONLY. Completed, Failed and Cancelled are not deletion authority: persisted
+Closed status plus the exact user-attributed card.closed event is required.
+The existing lifecycle permits manual closure of Completed, Failed and Cancelled
+cards. Active work must complete or be stopped through existing operator actions.
 
-Install the root-owned helper at /usr/local/libexec/remihub-agent-card-cleanup
-(mode 0755) and 97-card-cleanup.conf in the existing production deployment
-service's drop-in directory. Its privileged ExecStartPost is fixed purpose; it
-does not broaden the main worker's user or filesystem permissions. The existing
-timer runs reconciliation after successful run-once worker execution. Failure
-is logged but does not change the deployment result. A failed worker's next
-successful poll retries cleanup. No database migration, API or UI change occurs.
+Manual closure explicitly authorizes permanently discarding every disposable,
+exclusively owned worktree and its contents, including modified/untracked source,
+unique uncommitted edits, ignored files and failed/abandoned build outputs.
+No cleanliness, review, deployment-success or source-preservation proof is needed.
+Uncommitted data may be unrecoverable. Branches, tags, commits and shared Git
+objects remain; no history rewrite or garbage collection is performed.
 
-Root-owned /etc/remihub-agent-card-cleanup.json (0600) has exactly these keys:
-enabled (boolean), automatic_since (timezone-aware ISO timestamp),
-historical_cards (canonical UUID list), hold_cards (UUID list), hold_paths
-(absolute path list), max_resources (1..10). New manual closures after the
-activation watermark are automatic; earlier closures require an explicit
-reviewed historical card allowlist. Holds override automatic and historical
-eligibility. There is no age-based deletion. The historical allowlist can be
-cleared after reconciliation. Use --dry-run --historical before enabling it.
+The helper retains fixed repository/root/account boundaries, deterministic card
+UUID/revision paths and branches, persisted ownership, Git registration/common
+repository checks, filesystem ownership, no-follow root validation, cross-card
+isolation, explicit holds, active/retryable-run checks, process visibility and
+existing per-card flocks. Nested repositories, mounted/shared directories and
+uncertain identity defer deletion. Symlink targets are never traversed/deleted.
+Process cwd/root identities and mount aliases are checked as well as file/map
+paths. Confirmed zombies/kernel tasks have no userspace execution; errors reading
+an active/unclassified process fail closed. No process is killed by cleanup.
 
-Root-owned /var/lib/remihub-agent/card-cleanup (0700) retains compact per-card
-resource results and latest.json. Existing journald records each invocation.
-Per-card records retain removal intent and Git head/branch across crashes;
-recovery recognizes absent/unregistered worktrees without recreating or pruning.
-Global and existing per-card workspace flocks prevent concurrent removals.
+Eligible worktrees are removed as their actual repository owner using a single
+Git worktree remove --force. Native Git worktree locks remain retention holds;
+no double force, unrestricted recursive directory removal or global prune is
+used. The helper does not examine source contents or invoke Git status/filters.
+All build/temp contents inside the verified workspace are included. Outside it,
+patches, run/review/validation/deployment records, manifests, releases and rollback
+artifacts remain retained. Unattributed review-/index temp directories must not
+be guessed into a card association. The current inventory identified no retained
+standalone temporary directories in those pipeline patterns.
 
-Removal requires matching scope, deterministic UUID/revision path and branch,
-implementation ownership metadata, no active/retryable run, no process usage,
-complete process visibility, exact Git registration/common directory/owner,
-clean tracked/untracked state, and only explicitly classified ignored build
-outputs. Locked, stale, dirty, uncertain or retained resources defer. Git-native
-worktree removal runs as the real repository owner without force or broad
-safe.directory overrides. Branches, tags, commits and shared objects remain.
+Existing root-owned /etc/remihub-agent-card-cleanup.json uses enabled,
+hold_cards, hold_paths and max_resources (1..10). Legacy automatic_since and
+historical_cards fields are accepted for rollback compatibility but no longer
+gate eligibility: this policy applies to old and future verified manual closures.
+Keep those legacy fields during the initial rollout so the prior helper remains
+config-compatible if rollback is needed. Unknown keys fail closed. Holds always
+win over closure authorization.
 
-Frozen patches, review/validation evidence, deployment artifacts/manifests,
-release metadata, rollback refs/backups, shared caches, runtime directories,
-application files, media and historical preservation backups are excluded.
-Build outputs are reclaimed only as part of a verified removable worktree;
-standalone artifacts with ambiguous ownership are retained. Dirty worktrees
-remain deferred even when a frozen patch exists: the initial policy does not
-assume that patch preserves every local/ignored file.
+The existing enabled minute deployment timer continues to run the fixed cleanup
+post-hook after successful idle polls as well as successful deployments. No new
+worker, daemon, timer, migration or card-close API hook is introduced. Long or
+failed deployments/maintenance can delay a pass; later successful polls retry.
+Card closure never waits for deletion and remains Closed on failure/deferral.
 
-Inspect latest.json and per-card JSON as root, or journalctl for the existing
-production deployment unit. Disk estimates use du; filesystem free-byte deltas
-are affected by unrelated activity and are not exact attribution. Deferred
-resources remain visible in each reconciliation report. Audit metadata is small
-but follows existing card history retention; no workspace backups are created.
+Compact root-owned per-card intents/results and latest.json under
+/var/lib/remihub-agent/card-cleanup survive restarts. A cleanup intent is not
+closure authority: recovery rechecks the live card, holds, activity and exact
+registration. If interrupted removal lost only the .git marker, the original
+inode-bound marker may be restored from unchanged repository metadata before
+Git-native removal resumes. Missing/unregistered completed removals are recognized
+without recreating source. Disabled policy prevents destructive recovery too.
+No workspace backup or source-history verification system is added.
 
-Rollout: verify exact candidate and current baselines; run tests and a real
-controlled Git/process fixture; run production dry-run; install helper/policy/
-state/drop-in while the existing timer is briefly stopped and oneshot idle;
-reload systemd, run one bounded sweep, then restore the prior timer state.
-Do not restart applications or cancel work. Historical cleanup uses the same
-engine with a reviewed card allowlist, bounded batches and fresh checks.
+Before rollout run --dry-run --historical and report all eligible paths and size
+estimates. Do not install/enable this policy until historical deletion has been
+explicitly reviewed/authorized. While existing Agent dispatch is briefly fenced
+and idle, adopt the exact source, deploy the Close Card warning through the normal
+frontend build/QA/asset activation procedure, then replace the helper atomically.
+A Git source fast-forward alone does not deploy the compiled frontend warning.
+Freshly check active jobs, expected-old refs, helper identities, collisions,
+processes, holds and parity; never cancel work to make cleanup eligible.
+Run bounded batches, record before/after space observations and preserve all
+unclosed/unresolved resources. Restore only previously active units and verify an
+idle timer invocation. Publish backend source through the protected non-forced
+GitHub helper with expected-old verification; do not publish Android changes.
 
-Rollback disables policy.enabled and removes only this post-hook, followed by
-systemd daemon-reload. Preserve state/evidence and existing source history.
-Removed worktrees can be recreated from their preserved branches if needed;
-dirty worktrees were not removed. Do not reset repositories or delete history.
+Rollback: disable enabled, preserve state/evidence and restore the previous
+reviewed helper through an expected-current-hash atomic replacement. No Git reset
+or application-data change is needed. Removing the added post-hook and reloading
+systemd also stops cleanup. Discarded unique/uncommitted source is not promised
+recoverable: manual closure intentionally relinquishes it.

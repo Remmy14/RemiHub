@@ -595,7 +595,9 @@ function ActionPanel({
             {actionLabel(pendingAction)}
           </div>
           <p className="mt-1 text-sm text-slate-600">
-            {pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
+            {pendingAction === AgentActions.CLOSE
+              ? "Closing this card will permanently discard its implementation and deployment workspaces, including any uncommitted changes. Card history will be retained."
+              : pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
               ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
               : pendingAction === AgentActions.RETRY_REVIEW
               ? "Retry the same frozen candidate. This does not consume a correction cycle. Previous execution errors remain in history; deployment still requires an independent approval and separate human approval."

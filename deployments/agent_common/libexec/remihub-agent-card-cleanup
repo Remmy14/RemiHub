@@ -70,12 +70,12 @@ def secure_root_file(path):
 def read_policy():
     secure_root_file(CONFIG)
     policy=json.loads(CONFIG.read_text())
-    if set(policy) != {'enabled','automatic_since','historical_cards','hold_cards','hold_paths','max_resources'}:
+    required={'enabled','hold_cards','hold_paths','max_resources'}
+    if not required<=set(policy) or set(policy)-required-{'automatic_since','historical_cards'}:
         raise Deferred('unknown or incomplete policy')
-    for key in ('historical_cards','hold_cards'):
+    for key in ('hold_cards',):
         if not isinstance(policy[key],list):raise Deferred('invalid card policy')
         for value in policy[key]:canonical_id(value)
-    datetime.fromisoformat(policy['automatic_since'])
     if not isinstance(policy['enabled'],bool) or type(policy['max_resources']) is not int or not 1 <= policy['max_resources'] <= 10:
         raise Deferred('invalid cleanup budget')
     if not isinstance(policy['hold_paths'],list) or any(not isinstance(p,str) or not p.startswith('/') for p in policy['hold_paths']):raise Deferred('invalid retention paths')
@@ -87,8 +87,8 @@ def database():
     return json.loads(result.stdout)
 
 def git(surface, cwd, *args):
-    env={'PATH':'/usr/bin:/bin','HOME':'/nonexistent','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_OPTIONAL_LOCKS':'0','GIT_TERMINAL_PROMPT':'0'}
-    return subprocess.run(['/usr/sbin/runuser','-u',surface.owner,'--','/usr/bin/env',*[k+'='+v for k,v in env.items()],'/usr/bin/git','-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','-c','core.untrackedCache=false','-C',str(cwd),*args],capture_output=True,check=True,timeout=120).stdout
+    env={'PATH':'/usr/bin:/bin','HOME':'/nonexistent','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_OPTIONAL_LOCKS':'0','GIT_TERMINAL_PROMPT':'0','GIT_NO_REPLACE_OBJECTS':'1','GIT_NO_LAZY_FETCH':'1'}
+    return subprocess.run(['/usr/sbin/runuser','-u',surface.owner,'--','/usr/bin/env','-i',*[k+'='+v for k,v in env.items()],'/usr/bin/git','-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','-c','core.untrackedCache=false','-C',str(cwd),*args],capture_output=True,check=True,timeout=120).stdout
 
 def registrations(surface):
     no_symlinks(surface.repository);no_symlinks(surface.root)
@@ -126,17 +126,7 @@ def card_eligible(surface, card_id, path, db, policy, historical=False):
     for held in policy['hold_paths']:
         h=Path(held)
         if path==h or path in h.parents or h in path.parents:raise Deferred('explicit path retention hold')
-    after=datetime.fromisoformat(card['closed_at']) >= datetime.fromisoformat(policy['automatic_since'])
-    if not after and card_id not in policy['historical_cards'] and not historical:
-        raise Deferred('historical cleanup not enabled for this card')
     return card
-
-def ignored_disposable(name):
-    p=Path(name)
-    if p.is_absolute() or '..' in p.parts:return False
-    # Reproducible per-worktree outputs only; unknown ignored files are retained.
-    prefixes=('build/','app/build/','.gradle/','frontend-web/node_modules/','frontend-web/dist/','.pytest_cache/')
-    return name.startswith(prefixes) or ('__pycache__' in p.parts and p.suffix=='.pyc')
 
 def verify_worktree(surface, entry, path, branch):
     no_symlinks(path)
@@ -148,15 +138,36 @@ def verify_worktree(surface, entry, path, branch):
     if git(surface,path,'symbolic-ref','HEAD').decode().strip()!=branch:raise Deferred('worktree branch changed')
     head=git(surface,path,'rev-parse','HEAD').decode().strip()
     if head!=entry['HEAD'] or git(surface,surface.repository,'rev-parse',branch).decode().strip()!=head:raise Deferred('HEAD or preserved branch changed')
-    if git(surface,path,'status','--porcelain=v1','--untracked-files=all','--ignore-submodules=none').strip():raise Deferred('dirty or unpreserved changes')
-    ignored=git(surface,path,'ls-files','--others','--ignored','--exclude-standard','-z').split(b'\0')
-    if any(not ignored_disposable(os.fsdecode(p)) for p in ignored if p):raise Deferred('unclassified ignored files')
-    if (path/'.gitmodules').exists():
-        raise Deferred('submodule worktree requires manual inspection')
+    # Git state/content is intentionally not inspected: manual closure authorizes discard.
+    verify_isolation(path)
     st=path.stat();return st.st_dev,st.st_ino
+
+def mount_path(value):
+    for code in ('040','011','012','134'):
+        value=value.replace(chr(92)+code,chr(int(code,8)))
+    return value
+
+
+def verify_isolation(path):
+    # Refuse directory mounts and nested repositories; symlink targets are never followed.
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        mount=Path(mount_path(line.split()[4]))
+        if mount==path or path in mount.parents:raise Deferred('mounted/shared resource inside worktree')
+    def inaccessible(_error):raise Deferred('directory visibility incomplete')
+    for root,dirs,files in os.walk(path,followlinks=False,onerror=inaccessible):
+        if Path(root)!=path and ('.git' in dirs or '.git' in files):raise Deferred('nested repository requires ownership review')
+        dirs[:]=[d for d in dirs if not (Path(root)/d).is_symlink()]
+
+
+def inert_process(proc):
+    fields=dict(line.split(':',1) for line in (proc/'status').read_text().splitlines() if ':' in line)
+    return fields.get('State','').strip().split(' ')[0] in ('Z','X') or fields.get('Kthread','').strip()=='1'
 
 def process_use(path):
     prefix=str(path)+'/'
+    try:
+        st=path.stat();identity=(st.st_dev,st.st_ino)
+    except FileNotFoundError:identity=None
     def inside(value):return value==str(path) or value.startswith(prefix)
     for proc in Path('/proc').iterdir():
         if not proc.name.isdecimal():continue
@@ -164,16 +175,27 @@ def process_use(path):
             for name in ('cwd','root','exe'):
                 try:
                     if inside(os.readlink(proc/name).removesuffix(' (deleted)')):return True
+                    if identity is not None:
+                        st=(proc/name).stat()
+                        if (st.st_dev,st.st_ino)==identity:return True
                 except FileNotFoundError:pass
             for fd in (proc/'fd').iterdir():
                 try:
                     if inside(os.readlink(fd).removesuffix(' (deleted)')):return True
                 except FileNotFoundError:pass
+            for line in (proc/'mountinfo').read_text().splitlines():
+                value=mount_path(line.split()[3])
+                if inside(value):return True
             for line in (proc/'maps').read_text().splitlines():
                 parts=line.split(None,5)
                 if len(parts)==6 and inside(parts[5].removesuffix(' (deleted)')):return True
         except (FileNotFoundError,ProcessLookupError):continue
         except PermissionError:raise Deferred('process visibility incomplete')
+        except OSError as exc:
+            try:
+                if exc.errno==22 and inert_process(proc):continue
+            except FileNotFoundError:continue
+            raise Deferred('process visibility incomplete')
     return False
 
 @contextmanager
@@ -226,7 +248,7 @@ def sweep(policy, *, dry_run=True,historical=False,surfaces=SURFACES,load_db=dat
                         verify_worktree(surface,entry,path,branch)
                         if busy(path):raise Deferred('resource in use by process')
                     report['estimated_allocated_bytes']=int(subprocess.check_output(['/usr/bin/du','-sx','--block-size=1',str(path)],timeout=30).split()[0])
-                    report['status']='eligible';report['reason']='manual closure; clean registered worktree; history retained'
+                    report['status']='eligible';report['reason']='manual closure authorizes permanent workspace discard; safety checks passed'
                 else:
                     with card_locks(card_id,[s for s in surfaces if s.scope==surface.scope]):
                         card_eligible(surface,card_id,path,load_db(),policy)
@@ -236,15 +258,16 @@ def sweep(policy, *, dry_run=True,historical=False,surfaces=SURFACES,load_db=dat
                         if busy(path):raise Deferred('resource in use by process')
                         report['estimated_allocated_bytes']=int(subprocess.check_output(['/usr/bin/du','-sx','--block-size=1',str(path)],timeout=30).split()[0])
                         state_path=state_root/(card_id+'.json');state=resource_state(state_path)
-                        state['resources'][str(path)]={'status':'in_progress','head':entry['HEAD'],'branch':branch,'updated_at':datetime.now(timezone.utc).isoformat()}
+                        state['resources'][str(path)]={'status':'in_progress','head':entry['HEAD'],'branch':branch,'discard_authorized':True,'path_device':token[0],'path_inode':token[1],'git_dir':git(surface,path,'rev-parse','--absolute-git-dir').decode().strip(),'updated_at':datetime.now(timezone.utc).isoformat()}
                         atomic_json(state_path,state)
                         card_eligible(surface,card_id,path,load_db(),policy)
                         if verify_worktree(surface,entry,path,branch)!=token:raise Deferred('path identity changed')
-                        git(surface,surface.repository,'worktree','remove',str(path))
+                        if busy(path):raise Deferred('process appeared before removal')
+                        git(surface,surface.repository,'worktree','remove','--force',str(path))
                         if os.path.lexists(path) or any(e['worktree']==str(path) for e in registrations(surface)):raise Deferred('removal incomplete')
                         if git(surface,surface.repository,'rev-parse',branch).decode().strip()!=entry['HEAD']:raise Deferred('retained branch changed')
                         state['resources'][str(path)]['status']='completed';atomic_json(state_path,state)
-                        report['status']='removed';report['reason']='Git-native removal; branch retained';removed+=1
+                        report['status']='removed';report['reason']='user-authorized permanent discard; Git branch retained';removed+=1
             except (Deferred,FileNotFoundError) as exc:report['reason']=str(exc)
             except Exception as exc:report['status']='failed';report['reason']=type(exc).__name__
             if not dry_run and report.get('card_id') and any(c['id']==report['card_id'] and c['status']=='closed' and c['manual_close_exact'] for c in snapshot['cards']):
@@ -258,7 +281,7 @@ def sweep(policy, *, dry_run=True,historical=False,surfaces=SURFACES,load_db=dat
             results.append(report)
     return results
 
-def recover_intents(state_root, surfaces):
+def recover_intents(state_root, surfaces, *, policy=None,load_db=database,busy=process_use):
     # A crash after Git removal must not leave in_progress forever or recreate resources.
     known={str(s.root):s for s in surfaces}
     for p in state_root.glob('*.json'):
@@ -269,6 +292,38 @@ def recover_intents(state_root, surfaces):
             if record.get('status')!='in_progress':continue
             surface=known.get(str(Path(name).parent))
             if surface is None:continue
+            entries=[e for e in registrations(surface) if e['worktree']==name]
+            if record.get('discard_authorized') is True and entries:
+                effective=policy if policy is not None else read_policy()
+                if not effective['enabled']:continue
+                if len(entries)!=1 or entries[0].get('HEAD')!=record['head'] or entries[0].get('branch')!=record['branch'] or 'locked' in entries[0]:raise Deferred('recovery registration changed or retained')
+                card_id=canonical_id(p.stem);path=Path(name)
+                # The journal is not authorization: recheck current manual closure and holds.
+                card_eligible(surface,card_id,path,load_db(),effective)
+                expected=surface.root/('card-'+card_id)
+                if surface.implementation and path!=expected:raise Deferred('recovery ownership mismatch')
+                if not surface.implementation and not re.fullmatch('card-'+card_id+r'-r[1-9][0-9]*',path.name):raise Deferred('recovery ownership mismatch')
+                with card_locks(card_id,[s for s in surfaces if s.scope==surface.scope]):
+                    card_eligible(surface,card_id,path,load_db(),effective)
+                    if busy(path):raise Deferred('recovery resource in use')
+                    if not os.path.lexists(path):
+                        git(surface,surface.repository,'worktree','remove','--force',name)
+                    elif not os.path.lexists(path/'.git'):
+                        no_symlinks(path);verify_isolation(path)
+                        st=path.stat()
+                        if st.st_uid!=pwd.getpwnam(surface.owner).pw_uid or (st.st_dev,st.st_ino)!=(record.get('path_device'),record.get('path_inode')):raise Deferred('recovery directory identity changed')
+                        gd=Path(record['git_dir']);no_symlinks(gd)
+                        if gd.parent!=surface.repository/'worktrees':raise Deferred('recovery metadata escapes repository')
+                        for key,value in [('HEAD','ref: '+record['branch']),('gitdir',str(path/'.git'))]:
+                            no_symlinks(gd/key)
+                            if (gd/key).read_text().strip()!=value:raise Deferred('recovery metadata changed')
+                        no_symlinks(gd/'commondir')
+                        if (gd/(gd/'commondir').read_text().strip()).resolve()!=surface.repository:raise Deferred('recovery common directory changed')
+                        fd=os.open(path/'.git',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644)
+                        with os.fdopen(fd,'w') as f:
+                            owner=pwd.getpwnam(surface.owner);os.fchown(f.fileno(),owner.pw_uid,owner.pw_gid)
+                            f.write('gitdir: '+str(gd)+'\n');f.flush();os.fsync(f.fileno())
+                        git(surface,surface.repository,'worktree','repair',name)
             if not os.path.lexists(name) and not any(e['worktree']==name for e in registrations(surface)):
                 if git(surface,surface.repository,'rev-parse',record['branch']).decode().strip()==record['head']:
                     record['status']='completed';record['recovered']=True;changed=True
@@ -280,15 +335,16 @@ def main():
     args=parser.parse_args()
     if os.geteuid()!=0:parser.error('root required for fixed-account operations')
     if args.sweep==args.dry_run:parser.error('choose exactly --sweep or --dry-run')
-    if args.historical and not args.dry_run:parser.error('historical removal requires reviewed policy card allowlist')
+    if args.historical and not args.dry_run:parser.error('--historical is an inventory flag; removal uses --sweep')
     policy=read_policy()
     if args.sweep:
+        if not policy['enabled']:raise Deferred('cleanup disabled')
         no_symlinks(STATE);st=STATE.stat()
         if st.st_uid!=0 or stat.S_IMODE(st.st_mode)!=0o700:raise Deferred('unsafe state directory')
         fd=os.open(STATE/'sweep.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
         try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return
-        recover_intents(STATE,SURFACES)
+        recover_intents(STATE,SURFACES,policy=policy)
     before=os.statvfs('/');started=datetime.now(timezone.utc).isoformat()
     results=sweep(policy,dry_run=args.dry_run,historical=args.historical)
     after=os.statvfs('/');report={'started_at':started,'finished_at':datetime.now(timezone.utc).isoformat(),'trigger':'manual-card-closure-reconciliation','dry_run':args.dry_run,'estimated_removed_bytes':sum(r.get('estimated_allocated_bytes',0) for r in results if r['status']=='removed'),'resources':results,'filesystem_free_bytes_delta':(after.f_bavail-before.f_bavail)*after.f_frsize,'measurement_note':'Concurrent filesystem activity affects free-space delta; not exact reclaimed bytes'}
