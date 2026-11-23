@@ -401,6 +401,7 @@ function CardList({
             activeCards.map((card) => (
               <CardSummaryRow
                 card={card}
+                statusFirst
                 usage={usageSummary?.token_accounting.by_card.find((item) => item.card_id === card.id)?.total_tokens ?? null}
                 usageLoaded={usageSummary !== null}
                 usageCurrent={usageCurrent}
