@@ -15,6 +15,52 @@ export const AgentActions = {
 
 export type AgentAction = (typeof AgentActions)[keyof typeof AgentActions];
 
+export type BacklogPriority = "High" | "Medium" | "Low";
+export type BacklogItem = {
+  id: string;
+  title: string;
+  prompt: string;
+  priority: BacklogPriority;
+  created_by: string;
+  promoted_card_id: string | null;
+  promoted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+type BacklogItemResponse = { success: boolean; data: BacklogItem };
+type BacklogListResponse = { success: boolean; data: BacklogItem[] };
+type BacklogPromotionResponse = { success: boolean; data: { backlog_item_id: string; card_id: string } };
+
+export async function listBacklogItems(order: "priority" | "created_at" = "priority"): Promise<BacklogItem[]> {
+  const response = await apiRequest<BacklogListResponse>(`/agent/backlog?order=${order}`);
+  return response.data;
+}
+
+export async function getBacklogItem(id: string): Promise<BacklogItem> {
+  const response = await apiRequest<BacklogItemResponse>(`/agent/backlog/${id}`);
+  return response.data;
+}
+
+export async function saveBacklogItem(
+  data: { title: string; prompt: string; priority: BacklogPriority }, id?: string,
+): Promise<BacklogItem> {
+  const response = await apiRequest<BacklogItemResponse>(id ? `/agent/backlog/${id}` : "/agent/backlog", {
+    method: id ? "PUT" : "POST", body: JSON.stringify(data),
+  });
+  return response.data;
+}
+
+export async function deleteBacklogItem(id: string): Promise<void> {
+  await apiRequest<void>(`/agent/backlog/${id}`, { method: "DELETE" });
+}
+
+export async function sendBacklogToPlanning(id: string): Promise<string> {
+  const response = await apiRequest<BacklogPromotionResponse>(
+    `/agent/backlog/${id}/send-to-planning`, { method: "POST" },
+  );
+  return response.data.card_id;
+}
+
 export type AgentLatestRun = {
   independent_review?: Record<string, unknown> | null;
   id: string;

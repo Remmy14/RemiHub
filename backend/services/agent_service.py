@@ -973,6 +973,34 @@ def _card_detail(conn, card_id: str) -> dict:
     return _decorate_card(card, latest_run=latest_run)
 
 
+def _insert_initial_card(
+    cur, *, title: str, description: str, created_by: str,
+    client_message_id: str | None = None,
+) -> str:
+    """Insert the ordinary card and its planning work within the caller's transaction."""
+    card_id = str(uuid4())
+    cur.execute(
+        """INSERT INTO agent.cards (id, title, description, status, created_by)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (card_id, title, description, CardStatus.PLANNING_QUEUED.value, created_by),
+    )
+    message_id = _insert_message(
+        cur, card_id=card_id, author_type="user", content=description,
+        created_by=created_by, client_message_id=client_message_id,
+    )
+    run_id = _insert_run(
+        cur, card_id=card_id, phase=RunPhase.PLANNING,
+        card_revision=1, requested_by=created_by, input_message_id=message_id,
+    )
+    _insert_event(
+        cur, card_id=card_id, event_type="card.created", actor_type="user",
+        actor_user_id=created_by,
+        payload={"repository_scope": RepositoryScope.AUTO.value,
+                 "run_id": run_id, "status": CardStatus.PLANNING_QUEUED.value},
+    )
+    return card_id
+
+
 def create_card(
     *,
     title: str,
@@ -986,57 +1014,12 @@ def create_card(
         field="description",
         maximum=20000,
     )
-    card_id = str(uuid4())
-
     conn = get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO agent.cards (
-                    id,
-                    title,
-                    description,
-                    status,
-                    created_by
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    card_id,
-                    title,
-                    description,
-                    CardStatus.PLANNING_QUEUED.value,
-                    created_by,
-                ),
-            )
-            message_id = _insert_message(
-                cur,
-                card_id=card_id,
-                author_type="user",
-                content=description,
-                created_by=created_by,
+            card_id = _insert_initial_card(
+                cur, title=title, description=description, created_by=created_by,
                 client_message_id=client_message_id,
-            )
-            run_id = _insert_run(
-                cur,
-                card_id=card_id,
-                phase=RunPhase.PLANNING,
-                card_revision=1,
-                requested_by=created_by,
-                input_message_id=message_id,
-            )
-            _insert_event(
-                cur,
-                card_id=card_id,
-                event_type="card.created",
-                actor_type="user",
-                actor_user_id=created_by,
-                payload={
-                    "repository_scope": RepositoryScope.AUTO.value,
-                    "run_id": run_id,
-                    "status": CardStatus.PLANNING_QUEUED.value,
-                },
             )
 
         card = _card_detail(conn, card_id)

@@ -2,6 +2,8 @@ import { reviewRunStatus } from "./api/agentReview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode } from "react";
 import { CardUsage, CodexUsageDashboard } from "./CodexUsage";
+import AgentBacklog from "./AgentBacklog";
+import { confirmBacklogDiscard } from "./backlogFlow";
 
 import {
   addAgentFollowUp,
@@ -1089,7 +1091,8 @@ function CardDetail({
 }
 
 export default function AgentScreen() {
-  const [activeTab, setActiveTab] = useState<"cards" | "usage">("cards");
+  const [activeTab, setActiveTab] = useState<"cards" | "backlog" | "usage">("cards");
+  const [backlogDirty, setBacklogDirty] = useState(false);
   const [cards, setCards] = useState<AgentCardSummary[]>([]);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [selectedCard, setSelectedCard] = useState<AgentCardDetail | null>(null);
@@ -1266,15 +1269,29 @@ export default function AgentScreen() {
   };
 
   const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
-    const tabs = ["cards", "usage"] as const;
+    const tabs = ["cards", "backlog", "usage"] as const;
     const current = tabs.indexOf(activeTab);
     const next = event.key === "ArrowRight" ? (current + 1) % tabs.length :
       event.key === "ArrowLeft" ? (current + tabs.length - 1) % tabs.length :
         event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
     if (next === null) return;
     event.preventDefault();
-    setActiveTab(tabs[next]);
-    document.getElementById(`agent-tab-${tabs[next]}`)?.focus();
+    if (changeTab(tabs[next])) document.getElementById(`agent-tab-${tabs[next]}`)?.focus();
+  };
+
+  const changeTab = (tab: "cards" | "backlog" | "usage") => {
+    if (tab !== "backlog" && activeTab === "backlog" &&
+        !confirmBacklogDiscard(backlogDirty, window.confirm)) return false;
+    setActiveTab(tab);
+    return true;
+  };
+
+  const openPromotedCard = (id: string) => {
+    setActiveTab("cards");
+    setSelectedCard(null);
+    setSelectedCardId(id);
+    void loadCard(id);
+    void loadCards(true);
   };
 
   return (
@@ -1289,11 +1306,11 @@ export default function AgentScreen() {
       </div>
 
       <div role="tablist" aria-label="Agent sections" className="mb-5 flex flex-wrap gap-2 border-b border-slate-300">
-        {(["cards", "usage"] as const).map((tab) => <button key={tab} id={`agent-tab-${tab}`}
+        {(["cards", "backlog", "usage"] as const).map((tab) => <button key={tab} id={`agent-tab-${tab}`}
           type="button" role="tab" aria-controls={`agent-panel-${tab}`} aria-selected={activeTab === tab}
-          tabIndex={activeTab === tab ? 0 : -1} onClick={() => setActiveTab(tab)} onKeyDown={onTabKeyDown}
+          tabIndex={activeTab === tab ? 0 : -1} onClick={() => changeTab(tab)} onKeyDown={onTabKeyDown}
           className={`rounded-t-md px-4 py-2 text-sm font-bold focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600 ${activeTab === tab ? "border-b-2 border-blue-600 bg-white text-blue-800" : "text-slate-600 hover:bg-slate-200"}`}>
-          {tab === "cards" ? "Cards" : "Codex Usage"}
+          {tab === "cards" ? "Cards" : tab === "backlog" ? "Backlog" : "Codex Usage"}
         </button>)}
       </div>
 
@@ -1308,6 +1325,10 @@ export default function AgentScreen() {
 
       <div id="agent-panel-usage" role="tabpanel" aria-labelledby="agent-tab-usage" hidden={activeTab !== "usage"} tabIndex={0}>
         <CodexUsageDashboard onSummary={receiveUsageSummary} summaryRefresh={usageSummaryRefresh} />
+      </div>
+
+      <div id="agent-panel-backlog" role="tabpanel" aria-labelledby="agent-tab-backlog" hidden={activeTab !== "backlog"} tabIndex={0}>
+        <AgentBacklog onOpenCard={openPromotedCard} onDirtyChange={setBacklogDirty} />
       </div>
 
       <div id="agent-panel-cards" role="tabpanel" aria-labelledby="agent-tab-cards" hidden={activeTab !== "cards"} tabIndex={0}>

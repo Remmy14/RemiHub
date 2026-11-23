@@ -20,6 +20,45 @@ class AgentCardCreate(AgentRequestModel):
     client_message_id: UUID | None = None
 
 
+class AgentBacklogWrite(BaseModel):
+    # Preserve the prompt verbatim, including leading/trailing line breaks.
+    title: str = Field(min_length=1, max_length=160)
+    prompt: str = Field(min_length=1, max_length=20000)
+    priority: Literal["High", "Medium", "Low"] = "Medium"
+
+
+class AgentBacklogItem(BaseModel):
+    id: UUID
+    title: str
+    prompt: str
+    priority: Literal["High", "Medium", "Low"]
+    created_by: UUID
+    promoted_card_id: UUID | None
+    promoted_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentBacklogItemResponse(BaseModel):
+    success: bool
+    data: AgentBacklogItem
+
+
+class AgentBacklogListResponse(BaseModel):
+    success: bool
+    data: list[AgentBacklogItem]
+
+
+class AgentBacklogPromotion(BaseModel):
+    backlog_item_id: UUID
+    card_id: UUID
+
+
+class AgentBacklogPromotionResponse(BaseModel):
+    success: bool
+    data: AgentBacklogPromotion
+
+
 class AgentMessageCreate(AgentRequestModel):
     content: str = Field(min_length=1, max_length=20000)
     client_message_id: UUID | None = None

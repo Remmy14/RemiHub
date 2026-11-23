@@ -5,6 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.core.auth import AuthenticatedPrincipal, require_admin_principal
 from backend.models.agent_models import (
+    AgentBacklogWrite,
+    AgentBacklogItemResponse,
+    AgentBacklogListResponse,
+    AgentBacklogPromotionResponse,
     AgentCardCreate,
     AgentCardListResponse,
     AgentCardResponse,
@@ -19,6 +23,7 @@ from backend.models.agent_models import (
     CodexConfigurationResponse,
 )
 from backend.services import agent_service
+from backend.services import agent_backlog_service
 from backend.services import agent_usage_service
 
 
@@ -95,6 +100,70 @@ def _raise_http_error(exc: Exception) -> None:
         ) from exc
 
     raise exc
+
+
+@router.post("/backlog", status_code=status.HTTP_201_CREATED,
+             response_model=AgentBacklogItemResponse, responses=CARD_ERROR_RESPONSES)
+def create_backlog_item(request: AgentBacklogWrite,
+                        principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        item = agent_backlog_service.create(**request.model_dump(), created_by=principal.id)
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": item}
+
+
+@router.get("/backlog", response_model=AgentBacklogListResponse, responses=CARD_ERROR_RESPONSES)
+def list_backlog_items(order: str = "priority",
+                       _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        items = agent_backlog_service.list_active(order=order)
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": items}
+
+
+@router.get("/backlog/{item_id}", response_model=AgentBacklogItemResponse,
+            responses=CARD_ERROR_RESPONSES)
+def get_backlog_item(item_id: UUID,
+                     _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        item = agent_backlog_service.get(str(item_id))
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": item}
+
+
+@router.put("/backlog/{item_id}", response_model=AgentBacklogItemResponse,
+            responses=CARD_ERROR_RESPONSES)
+def update_backlog_item(item_id: UUID, request: AgentBacklogWrite,
+                        _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        item = agent_backlog_service.update(str(item_id), **request.model_dump())
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": item}
+
+
+@router.delete("/backlog/{item_id}", status_code=status.HTTP_204_NO_CONTENT,
+               responses=CARD_ERROR_RESPONSES)
+def delete_backlog_item(item_id: UUID,
+                        _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        agent_backlog_service.delete(str(item_id))
+    except Exception as exc:
+        _raise_http_error(exc)
+
+
+@router.post("/backlog/{item_id}/send-to-planning",
+             response_model=AgentBacklogPromotionResponse, responses=CARD_ERROR_RESPONSES)
+def send_backlog_to_planning(item_id: UUID,
+                             principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        result = agent_backlog_service.send_to_planning(str(item_id), created_by=principal.id)
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "data": result}
 
 
 @router.post(
