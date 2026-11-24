@@ -1427,6 +1427,15 @@ def return_to_implementation(
                 input_message_id=message_id,
             )
 
+            # Queue an authorized refresh for the existing workspace manager.
+            # Merge into its initial metadata to preserve the new review cycle.
+            # The worker preserves WIP and advances to authoritative main under
+            # the existing workspace lock; the API never rewrites source.
+            cur.execute(
+                "UPDATE agent.runs SET result_metadata = result_metadata || %s::jsonb WHERE id = %s",
+                (json.dumps({"refresh_base": True}), run_id),
+            )
+
             _update_card_status(
                 cur,
                 card_id=card_id,
@@ -1442,6 +1451,7 @@ def return_to_implementation(
                 actor_user_id=requested_by,
                 payload={
                     "failed_deployment_run_id": failed_run["id"],
+                    "refresh_base_requested": True,
                     "old_revision": card["revision"],
                     "revision": revision,
                     "implementation_run_id": run_id,

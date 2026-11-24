@@ -18,7 +18,11 @@ backend QA rollback blocks, bound to the exact run, card revision and candidate.
 It rejects production handoffs, production deployments, inconsistent identities,
 incomplete rollback evidence and a successful deployment of the revision. The
 existing transaction increments the revision and queues implementation with user
-instructions. Old approvals and all run/review records remain historical;
+instructions, merging `refresh_base=true` into the new run metadata while retaining
+its fresh review cycle. The existing workspace manager preserves dirty tracked
+and untracked work in a retained stash, fast-forwards only and fences conflicts
+before validation. Finalize and publish infrastructure baseline changes before
+invoking recovery; never refresh manually or reuse a stale frozen patch. Old approvals and all run/review records remain historical;
 modified source requires fresh trusted validation, independent review and human
 deployment approval. No direct status or approval SQL is an activation step.
 
