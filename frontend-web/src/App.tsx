@@ -15,6 +15,7 @@ type ModuleEntry = {
   name: string;
   description: string;
   href: string;
+  icon: string;
   status: string;
   publicModule?: boolean;
 };
@@ -24,6 +25,7 @@ const modules: ModuleEntry[] = [
     name: "Race Day",
     description: "Live Indy 500 pool standings for the family race day view.",
     href: "/race",
+    icon: "/module-icons/race-day.svg",
     status: "Public",
     publicModule: true,
   },
@@ -31,6 +33,7 @@ const modules: ModuleEntry[] = [
     name: "Race Draft",
     description: "Draft companion for pool selection and available drivers.",
     href: "/race/draft",
+    icon: "/module-icons/race-draft.svg",
     status: "Public",
     publicModule: true,
   },
@@ -38,36 +41,42 @@ const modules: ModuleEntry[] = [
     name: "Finance",
     description: "Financial snapshots, history, and account management.",
     href: "/portal/finance",
+    icon: "/module-icons/finance.svg",
     status: "Authenticated",
   },
   {
     name: "Plex Monitor",
     description: "Track downloads from submission through Plex processing.",
     href: "/portal/downloads",
+    icon: "/module-icons/plex-monitor.svg",
     status: "Authenticated",
   },
   {
     name: "Fitness",
     description: "Scheduled workouts, running, reusable templates, and training plans.",
     href: "/portal/fitness",
+    icon: "/module-icons/fitness.svg",
     status: "Authenticated",
   },
   {
     name: "RH-Storage",
     description: "Storage pool health and repair status.",
     href: "/storage",
+    icon: "/module-icons/rh-storage.svg",
     status: "Authenticated",
   },
   {
     name: "Agent",
     description: "Deployment and agent workflow controls.",
     href: "/agent",
+    icon: "/module-icons/agent.svg",
     status: "Authenticated",
   },
   {
     name: "Health",
     description: "Service health and operational status.",
     href: "/health",
+    icon: "/module-icons/health.svg",
     status: "Authenticated",
   },
 ];
@@ -232,8 +241,17 @@ function PortalHome() {
               key={module.name}
             >
               <div className="flex items-start justify-between gap-3">
-                <h2 className="text-lg font-black">{module.name}</h2>
-                <span className="rounded-full bg-slate-100 px-2 py-1 text-xs font-bold text-slate-600">
+                <div className="flex min-w-0 items-center gap-3">
+                  <img
+                    alt=""
+                    className="h-10 w-10 shrink-0 rounded-lg"
+                    height="40"
+                    src={module.icon}
+                    width="40"
+                  />
+                  <h2 className="text-lg font-black">{module.name}</h2>
+                </div>
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-1 text-xs font-bold text-slate-600">
                   {module.status}
                 </span>
               </div>
