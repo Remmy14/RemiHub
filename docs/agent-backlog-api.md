@@ -11,14 +11,15 @@ and leaves the draft active.
 
 | Operation | Endpoint | Body / query | Successful data |
 | --- | --- | --- | --- |
-| List active drafts | `GET /agent/backlog` | `order=priority` (default) or `order=created_at` | Array of items |
+| List active drafts | `GET /agent/backlog` | `order=custom` (default), `order=priority`, or `order=created_at` | Array of items and top-level `revision` |
+| Reorder active drafts | `PUT /agent/backlog/order` | `{revision, item_ids}` containing every active item ID exactly once | Updated top-level `revision` |
 | Create | `POST /agent/backlog` | `{title, prompt, priority?}` | Item; HTTP 201 |
 | Retrieve | `GET /agent/backlog/{id}` | — | Item, including its complete prompt |
 | Update | `PUT /agent/backlog/{id}` | `{title, prompt, priority?}` | Updated item |
 | Delete draft | `DELETE /agent/backlog/{id}` | — | HTTP 204 |
 | Send to Planning | `POST /agent/backlog/{id}/send-to-planning` | Empty body | `{backlog_item_id, card_id}` |
 
-An item has `id`, `title`, `prompt`, `priority` (`High`, `Medium`, `Low`),
+An item has `id`, `title`, `prompt`, `priority` (`High`, `Medium`, `Low`), `sort_order`,
 `created_by`, `created_at`, `updated_at`, `promoted_card_id`, and `promoted_at`.
 Priority defaults to `Medium`. Title and prompt are required, nonblank, and
 limited to 160 and 20,000 characters respectively. The prompt is stored and
@@ -27,6 +28,20 @@ items. Retrieval of a known submitted item remains available for historical
 linkage. A repeated promotion returns the original `card_id`, allowing a client
 to recover after losing an HTTP response. Draft writes never create a card or
 planning run; only the promotion endpoint does.
+
+Custom order is shared across administrators. Existing drafts are assigned positions
+in the former default display order (Priority, then newest first) on first backlog
+access after migration `0029`. New drafts append at the bottom. Reorder requests
+must include the revision from a list response; a stale revision or changed active
+item set returns 409, so the client can reload before retrying. Reordering changes
+only `sort_order`; it never changes priority or creates an Agent card or run.
+
+The `0029` migration creates `agent.backlog_order_state`. Before enabling the new
+API, RemiHub must grant the application role SELECT, INSERT, and UPDATE on that
+table, plus UPDATE on `agent.backlog_items` if it does not already have it. This
+grant is a RemiHub deployment step; migration SQL cannot contain role grants.
+Rolling back `0029` removes custom positions, so export them before rollback if
+they need to be retained.
 
 ## Deployment database privileges
 

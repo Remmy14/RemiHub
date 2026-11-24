@@ -6,8 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from backend.core.auth import AuthenticatedPrincipal, require_admin_principal
 from backend.models.agent_models import (
     AgentBacklogWrite,
+    AgentBacklogReorder,
     AgentBacklogItemResponse,
     AgentBacklogListResponse,
+    AgentBacklogOrderResponse,
     AgentBacklogPromotionResponse,
     AgentCardCreate,
     AgentCardListResponse,
@@ -114,13 +116,25 @@ def create_backlog_item(request: AgentBacklogWrite,
 
 
 @router.get("/backlog", response_model=AgentBacklogListResponse, responses=CARD_ERROR_RESPONSES)
-def list_backlog_items(order: str = "priority",
+def list_backlog_items(order: str = "custom",
                        _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
     try:
-        items = agent_backlog_service.list_active(order=order)
+        items, revision = agent_backlog_service.list_active(order=order)
     except Exception as exc:
         _raise_http_error(exc)
-    return {"success": True, "data": items}
+    return {"success": True, "data": items, "revision": revision}
+
+
+@router.put("/backlog/order", response_model=AgentBacklogOrderResponse,
+            responses=CARD_ERROR_RESPONSES)
+def reorder_backlog_items(request: AgentBacklogReorder,
+                          _principal: AuthenticatedPrincipal = Depends(require_admin_principal)):
+    try:
+        revision = agent_backlog_service.reorder(
+            [str(item_id) for item_id in request.item_ids], revision=request.revision)
+    except Exception as exc:
+        _raise_http_error(exc)
+    return {"success": True, "revision": revision}
 
 
 @router.get("/backlog/{item_id}", response_model=AgentBacklogItemResponse,

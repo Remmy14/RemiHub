@@ -27,6 +27,11 @@ class AgentBacklogWrite(BaseModel):
     priority: Literal["High", "Medium", "Low"] = "Medium"
 
 
+class AgentBacklogReorder(BaseModel):
+    revision: int = Field(ge=0)
+    item_ids: list[UUID]
+
+
 class AgentBacklogItem(BaseModel):
     id: UUID
     title: str
@@ -37,6 +42,7 @@ class AgentBacklogItem(BaseModel):
     promoted_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    sort_order: int | None
 
 
 class AgentBacklogItemResponse(BaseModel):
@@ -47,6 +53,12 @@ class AgentBacklogItemResponse(BaseModel):
 class AgentBacklogListResponse(BaseModel):
     success: bool
     data: list[AgentBacklogItem]
+    revision: int
+
+
+class AgentBacklogOrderResponse(BaseModel):
+    success: bool
+    revision: int
 
 
 class AgentBacklogPromotion(BaseModel):

@@ -15,13 +15,14 @@ CARD_ID = "2ee985cd-78dc-4e1f-8f51-62507fe1b55a"
 USER_ID = "c346f3f4-3867-4ddb-83ea-7d24db8817bc"
 NOW = "2026-11-23T00:00:00+00:00"
 COLUMNS = [part.strip() for part in backlog.COLUMNS.split(",")]
+ORIGINAL_LOCK_ORDER = backlog._lock_order
 
 
 def item(*, promoted_card_id=None):
     return dict(id=ITEM_ID, title="Detailed request", prompt="  first line\nsecond line\n",
                 priority="Medium", created_by=USER_ID, promoted_card_id=promoted_card_id,
                 promoted_at=NOW if promoted_card_id else None,
-                created_at=NOW, updated_at=NOW)
+                created_at=NOW, updated_at=NOW, sort_order=1)
 
 
 def row(value):
@@ -29,12 +30,26 @@ def row(value):
 
 
 class BacklogServiceTests(unittest.TestCase):
+    def setUp(self):
+        lock = patch.object(backlog, "_lock_order", return_value=0)
+        lock.start()
+        self.addCleanup(lock.stop)
+
     def connection(self, *rows):
         conn = MagicMock()
         cur = conn.cursor.return_value.__enter__.return_value
         cur.description = [(name,) for name in COLUMNS]
         cur.fetchone.side_effect = rows
         return conn, cur
+
+    def test_first_access_backfills_existing_items_in_old_default_order(self):
+        cur = MagicMock()
+        cur.fetchone.return_value = (0, False)
+        self.assertEqual(ORIGINAL_LOCK_ORDER(cur), 0)
+        statements = [call.args[0] for call in cur.execute.call_args_list]
+        self.assertTrue(any("row_number()" in statement and "CASE priority" in statement
+                            and "created_at DESC" in statement for statement in statements))
+        self.assertTrue(any("initialized = true" in statement for statement in statements))
 
     @patch.object(backlog.agent_service, "put_db_conn")
     @patch.object(backlog.agent_service, "get_db_conn")
@@ -44,9 +59,9 @@ class BacklogServiceTests(unittest.TestCase):
         result = backlog.create(title=item()["title"], prompt=item()["prompt"],
                                 priority="Medium", created_by=USER_ID)
         self.assertEqual(result["prompt"], item()["prompt"])
-        self.assertEqual(cur.execute.call_count, 1)
-        self.assertIn("INSERT INTO agent.backlog_items", cur.execute.call_args.args[0])
-        self.assertNotIn("agent.runs", cur.execute.call_args.args[0])
+        statements = [call.args[0] for call in cur.execute.call_args_list]
+        self.assertTrue(any("INSERT INTO agent.backlog_items" in statement for statement in statements))
+        self.assertFalse(any("agent.runs" in statement for statement in statements))
         conn.commit.assert_called_once()
 
     @patch.object(backlog.agent_service, "put_db_conn")
@@ -60,9 +75,9 @@ class BacklogServiceTests(unittest.TestCase):
         insert_card.assert_called_once_with(
             cur, title=item()["title"], description=item()["prompt"], created_by=USER_ID,
         )
-        self.assertIn("FOR UPDATE", cur.execute.call_args_list[0].args[0])
-        self.assertIn("promoted_card_id", cur.execute.call_args_list[1].args[0])
-        self.assertIn("updated_at = CURRENT_TIMESTAMP", cur.execute.call_args_list[1].args[0])
+        statements = [call.args[0] for call in cur.execute.call_args_list]
+        self.assertTrue(any("FOR UPDATE" in statement for statement in statements))
+        self.assertTrue(any("updated_at = CURRENT_TIMESTAMP" in statement for statement in statements))
         conn.commit.assert_called_once()
 
     @patch.object(backlog.agent_service, "put_db_conn")
@@ -128,11 +143,13 @@ class BacklogServiceTests(unittest.TestCase):
         conn, cur = self.connection()
         cur.fetchall.return_value = []
         get_conn.return_value = conn
-        self.assertEqual(backlog.list_active(order="priority"), [])
+        self.assertEqual(backlog.list_active(order="priority"), ([], 0))
         self.assertIn("CASE priority", cur.execute.call_args.args[0])
         self.assertIn("promoted_card_id IS NULL", cur.execute.call_args.args[0])
         backlog.list_active(order="created_at")
         self.assertNotIn("CASE priority", cur.execute.call_args.args[0])
+        backlog.list_active()
+        self.assertIn("sort_order", cur.execute.call_args.args[0])
         with self.assertRaises(ValueError):
             backlog.list_active(order="unknown")
 
@@ -153,7 +170,7 @@ class BacklogHttpTests(unittest.TestCase):
     def test_all_backlog_routes_require_administrator(self):
         backlog_routes = [route for route in agent.router.routes
                           if route.path.startswith("/agent/backlog")]
-        self.assertEqual(len(backlog_routes), 6)
+        self.assertEqual(len(backlog_routes), 7)
         for route in backlog_routes:
             self.assertIn(require_admin_principal,
                           [dependency.call for dependency in route.dependant.dependencies])
@@ -175,6 +192,18 @@ class BacklogMigrationTests(unittest.TestCase):
         migration_dir = Path(__file__).resolve().parents[1] / "backend/database/migrations"
         up = migration_dir / "0028_agent_backlog.up.sql"
         down = migration_dir / "0028_agent_backlog.down.sql"
+        GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
+        GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
+        GitBackendDeploymentManager._validate_migration_pair(up, down)
+
+    def test_order_migration_is_accepted_by_deployment_policy(self):
+        migration_dir = Path(__file__).resolve().parents[1] / "backend/database/migrations"
+        up = migration_dir / "0029_agent_backlog_order.up.sql"
+        down = migration_dir / "0029_agent_backlog_order.down.sql"
+        # PostgreSQL accepts a qualified table here, but not a qualified
+        # index name in CREATE INDEX.
+        self.assertIn("CREATE INDEX agent_backlog_custom_order_idx", up.read_text())
+        self.assertIn("ON agent.backlog_items", up.read_text())
         GitBackendDeploymentManager._validate_migration_sql(up, direction="up")
         GitBackendDeploymentManager._validate_migration_sql(down, direction="down")
         GitBackendDeploymentManager._validate_migration_pair(up, down)

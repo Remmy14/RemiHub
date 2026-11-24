@@ -26,14 +26,24 @@ export type BacklogItem = {
   promoted_at: string | null;
   created_at: string;
   updated_at: string;
+  sort_order: number | null;
 };
 type BacklogItemResponse = { success: boolean; data: BacklogItem };
-type BacklogListResponse = { success: boolean; data: BacklogItem[] };
+type BacklogListResponse = { success: boolean; data: BacklogItem[]; revision: number };
 type BacklogPromotionResponse = { success: boolean; data: { backlog_item_id: string; card_id: string } };
 
-export async function listBacklogItems(order: "priority" | "created_at" = "priority"): Promise<BacklogItem[]> {
+export type BacklogOrder = "custom" | "priority" | "created_at";
+
+export async function listBacklogItems(order: BacklogOrder = "custom"): Promise<BacklogListResponse> {
   const response = await apiRequest<BacklogListResponse>(`/agent/backlog?order=${order}`);
-  return response.data;
+  return response;
+}
+
+export async function reorderBacklogItems(itemIds: string[], revision: number): Promise<number> {
+  const response = await apiRequest<{ success: boolean; revision: number }>("/agent/backlog/order", {
+    method: "PUT", body: JSON.stringify({ item_ids: itemIds, revision }),
+  });
+  return response.revision;
 }
 
 export async function getBacklogItem(id: string): Promise<BacklogItem> {
