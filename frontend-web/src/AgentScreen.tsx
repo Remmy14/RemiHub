@@ -29,6 +29,7 @@ import type {
 } from "./api/agentApi";
 
 const POLL_INTERVAL_MILLIS = 5000;
+const CLOSE_CARD_WARNING = "Closing this card will permanently discard its implementation and deployment workspaces, including any uncommitted changes. Card history will be retained.";
 
 const activeStatuses = new Set([
   "planning_queued",
@@ -596,7 +597,7 @@ function ActionPanel({
           </div>
           <p className="mt-1 text-sm text-slate-600">
             {pendingAction === AgentActions.CLOSE
-              ? "Closing this card will permanently discard its implementation and deployment workspaces, including any uncommitted changes. Card history will be retained."
+              ? CLOSE_CARD_WARNING
               : pendingAction === AgentActions.RETURN_TO_IMPLEMENTATION
               ? "Explain what failed and how to correct it. A new implementation revision will require fresh deployment approval."
               : pendingAction === AgentActions.RETRY_REVIEW
@@ -702,6 +703,99 @@ function FollowUpComposer({
         Send
       </button>
     </form>
+  );
+}
+
+function CardToolbar({
+  card,
+  actionInProgress,
+  isLoadingCard,
+  isCreateFormOpen,
+  onClose,
+  onNewCard,
+  onRefresh,
+}: {
+  card: AgentCardDetail | null;
+  actionInProgress: AgentAction | "create" | null;
+  isLoadingCard: boolean;
+  isCreateFormOpen: boolean;
+  onClose: (notes: string) => void;
+  onNewCard: () => void;
+  onRefresh: () => void;
+}) {
+  const [confirmingClose, setConfirmingClose] = useState(false);
+  const [notes, setNotes] = useState("");
+  const canClose = card?.allowed_actions.includes(AgentActions.CLOSE) === true;
+  const closeDisabled = !canClose || isLoadingCard || actionInProgress !== null;
+
+  return (
+    <div className="mb-4">
+      <div className="flex items-center justify-between gap-2 overflow-x-auto whitespace-nowrap">
+        <button
+          className="shrink-0 rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-100 disabled:text-slate-500"
+          disabled={closeDisabled}
+          onClick={() => { setNotes(""); setConfirmingClose(true); }}
+          type="button"
+        >
+          {actionInProgress === AgentActions.CLOSE ? "Submitting..." : "Close Card"}
+        </button>
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          <button
+            className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            disabled={isCreateFormOpen || actionInProgress !== null}
+            onClick={onNewCard}
+            type="button"
+          >
+            New Card
+          </button>
+          <button
+            className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+            disabled={!card || isLoadingCard || actionInProgress !== null}
+            onClick={onRefresh}
+            type="button"
+          >
+            Refresh Card
+          </button>
+        </div>
+      </div>
+
+      {confirmingClose && (
+        <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-3">
+          <div className="text-sm font-bold text-slate-900">Close Card</div>
+          <p className="mt-1 text-sm text-slate-600">{CLOSE_CARD_WARNING}</p>
+          <textarea
+            aria-label="Close Card notes"
+            className="mt-3 min-h-24 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+            maxLength={2000}
+            onChange={(event) => setNotes(event.target.value)}
+            placeholder="Notes (optional)"
+            value={notes}
+          />
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <button
+              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100"
+              disabled={actionInProgress !== null}
+              onClick={() => setConfirmingClose(false)}
+              type="button"
+            >
+              Back
+            </button>
+            <button
+              className="rounded-md bg-slate-950 px-3 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+              disabled={closeDisabled}
+              onClick={() => {
+                if (!canClose || isLoadingCard || actionInProgress !== null) return;
+                onClose(notes);
+                setConfirmingClose(false);
+              }}
+              type="button"
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -979,7 +1073,6 @@ function CardDetail({
   isLoading,
   onAction,
   onBack,
-  onRefresh,
   onUsageRefresh,
   onSendFollowUp,
 }: {
@@ -990,29 +1083,18 @@ function CardDetail({
   isLoading: boolean;
   onAction: (action: AgentAction, notes?: string | null, revision?: ReviewRevision) => void;
   onBack: () => void;
-  onRefresh: () => void;
   onUsageRefresh: () => void;
   onSendFollowUp: (content: string) => void;
 }) {
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <button
-          className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100 lg:hidden"
-          onClick={onBack}
-          type="button"
-        >
-          Back to cards
-        </button>
-        <button
-          className="ml-auto rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
-          disabled={isLoading || actionInProgress !== null}
-          onClick={onRefresh}
-          type="button"
-        >
-          Refresh Card
-        </button>
-      </div>
+      <button
+        className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-700 hover:bg-slate-100 lg:hidden"
+        onClick={onBack}
+        type="button"
+      >
+        Back to cards
+      </button>
 
       {(isLoading || actionInProgress !== null) && (
         <div className="h-1 overflow-hidden rounded-full bg-slate-200">
@@ -1334,9 +1416,20 @@ export default function AgentScreen() {
       </div>
 
       <div id="agent-panel-cards" role="tabpanel" aria-labelledby="agent-tab-cards" hidden={activeTab !== "cards"} tabIndex={0}>
-        {!isCreateFormOpen && <div className="mb-4 flex justify-end"><button
-          className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-          disabled={actionInProgress !== null} onClick={() => setIsCreateFormOpen(true)} type="button">New Card</button></div>}
+      <CardToolbar
+        key={selectedCardId ?? "no-card"}
+        card={selectedCard?.id === selectedCardId ? selectedCard : null}
+        actionInProgress={actionInProgress}
+        isLoadingCard={isLoadingCard}
+        isCreateFormOpen={isCreateFormOpen}
+        onClose={(notes) => { void runAction(AgentActions.CLOSE, notes); }}
+        onNewCard={() => setIsCreateFormOpen(true)}
+        onRefresh={() => {
+          if (!selectedCard || selectedCard.id !== selectedCardId) return;
+          void loadCard(selectedCard.id, false);
+          refreshUsageSummary();
+        }}
+      />
       <div className="grid min-w-0 gap-5 lg:grid-cols-[minmax(20rem,24rem)_minmax(0,1fr)]">
         <aside className={isCreateFormOpen ? "order-2 min-w-0 space-y-4 lg:order-none" : "min-w-0 space-y-4"}>
           <section className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
@@ -1396,7 +1489,6 @@ export default function AgentScreen() {
                 setSelectedCard(null);
                 setSelectedCardId(null);
               }}
-              onRefresh={() => { void loadCard(selectedCard.id, false); refreshUsageSummary(); }}
               onUsageRefresh={refreshUsageSummary}
               onSendFollowUp={sendFollowUp}
             />
