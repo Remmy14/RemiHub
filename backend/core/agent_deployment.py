@@ -51,6 +51,9 @@ class DeploymentRollbackError(AgentDeploymentError):
 class DeploymentRolledBackError(AgentDeploymentError):
     """A deployment failed, but code/database state was restored safely."""
 
+    def __init__(self, message: str, *, recovery: dict | None = None):
+        super().__init__(message)
+        self.recovery = dict(recovery or {})
 
 @dataclass(frozen=True)
 class ApprovedImplementation:
@@ -1834,6 +1837,27 @@ class GitBackendDeploymentManager:
                         "Deployment target advanced before candidate execution"
                     )
 
+                # A previous rollback is not permission to execute the same
+                # approved source again. Reconcile legacy temporary blocks
+                # without rebuilding, stopping the service or applying SQL.
+                attempts = manifest.get("attempts") or []
+                if attempts and attempts[-1].get("status") == "rolled_back":
+                    previous = attempts[-1]
+                    if previous.get("rollback_performed") is not True or previous.get("rollback_errors") != []:
+                        raise DeploymentRollbackError("Previous rollback evidence is incomplete")
+                    self.runtime.verify()
+                    expected = tuple(item for item in migration_plan.expected_history
+                                     if item["version"] not in migration_plan.versions)
+                    _require_exact_migration_history(
+                        source=self.environment, expected=expected,
+                        observed=self.database.migration_history(),
+                    )
+                    raise DeploymentRolledBackError(
+                        "Deployment requires implementation correction after verified rollback: "
+                        + str(previous.get("error", "deployment failed")),
+                        recovery=self._rollback_recovery(claim, candidate_commit, previous),
+                    )
+
                 attempt = self._begin_attempt(manifest, claim)
                 self._write_manifest(manifest_path, manifest)
                 return self._execute_candidate(
@@ -2280,6 +2304,15 @@ class GitBackendDeploymentManager:
                 rollback_errors.append(f"restart: {rollback_exc}")
 
             attempt["rollback_performed"] = True
+            try:
+                _require_exact_migration_history(
+                    source=self.environment,
+                    expected=tuple(item for item in migration_plan.expected_history
+                                   if item["version"] not in migration_plan.versions),
+                    observed=self.database.migration_history(),
+                )
+            except Exception as rollback_exc:
+                rollback_errors.append(f"migration_history: {rollback_exc}")
             attempt["rollback_errors"] = rollback_errors
             attempt["finished_at"] = _utc_now()
             if rollback_errors:
@@ -2293,8 +2326,26 @@ class GitBackendDeploymentManager:
             attempt["status"] = "rolled_back"
             self._write_manifest(manifest_path, manifest)
             raise DeploymentRolledBackError(
-                f"Deployment failed and was rolled back safely: {exc}"
+                f"Deployment failed and was rolled back safely: {exc}",
+                recovery=self._rollback_recovery(claim, candidate_commit, attempt),
             ) from exc
+
+    def _rollback_recovery(self, claim, candidate_commit, attempt):
+        return {
+            "environment": self.environment,
+            "deployment_recovery": deployment_recovery_metadata(
+                github_sync_status=GITHUB_SYNC_LOCAL_INCOMPLETE,
+                retryable=False, blocker_code="deployment_rolled_back",
+                last_error=attempt.get("error"), candidate_commit=candidate_commit,
+                deployment_run_id=claim.id, production_deployed=False,
+            ),
+            "rollback": {
+                "verified": True, "environment": self.environment,
+                "deployment_run_id": claim.id, "card_revision": claim.card_revision,
+                "candidate_commit": candidate_commit,
+                "failure_stage": attempt.get("failure_stage"),
+            },
+        }
 
     def _failed_implementation_test_is_blocking(
         self,
@@ -3799,6 +3850,7 @@ class GitBackendDeploymentExecutor:
             raise AgentTemporarilyBlockedError(
                 str(exc),
                 retry_after_seconds=self.retry_after_seconds,
+                metadata=exc.recovery,
             ) from exc
 
         github_sync: dict[str, Any] | None = None

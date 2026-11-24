@@ -257,13 +257,13 @@ def _deployment_recovery_from_run(run: dict | None) -> dict | None:
 
 
 def _safe_reimplementation_failure(card: dict, latest_run: dict | None) -> bool:
-    """Only permit recovery from recognized pre-application QA failures."""
+    """Permit recognized pre-application failures or verified QA rollbacks."""
     if (
-        card.get("status") != CardStatus.FAILED.value
+        card.get("status") not in {CardStatus.FAILED.value, CardStatus.BLOCKED.value}
         or card.get("repository_scope") != RepositoryScope.BACKEND.value
         or latest_run is None
         or latest_run.get("phase") != RunPhase.DEPLOYMENT.value
-        or latest_run.get("status") != RunStatus.FAILED.value
+        or latest_run.get("status") not in {RunStatus.FAILED.value, RunStatus.BLOCKED.value}
         or latest_run.get("card_revision") != card.get("revision")
     ):
         return False
@@ -280,6 +280,30 @@ def _safe_reimplementation_failure(card: dict, latest_run: dict | None) -> bool:
 
     recovery = _deployment_recovery_from_run(latest_run)
     if isinstance(recovery, dict) and recovery.get("production_deployed"):
+        return False
+
+    if card.get("status") == CardStatus.BLOCKED.value:
+        rollback = metadata.get("rollback") or {}
+        return (
+            latest_run.get("status") == RunStatus.BLOCKED.value
+            and metadata.get("environment") == "qa"
+            and isinstance(recovery, dict)
+            and recovery.get("retryable") is False
+            and recovery.get("production_deployed") is False
+            and recovery.get("blocker_code") == "deployment_rolled_back"
+            and recovery.get("deployment_run_id") == latest_run.get("id")
+            and isinstance(rollback, dict)
+            and rollback.get("verified") is True
+            and rollback.get("environment") == "qa"
+            and rollback.get("deployment_run_id") == latest_run.get("id")
+            and rollback.get("card_revision") == card.get("revision")
+            and rollback.get("candidate_commit") == recovery.get("candidate_commit")
+            and isinstance(rollback.get("candidate_commit"), str)
+            and len(rollback["candidate_commit"]) == 40
+            and all(ch in "0123456789abcdef" for ch in rollback["candidate_commit"])
+        )
+
+    if latest_run.get("status") != RunStatus.FAILED.value:
         return False
 
     error = latest_run.get("error_message") or ""
@@ -327,8 +351,9 @@ def _allowed_actions(card: dict, *, latest_run: dict | None = None) -> list[str]
 
     if status is CardStatus.FAILED:
         actions.append("retry_review" if latest_run and latest_run.get("phase") == "review" else "retry")
-        if _safe_reimplementation_failure(card, latest_run):
-            actions.append("return_to_implementation")
+
+    if _safe_reimplementation_failure(card, latest_run):
+        actions.append("return_to_implementation")
 
     if _can_continue_corrections(card, latest_run):
         actions.append("continue_corrections")
@@ -1355,7 +1380,7 @@ def return_to_implementation(
             if not _safe_reimplementation_failure(card, failed_run):
                 raise AgentStateConflictError(
                     "Return to implementation requires a verified "
-                    "pre-application backend QA failure"
+                    "pre-application backend QA failure or a verified QA rollback"
                 )
 
             # Prevent reopening a revision that already passed QA.

@@ -1188,6 +1188,23 @@ class RunFailureMetadataTests(unittest.TestCase):
     @patch("backend.services.agent_worker_service._lock_owned_run")
     @patch("backend.services.agent_worker_service.put_db_conn")
     @patch("backend.services.agent_worker_service.get_db_conn")
+    def test_nonretryable_deployment_has_no_scheduled_retry(self, get_conn, put_conn, lock, event):
+        connection = MagicMock()
+        get_conn.return_value = connection
+        lock.return_value = {"card_status": "deploying"}
+        block_run(claimed_run(phase=RunPhase.DEPLOYMENT), reason="Verified QA rollback",
+                  retry_after_seconds=60,
+                  metadata={"deployment_recovery": {"retryable": False}})
+        calls = connection.cursor.return_value.__enter__.return_value.execute.call_args_list
+        self.assertIs(calls[0].args[1][1], True)
+        self.assertIs(calls[1].args[1][3], True)
+        self.assertIs(event.call_args.kwargs["payload"]["retryable"], False)
+        self.assertIsNone(event.call_args.kwargs["payload"]["retry_after_seconds"])
+
+    @patch("backend.services.agent_worker_service._insert_event")
+    @patch("backend.services.agent_worker_service._lock_owned_run")
+    @patch("backend.services.agent_worker_service.put_db_conn")
+    @patch("backend.services.agent_worker_service.get_db_conn")
     def test_block_run_merges_metadata_without_losing_deployment_pipeline(
         self,
         get_db_conn,
@@ -1225,8 +1242,8 @@ class RunFailureMetadataTests(unittest.TestCase):
 
         run_update_sql, run_update_parameters = cursor.execute.call_args_list[0].args
         self.assertIn("result_metadata = %s::jsonb", run_update_sql)
-        self.assertIn('"deployment_pipeline"', run_update_parameters[3])
-        self.assertIn('"deployment_recovery"', run_update_parameters[3])
+        self.assertIn('"deployment_pipeline"', run_update_parameters[4])
+        self.assertIn('"deployment_recovery"', run_update_parameters[4])
         insert_event.assert_called_once()
         self.assertIn(
             "deployment_pipeline",

@@ -1208,7 +1208,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             history=(),
         )
 
-        with self.assertRaises(DeploymentRolledBackError):
+        with self.assertRaises(DeploymentRollbackError):
             self._manager(database=database).deploy(claim)
 
         self.assertIn("verify", self.runtime.events)
@@ -1216,7 +1216,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text())
         attempt = manifest["attempts"][-1]
         self.assertEqual(attempt["failure_stage"], "qa_history_after_validation")
-        self.assertEqual(attempt["status"], "rolled_back")
+        self.assertEqual(attempt["status"], "rollback_failed")
 
     def test_production_history_is_rechecked_after_production_validation(self):
         claim = self._qa_succeeded_claim(
@@ -1242,7 +1242,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         database = FakeDatabase(history=())
         runtime = FakeRuntime()
 
-        with self.assertRaises(DeploymentRolledBackError):
+        with self.assertRaises(DeploymentRollbackError):
             self._manager(
                 database=database,
                 runtime=runtime,
@@ -1258,7 +1258,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         manifest_path = self.production_deployment_artifacts / claim.card_id / f"{claim.id}.deployment.json"
         manifest = json.loads(manifest_path.read_text())
         attempt = manifest["attempts"][-1]
-        self.assertEqual(attempt["status"], "rolled_back")
+        self.assertEqual(attempt["status"], "rollback_failed")
         self.assertEqual(
             attempt["failure_stage"],
             "production_history_after_validation",
@@ -1530,7 +1530,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
                 ),
             }
         )
-        database = FakeDatabase(pending=("0002",))
+        database = FakeDatabase(pending=("0002",), history=self._expected_history())
         runtime = FakeRuntime(fail_verify_times=1)
         manager = self._manager(database=database, runtime=runtime)
 
@@ -1560,6 +1560,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         )
         database = FakeDatabase(
             pending=("0002",),
+            history=self._expected_history(),
             fail_upgrade=True,
             apply_before_failure=True,
         )
@@ -1641,7 +1642,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
             self.base_commit,
         )
 
-    def test_retry_reuses_candidate_and_preserves_attempt_history(self):
+    def test_legacy_rollback_is_reconciled_without_reexecuting_candidate(self):
         claim = self._prepare_deployment(
             {"backend/example.py": "VALUE = 2\n"}
         )
@@ -1649,14 +1650,24 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         manager = self._manager(runtime=runtime)
         with self.assertRaises(DeploymentRolledBackError):
             manager.deploy(claim)
-        candidate = manager.deploy(claim)
+        events = list(runtime.events)
+        with self.assertRaises(DeploymentRolledBackError) as raised:
+            manager.deploy(claim)
+        self.assertFalse(raised.exception.recovery["deployment_recovery"]["retryable"])
+        self.assertTrue(raised.exception.recovery["rollback"]["verified"])
+        self.assertEqual(runtime.events, events + ["verify"])
+        self.assertEqual(_git(self.target, "rev-parse", "qa-main"), self.base_commit)
+        manifest = json.loads(next(self.deployment_artifacts.rglob("*.deployment.json")).read_text())
+        self.assertEqual(len(manifest["attempts"]), 1)
 
-        manifest = json.loads(Path(candidate.manifest_path).read_text())
-        self.assertEqual(
-            [attempt["status"] for attempt in manifest["attempts"]],
-            ["rolled_back", "succeeded"],
-        )
-        self.assertEqual(_git(self.target, "rev-parse", "qa-main"), candidate.candidate_commit)
+    def test_legacy_rollback_with_changed_database_history_cannot_be_certified(self):
+        claim = self._prepare_deployment({"backend/example.py": "VALUE = 2\n"})
+        manager = self._manager(runtime=FakeRuntime(fail_verify_times=1))
+        with self.assertRaises(DeploymentRolledBackError):
+            manager.deploy(claim)
+        self.database.configured_history = ()
+        with self.assertRaisesRegex(AgentDeploymentError, "migration history"):
+            manager.deploy(claim)
 
     def test_success_retry_is_idempotent(self):
         claim = self._prepare_deployment(
@@ -1673,7 +1684,7 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         manifest = json.loads(Path(second.manifest_path).read_text())
         self.assertEqual(len(manifest["attempts"]), 1)
 
-    def test_executor_turns_safe_rollback_into_retryable_block(self):
+    def test_executor_turns_safe_rollback_into_nonretryable_block(self):
         claim = self._prepare_deployment(
             {"backend/example.py": "VALUE = 2\n"}
         )
@@ -1685,6 +1696,8 @@ class GitBackendDeploymentManagerTests(unittest.TestCase):
         with self.assertRaises(AgentTemporarilyBlockedError) as raised:
             executor.execute(claim)
         self.assertEqual(raised.exception.retry_after_seconds, 90)
+        self.assertIs(raised.exception.metadata["deployment_recovery"]["retryable"], False)
+        self.assertEqual(raised.exception.metadata["environment"], "qa")
 
     def test_executor_rejects_non_backend_repository_scope(self):
         claim = self._prepare_deployment(

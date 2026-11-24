@@ -44,6 +44,28 @@ class ReimplementationSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_verified_blocked_qa_rollback_can_return(self):
+        from backend.services.agent_service import _allowed_actions
+        card = {**self.card, "status": "blocked"}
+        recovery = {"production_deployed": False, "retryable": False,
+                    "deployment_run_id": self.run["id"],
+                    "blocker_code": "deployment_rolled_back", "candidate_commit": "a" * 40}
+        proof = {"verified": True, "environment": "qa", "deployment_run_id": self.run["id"],
+                 "card_revision": 1, "candidate_commit": "a" * 40}
+        run = {**self.run, "status": "blocked", "result_metadata": {
+            "environment": "qa", "deployment_recovery": recovery, "rollback": proof}}
+        self.assertTrue(_safe_reimplementation_failure(card, run))
+        self.assertIn("return_to_implementation", _allowed_actions(card, latest_run=run))
+        for changes in ({"environment": "production"}, {"deployment_run_id": "other"},
+                        {"card_revision": 2}, {"verified": False}, {"candidate_commit": "b" * 40}):
+            bad = {**run, "result_metadata": {**run["result_metadata"], "rollback": {**proof, **changes}}}
+            self.assertFalse(_safe_reimplementation_failure(card, bad), changes)
+        for changes in ({"deployment_pipeline": {"stage": "qa_succeeded"}},
+                        {"environment": "production"}, {"rollback": {}},
+                        {"deployment_recovery": {**recovery, "production_deployed": True}}):
+            self.assertFalse(_safe_reimplementation_failure(card, {
+                **run, "result_metadata": {**run["result_metadata"], **changes}}), changes)
+
     def test_production_handoff_rejected(self):
         metadata = {
             "deployment_pipeline": {

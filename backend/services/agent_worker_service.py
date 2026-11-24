@@ -380,6 +380,11 @@ def claim_next_run(
                   {scope_predicate}
                   {deployment_environment_predicate}
                   AND (
+                    runs.phase <> 'deployment'
+                    OR (runs.result_metadata #>> '{{deployment_recovery,retryable}}')
+                       IS DISTINCT FROM 'false'
+                  )
+                  AND (
                     (
                         runs.status = 'queued'
                         AND runs.available_at <= CURRENT_TIMESTAMP
@@ -1094,6 +1099,12 @@ def block_run(
         _merge_metadata(claim.result_metadata, metadata),
         sort_keys=True,
     )
+    recovery = json.loads(metadata_payload).get("deployment_recovery")
+    permanent_deployment = (
+        claim.phase is RunPhase.DEPLOYMENT
+        and isinstance(recovery, dict)
+        and recovery.get("retryable") is False
+    )
     resume_status = queued_card_status_for_phase(claim.phase)
 
     conn = get_db_conn()
@@ -1111,7 +1122,8 @@ def block_run(
                 SET status = %s,
                     lease_token = NULL,
                     lease_expires_at = NULL,
-                    available_at = CURRENT_TIMESTAMP + {_lease_interval_sql()},
+                    available_at = CASE WHEN %s THEN 'infinity'::timestamptz
+                        ELSE CURRENT_TIMESTAMP + {_lease_interval_sql()} END,
                     blocked_reason = %s,
                     result_metadata = %s::jsonb,
                     finished_at = NULL
@@ -1119,6 +1131,7 @@ def block_run(
                 """,
                 (
                     RunStatus.BLOCKED.value,
+                    permanent_deployment,
                     retry_after_seconds,
                     normalized_reason,
                     metadata_payload,
@@ -1131,13 +1144,15 @@ def block_run(
                 SET status = %s,
                     resume_status = %s,
                     blocked_reason = %s,
-                    blocked_until = CURRENT_TIMESTAMP + {_lease_interval_sql()}
+                    blocked_until = CASE WHEN %s THEN 'infinity'::timestamptz
+                        ELSE CURRENT_TIMESTAMP + {_lease_interval_sql()} END
                 WHERE id = %s
                 """,
                 (
                     CardStatus.BLOCKED.value,
                     resume_status.value,
                     normalized_reason,
+                    permanent_deployment,
                     retry_after_seconds,
                     claim.card_id,
                 ),
@@ -1150,7 +1165,8 @@ def block_run(
                 actor_user_id=None,
                 payload={
                     "reason": normalized_reason,
-                    "retry_after_seconds": retry_after_seconds,
+                    "retry_after_seconds": None if permanent_deployment else retry_after_seconds,
+                    "retryable": not permanent_deployment,
                     "run_id": claim.id,
                     "worker_id": claim.worker_id,
                     "metadata": _merge_metadata(claim.result_metadata, metadata),
