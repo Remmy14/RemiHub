@@ -67,6 +67,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # /opt/remihub
 STATIC_DIR = BASE_DIR / 'backend' / 'static'
 WEB_DIST_DIR = BASE_DIR / 'frontend-web' / 'dist'
 WEB_ASSETS_DIR = WEB_DIST_DIR / 'assets'
+WEB_MODULE_ICONS_DIR = WEB_DIST_DIR / 'module-icons'
 
 # Load environment variables
 _ENV_PATH = resolve_environment_file_path()
@@ -189,6 +190,12 @@ app.mount(
     '/assets',
     StaticFiles(directory=str(WEB_ASSETS_DIR), check_dir=False),
     name='web-assets',
+)
+
+app.mount(
+    '/module-icons',
+    StaticFiles(directory=str(WEB_MODULE_ICONS_DIR), check_dir=False),
+    name='web-module-icons',
 )
 
 
