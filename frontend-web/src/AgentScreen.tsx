@@ -730,16 +730,18 @@ function CardToolbar({
 
   return (
     <div className="mb-4">
-      <div className="flex items-center justify-between gap-2 overflow-x-auto whitespace-nowrap">
-        <button
-          className="shrink-0 rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-100 disabled:text-slate-500"
-          disabled={closeDisabled}
-          onClick={() => { setNotes(""); setConfirmingClose(true); }}
-          type="button"
-        >
-          {actionInProgress === AgentActions.CLOSE ? "Submitting..." : "Close Card"}
-        </button>
+      <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap">
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          {canClose && (
+            <button
+              className="shrink-0 rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-bold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-100 disabled:text-slate-500"
+              disabled={closeDisabled}
+              onClick={() => { setNotes(""); setConfirmingClose(true); }}
+              type="button"
+            >
+              {actionInProgress === AgentActions.CLOSE ? "Submitting..." : "Close Card"}
+            </button>
+          )}
           <button
             className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
             disabled={isCreateFormOpen || actionInProgress !== null}
