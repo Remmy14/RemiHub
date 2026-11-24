@@ -380,7 +380,8 @@ def claim_next_run(
                   {scope_predicate}
                   {deployment_environment_predicate}
                   AND (
-                    runs.phase <> 'deployment'
+                    runs.status <> 'blocked'
+                    OR runs.phase <> 'deployment'
                     OR (runs.result_metadata #>> '{{deployment_recovery,retryable}}')
                        IS DISTINCT FROM 'false'
                   )

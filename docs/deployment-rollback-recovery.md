@@ -4,7 +4,9 @@ A safely rolled-back deployment is a non-retryable block. The executor records
 trusted rollback identity, environment and revision, checks restored migration
 history, and requires operator correction rather than repeating the approved
 candidate. Blocked runs with explicit `deployment_recovery.retryable=false`
-have infinite availability and are excluded from deployment claims. Missing
+have infinite availability and are excluded from deployment claims only while Blocked. A normal Queued QA
+handoff or expired Running production execution may carry non-retryable display
+metadata and must remain eligible under its normal phase/lease guards. Missing
 metadata retains the established temporary-block behavior for unrelated work.
 
 For legacy rolled-back attempts, the deployment manager validates the retained
