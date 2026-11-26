@@ -27,3 +27,16 @@ export function focusBacklogHandle(
     }
   }
 }
+
+export function focusBacklogEditButton(
+  container: Pick<HTMLElement, "querySelectorAll"> | null,
+  id: string,
+): void {
+  const buttons = container?.querySelectorAll<HTMLButtonElement>("[data-backlog-edit-id]");
+  for (const button of buttons ?? []) {
+    if (button.dataset.backlogEditId === id) {
+      button.focus();
+      return;
+    }
+  }
+}

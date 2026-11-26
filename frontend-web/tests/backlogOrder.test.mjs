@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { focusBacklogHandle, keyboardMove, moveItem } from "../src/backlogOrder.ts";
+import { focusBacklogEditButton, focusBacklogHandle, keyboardMove, moveItem } from "../src/backlogOrder.ts";
 
 const items = [{ id: "a", priority: "Low" }, { id: "b", priority: "High" }, { id: "c", priority: "Medium" }];
 
@@ -33,4 +33,17 @@ test("successive arrow moves keep the moved handle as the keyboard target", () =
   }
   assert.equal(keyboardMove(order, "a", "ArrowDown"), null);
   assert.equal(keyboardMove(order, "a", "Enter"), null);
+});
+
+test("saved item receives focus at its refreshed sorted position", () => {
+  let focused = null;
+  const buttons = ["c", "a", "b"].map((id) => ({
+    dataset: { backlogEditId: id },
+    focus() { focused = id; },
+  }));
+  focusBacklogEditButton({ querySelectorAll: () => buttons }, "b");
+  assert.equal(focused, "b");
+  focused = null;
+  focusBacklogEditButton({ querySelectorAll: () => buttons }, "missing");
+  assert.equal(focused, null);
 });

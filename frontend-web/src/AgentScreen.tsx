@@ -1,5 +1,5 @@
 import { reviewRunStatus } from "./api/agentReview";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode } from "react";
 import { CardUsage, CodexUsageDashboard } from "./CodexUsage";
 import AgentBacklog from "./AgentBacklog";
@@ -1178,6 +1178,7 @@ function CardDetail({
 
 export default function AgentScreen() {
   const [activeTab, setActiveTab] = useState<"cards" | "backlog" | "usage">("cards");
+  const [scrollToPromotedCard, setScrollToPromotedCard] = useState(false);
   const [backlogDirty, setBacklogDirty] = useState(false);
   const [cards, setCards] = useState<AgentCardSummary[]>([]);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
@@ -1197,6 +1198,13 @@ export default function AgentScreen() {
     setUsageSummaryVersion(refreshVersion);
   }, []);
   const refreshUsageSummary = useCallback(() => setUsageSummaryRefresh((value) => value + 1), []);
+
+  useLayoutEffect(() => {
+    if (activeTab === "cards" && scrollToPromotedCard) {
+      window.scrollTo(0, 0);
+      setScrollToPromotedCard(false);
+    }
+  }, [activeTab, scrollToPromotedCard]);
 
   useEffect(() => {
     if (!selectedCard) {
@@ -1374,6 +1382,7 @@ export default function AgentScreen() {
 
   const openPromotedCard = (id: string) => {
     setActiveTab("cards");
+    setScrollToPromotedCard(true);
     setSelectedCard(null);
     setSelectedCardId(id);
     void loadCard(id);

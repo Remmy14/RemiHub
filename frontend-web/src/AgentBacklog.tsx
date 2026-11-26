@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent, PointerEvent as ReactPointerEvent } from "react";
 import {
   deleteBacklogItem, getBacklogItem, listBacklogItems, saveBacklogItem,
   sendBacklogToPlanning, reorderBacklogItems,
 } from "./api/agentApi";
 import type { BacklogItem, BacklogOrder, BacklogPriority } from "./api/agentApi";
-import { focusBacklogHandle, keyboardMove, moveItem } from "./backlogOrder";
+import { focusBacklogEditButton, focusBacklogHandle, keyboardMove, moveItem } from "./backlogOrder";
 import {
   confirmBacklogDiscard, confirmBacklogPromotion, editorFromItem,
   hasUnsavedBacklogChanges, promoteBacklogItem, saveBacklogEditor,
@@ -33,6 +33,13 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [focusAfterSaveId, setFocusAfterSaveId] = useState<string | null>(null);
+
+  useLayoutEffect(() => {
+    if (!focusAfterSaveId || busy) return;
+    focusBacklogEditButton(listRef.current, focusAfterSaveId);
+    setFocusAfterSaveId(null);
+  }, [focusAfterSaveId, busy]);
 
   const dirty = hasUnsavedBacklogChanges(editor, savedEditor);
   useEffect(() => { onDirtyChange(dirty); }, [dirty, onDirtyChange]);
@@ -44,9 +51,9 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (showLoading = true) => {
     const requestId = ++refreshId.current;
-    setLoading(true);
+    if (showLoading) setLoading(true);
     try {
       const result = await listBacklogItems(order);
       if (requestId === refreshId.current) {
@@ -56,7 +63,7 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
     catch (caught) {
       if (requestId === refreshId.current) setError(caught instanceof Error ? caught.message : "Unable to load backlog.");
     }
-    finally { if (requestId === refreshId.current) setLoading(false); }
+    finally { if (requestId === refreshId.current && showLoading) setLoading(false); }
   }, [order]);
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -128,8 +135,10 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
 
   const closeEditor = () => {
     if (!confirmBacklogDiscard(dirty, window.confirm)) return;
+    const editedId = editor?.id;
     setEditor(null);
     setSavedEditor(null);
+    if (editedId) requestAnimationFrame(() => focusBacklogEditButton(listRef.current, editedId));
   };
 
   const edit = async (id: string) => {
@@ -150,10 +159,12 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
     if (!editor || busy) return;
     setBusy(true);
     try {
+      const editedId = editor.id;
       await saveBacklogEditor(editor, saveBacklogItem);
       setEditor(null);
       setSavedEditor(null);
-      await refresh();
+      await refresh(false);
+      if (editedId) setFocusAfterSaveId(editedId);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Unable to save item."); }
     finally { setBusy(false); }
   };
@@ -183,22 +194,11 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
     finally { setBusy(false); }
   };
 
-  return <section className="space-y-4" aria-label="Agent backlog">
-    <div className="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <h2 className="text-xl font-black text-slate-950">Backlog</h2>
-        <p className="text-sm text-slate-600">Saved requests stay inactive until you send one to Planning.</p>
-      </div>
-      <button type="button" disabled={busy} onClick={() => {
-        if (!confirmBacklogDiscard(dirty, window.confirm)) return;
-        setEditor({ ...emptyEditor }); setSavedEditor({ ...emptyEditor });
-      }} className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">New Backlog Item</button>
-    </div>
-    {error && <div role="alert" className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">{error}</div>}
-    {editor && <form onSubmit={(event) => void save(event)} className="space-y-3 rounded-md border border-slate-200 bg-white p-4 shadow-sm">
+  const editorForm = editor && <form onSubmit={(event) => void save(event)} className="min-w-0 space-y-3 rounded-md border border-slate-200 bg-white p-4 shadow-sm">
       <h3 className="font-bold">{editor.id ? "Edit Backlog Item" : "New Backlog Item"}</h3>
+      {error && <div role="alert" className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">{error}</div>}
       <label className="block text-sm font-semibold">Title
-        <input required value={editor.title} onChange={(event) => setEditor({ ...editor, title: event.target.value })}
+        <input autoFocus required value={editor.title} onChange={(event) => setEditor({ ...editor, title: event.target.value })}
           className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-base" />
       </label>
       {editor.title.length > 160 && <p role="alert" className="text-sm text-red-700">Title must be at most 160 characters.</p>}
@@ -219,7 +219,21 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
           className="rounded-md bg-blue-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">{busy ? "Saving…" : "Save to Backlog"}</button>
         <button type="button" onClick={closeEditor} disabled={busy} className="rounded-md border border-slate-300 px-4 py-2 text-sm font-bold">Cancel</button>
       </div>
-    </form>}
+    </form>;
+
+  return <section className="space-y-4" aria-label="Agent backlog">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h2 className="text-xl font-black text-slate-950">Backlog</h2>
+        <p className="text-sm text-slate-600">Saved requests stay inactive until you send one to Planning.</p>
+      </div>
+      <button type="button" disabled={busy} onClick={() => {
+        if (!confirmBacklogDiscard(dirty, window.confirm)) return;
+        setEditor({ ...emptyEditor }); setSavedEditor({ ...emptyEditor });
+      }} className="rounded-md bg-slate-950 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">New Backlog Item</button>
+    </div>
+    {error && !editor && <div role="alert" className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">{error}</div>}
+    {editor && !editor.id && editorForm}
     <label className="flex items-center gap-2 text-sm font-semibold">Sort by
       <select value={order} disabled={busy || !!draggingId} onChange={(event) => setOrder(event.target.value as BacklogOrder)}
         className="rounded-md border border-slate-300 bg-white px-3 py-2">
@@ -238,11 +252,11 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
           className="rounded-md bg-blue-600 px-4 py-2 text-sm font-bold text-white">New Backlog Item</button>
       </div> : <div ref={listRef} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel} className={order === "custom" ? "grid gap-3" : "grid gap-3 md:grid-cols-2"}>
-        {items.map((item, index) => <div key={item.id}>
+        {items.map((item, index) => <div key={item.id} className="min-w-0">
           {draggingId && dropIndex === index && <div aria-hidden="true" className="mb-2 flex items-center gap-2 text-xs font-bold text-blue-700">
             <span className="h-1 flex-1 rounded-full bg-blue-600" />Drop here<span className="h-1 flex-1 rounded-full bg-blue-600" />
           </div>}
-          <article data-backlog-id={item.id} className={`min-w-0 rounded-md border bg-white p-4 shadow-sm ${draggingId === item.id ? "border-blue-500 bg-blue-50 shadow-lg ring-2 ring-blue-200" : "border-slate-200"}`}>
+          {editor?.id === item.id ? editorForm : <article data-backlog-id={item.id} className={`min-w-0 rounded-md border bg-white p-4 shadow-sm ${draggingId === item.id ? "border-blue-500 bg-blue-50 shadow-lg ring-2 ring-blue-200" : "border-slate-200"}`}>
           <div className="flex items-start justify-between gap-2">
             <div className="flex min-w-0 items-center gap-3">
               {order === "custom" && <>
@@ -264,11 +278,11 @@ export default function AgentBacklog({ onOpenCard, onDirtyChange }: {
           <p className="mt-1 text-xs text-slate-500">Updated {new Date(item.updated_at).toLocaleDateString()}</p>
           <p className="mt-3 line-clamp-3 whitespace-pre-wrap text-sm text-slate-700">{item.prompt}</p>
           <div className="mt-4 flex flex-wrap gap-2">
-            <button type="button" disabled={busy} onClick={() => void edit(item.id)} className="rounded border px-3 py-2 text-sm font-semibold">Edit</button>
+            <button type="button" data-backlog-edit-id={item.id} disabled={busy} onClick={() => void edit(item.id)} className="rounded border px-3 py-2 text-sm font-semibold">Edit</button>
             <button type="button" disabled={busy} onClick={() => void remove(item)} className="rounded border px-3 py-2 text-sm font-semibold">Delete</button>
             <button type="button" disabled={busy} onClick={() => void promote(item)} className="rounded bg-blue-600 px-3 py-2 text-sm font-bold text-white disabled:opacity-50">{busy ? "Working…" : "Send to Planning"}</button>
           </div>
-          </article>
+          </article>}
         </div>)}
       </div>}
   </section>;
